@@ -2,3 +2,6 @@
 venv/
 __pycache__/
 *.pyc
+
+# 문서파일 ignore
+근희함.doc
