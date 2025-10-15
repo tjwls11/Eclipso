@@ -15,6 +15,9 @@ with olefile.OleFileIO("test.doc") as ole:
     fWhichTblStm = (fib_base_flags & 0x0200) != 0
     tbl_stream = "1Table" if fWhichTblStm else "0Table"
 
+    #fComplex확인
+    fComplex = (fib_base_flags & 0x0004) != 0
+
     # Table 스트림 읽기
     table_data = ole.openstream(tbl_stream).read()
 
@@ -56,6 +59,7 @@ for i in range(len(aCP) - 2):
 #출력
 fib = {
     "tbl_stream" : tbl_stream,
+    "fComplex" : fComplex,
     "base_len": base_len,
     "csw": csw,
     "fibRgW_len": fibRgW_len,
