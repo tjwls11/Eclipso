@@ -30,3 +30,14 @@ def extract_text(file_bytes: bytes) -> dict:
 
     full = "\n".join(texts)
     return {"full_text": full, "pages": [{"page": 1, "text": full}]}
+
+from .redac_rules import apply_redaction_rules
+
+def redact(file_bytes: bytes) -> bytes:
+    """HWP 텍스트 기반 레닥션"""
+    result = extract_text(file_bytes)
+    text = result.get("full_text", "")
+    if not text.strip():
+        return b""
+    redacted = apply_redaction_rules(text)
+    return redacted.encode("utf-8")

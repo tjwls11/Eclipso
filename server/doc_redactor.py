@@ -109,3 +109,14 @@ def extract_text(file_bytes: bytes) -> dict:
     except Exception as e:
         print("DOC 추출 중 예외:", e)
         return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+
+from .redac_rules import apply_redaction_rules
+
+def redact(file_bytes: bytes) -> bytes:
+    """DOC 텍스트 기반 레닥션"""
+    result = extract_text(file_bytes)
+    text = result.get("full_text", "")
+    if not text.strip():
+        return b""
+    redacted = apply_redaction_rules(text)
+    return redacted.encode("utf-8")
