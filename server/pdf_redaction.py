@@ -236,6 +236,18 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill="black") -> bytes:
     return out.getvalue()
 
 def extract_text(file_bytes: bytes):
+    import io
+    import fitz
+
+    text = ""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pages = []
+    for i, page in enumerate(doc):
+        page_text = page.get_text("text")
+        text += page_text or ""
+        pages.append({"page": i + 1, "text": page_text})
+    doc.close()
+    return {"full_text": text, "pages": pages}
     from PyPDF2 import PdfReader
     import io
 
