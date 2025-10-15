@@ -7,7 +7,7 @@ def le32(b, off):
     return struct.unpack_from("<I", b, off)[0]
 
 
-with olefile.OleFileIO("근희함.doc") as ole:
+with olefile.OleFileIO("test.doc") as ole:
     word_data = ole.openstream("WordDocument").read()
 
     # fWhichTblStm 플래그 확인
@@ -17,7 +17,6 @@ with olefile.OleFileIO("근희함.doc") as ole:
 
     # Table 스트림 읽기
     table_data = ole.openstream(tbl_stream).read()
-
 
 base_len = 32
 csw = le16(word_data, 32)
@@ -53,9 +52,10 @@ for i in range(len(aCP) - 2):
     story.append((start_cp, end_cp))
 
 
-#출력 딕셔너리
-'''
+
+#출력
 fib = {
+    "tbl_stream" : tbl_stream,
     "base_len": base_len,
     "csw": csw,
     "fibRgW_len": fibRgW_len,
@@ -67,19 +67,13 @@ fib = {
     "cbRgFcLcb": cbRgFcLcb,
     "fibRgFcLcbBlob_off": fibRgFcLcbBlob_off,
     "fibRgFcLcbBlob_len": fibRgFcLcbBlob_len,
-    "fcPlcHdd": fcPlcHdd,
-    "lcbPlcHdd": lcbPlcHdd
 }
 
 for name, value in fib.items():
     print(f"{name} = {value}")
 
-'''
-
-print(f"tbl_stream = {tbl_stream}")
 print(f"fcPlcHdd = {fcPlcHdd} (0x{fcPlcHdd:08X})") #16진수 8자리 포맷 출력
 print(f"lcbPlcHdd = {lcbPlcHdd} (0x{lcbPlcHdd:08X})")
-print(f"ccpHdd = {ccpHdd}")
 print(f"aCP count = {len(aCP)}")
 
 for i, (start, end) in enumerate(story): #인덱스와 값 동시에 꺼내기
