@@ -22,4 +22,4 @@ doc_area = fcMac - fcMin
 
 print(f"fcMin: 0x{fcMin:08X} ({fcMin})")
 print(f"fcMac: 0x{fcMac:08X} ({fcMac})")
-print(f"doc_erea: {doc_area} (0x{fcMin:08X} ~ 0x{(fcMac - 1):08X})")
+print(f"doc_erea: 0x{fcMin:08X} ~ 0x{(fcMac - 1):08X} ({doc_area})")
