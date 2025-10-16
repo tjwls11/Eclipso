@@ -4,15 +4,17 @@ import struct
 import argparse
 import shutil
 
+def le16(b, off): 
+    return struct.unpack_from("<H", b, off)[0]
+
+def le32(b, off):
+    return struct.unpack_from("<I", b, off)[0]
+
 # --- CLI 부분 (디버깅용)
-parser = argparse.ArgumentParser()
-parser.add_argument("doc_path", help="레닥션 처리를 원하는 doc 파일 경로")
-parser.add_argument(
-    "--targets", "-t", nargs="+", required=True, help="레닥션 할 문자 목록. (여러개 가능. 공백으로 구분)"
-)
-parser.add_argument(
-    "--output", "-o", help="출력 파일."
-)
+parser = argparse.ArgumentParser(description="MS Word .doc 레닥션 (동일 길이 치환)")
+parser.add_argument("doc_path", help="레닥션할 doc 파일 경로")
+parser.add_argument("--targets", "-t", nargs="+", required=True, help="치환할 문자열 (공백 구분)")
+parser.add_argument("--output", "-o", help="출력 파일명 (미지정시 '_replaced' 자동 추가)")
 args = parser.parse_args()
 
 doc_path = args.doc_path
@@ -22,43 +24,38 @@ targets = args.targets
 base, ext = os.path.splitext(doc_path)
 output_name = f"{base}_replaced{ext}"
 
-#copy original
+# 원본 보존 (original copy)
 shutil.copy2(doc_path, output_name)
 
-# --- copy olefile open
+
+# WordDocument 파싱
 with olefile.OleFileIO(output_name) as ole:
     # WordDocument 스트림 읽기
     word_data = ole.openstream("WordDocument").read()
-
-    # FIB에서 fcClx, lcbClx 읽기
-    fcClx = struct.unpack_from("<I", word_data, 0x01A2)[0]
-    lcbClx = struct.unpack_from("<I", word_data, 0x01A6)[0]
+    
 
     # fWhichTblStm 플래그 확인
-    fib_base_flags = struct.unpack_from("<H", word_data, 0x000A)[0]
+    fib_base_flags = le16(word_data, 0x000A)
     fWhichTblStm = (fib_base_flags & 0x0200) != 0
     tbl_stream = "1Table" if fWhichTblStm else "0Table"
 
     # Table 스트림 읽기
     table_data = ole.openstream(tbl_stream).read()
 
-    #파일 쓰기 부분 정의
-    write_ole = olefile.OleFileIO(output_name, write_mode=True)
 
+# FIB에서 fcClx, lcbClx 읽기
+fcClx = le32(word_data, 0x01A2)
+lcbClx = le32(word_data, 0x01A6)
+
+#fComplex확인
+fComplex = (fib_base_flags & 0x0004) != 0
+
+print(f"fComplex: {fComplex}")
 print("WordDocument 스트림 크기:", len(word_data))
 print(f"fcClx = {hex(fcClx)} ({fcClx})")
 print(f"lcbClx = {hex(lcbClx)} ({lcbClx})")
 print(f"이 문서는 {'1Table' if fWhichTblStm else '0Table'} 스트림입니다.")
 print("Table 스트림 크기:", len(table_data))
-
-#Clx 블록 추출
-if lcbClx == 0:
-    raise ValueError("CLX 길이가 0입니다 (텍스트 조각 정보 없음)")
-if fcClx + lcbClx > len(table_data):
-    raise ValueError("CLX 범위가 테이블 스트림을 벗어납니다")
-clx = table_data[fcClx:fcClx + lcbClx]
-print("CLx 크기:", len(clx), "bytes")
-print("Clx 시작 바이트:", clx[:16])
 
 #CLx 안에서 PlcPcd 추출
 def extract_plcpcd(clx: bytes) -> bytes:
@@ -71,6 +68,7 @@ def extract_plcpcd(clx: bytes) -> bytes:
                 raise ValueError("잘못된 Clx: Prc 헤더가 짧음")
             cb = struct.unpack_from("<H", clx, i)[0]
             i += 2 + cb
+
         elif tag == 0x02:  # Pcdt
             if i + 4 > len(clx):
                 raise ValueError("잘못된 Clx: Pcdt 길이 누락")
@@ -79,6 +77,7 @@ def extract_plcpcd(clx: bytes) -> bytes:
             if i + lcb > len(clx):
                 raise ValueError("잘못된 Clx: PlcPcd 범위 초과")
             return clx[i:i+lcb]  # 정상 반환
+        
         else:
             raise ValueError(f"알 수 없는 CLX 태그: 0x{tag:02X}")
 
@@ -145,16 +144,15 @@ def decode_piece(chunk: bytes, fCompressed: bool) -> str:
         text = chunk.decode("cp1252", errors="replace") #1 byte
     else:
         text = chunk.decode("utf-16le", errors="replace")  #2 byte
-    # Normalize newlines so CR (\r) doesn't overwrite prints in console
-    # Word often uses CRLF; sometimes lone CR can appear in pieces
+    # CR(\r)이 콘솔에 출력되는 내용을 덮어쓰지 않도록 줄바꿈을 정규화
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return text
 
-#텍스트 추출
+
+# ------ 텍스트 추출 (디버깅용) ------ 
 def extract_full_text(word_data: bytes, pieces):
     texts = []
     for i, p in enumerate(pieces):
-        #WordDocument에서 해당 조각의 바이트 범위 잘라오기
         start_pos = p["fc"]
         end_pos = p["fc"] + p["byte_count"]
         
@@ -170,26 +168,23 @@ def extract_full_text(word_data: bytes, pieces):
         print(f"바이트 내용 (hex): {chunk[:20].hex()}...")
         
         text = decode_piece(chunk, p["fCompressed"])
-        # Escape control characters for debug visibility
         debug_text = text.encode('unicode_escape').decode('ascii')
-        print(f"디코딩된 텍스트: '{debug_text}'")
-        print()
+        print(f"디코딩된 텍스트: '{debug_text}'\n")
         
         texts.append(text)
     return "".join(texts)
 
 full_text = extract_full_text(word_data, pieces)
-# For final output, show visible newlines
-visible_text = full_text
 print("==== 추출된 텍스트 ====")
-print(visible_text)
+print(full_text)
 
-# --- 치환 부분
+
+# ============ 치환 부분 ============
 replaced_word_data = bytearray(word_data)
 total_replacement = 0
 
 for target_text in targets:
-    replacement_text = "".join(c if c == "-" else "*" for c in target_text) #하이픈은 제외하고 치환.
+    replacement_text = "".join(c if c == "-" else "*" for c in target_text)
     for p in pieces:
         start_pos = p["fc"]
         end_pos = p["fc"] + p["byte_count"]
@@ -213,7 +208,9 @@ for target_text in targets:
             replacement_bytes = replacement_text.encode(enc, errors="replace")
 
             if len(replacement_bytes) != byte_len:
-                raise  ValueError(f"치환 바이트 길이가 일치하지 않음: expected: {byte_len}, got: {len(replacement_bytes)}, encoding:{enc}")
+                raise ValueError(
+                    f"치환 바이트 길이 불일치: expected {byte_len}, got {len(replacement_bytes)}, encoding: {enc}"
+                )
 
             replaced_word_data[byte_start:byte_start + byte_len] = replacement_bytes
             total_replacement += 1
@@ -221,13 +218,15 @@ for target_text in targets:
 
 print(f"총 {total_replacement}개 치환 완료")
 
+
+# 저장 
+write_ole = olefile.OleFileIO(output_name, write_mode=True)
 if total_replacement > 0:
     write_ole.write_stream("WordDocument", bytes(replaced_word_data))
+    write_ole.fp.flush()
     write_ole.close()
     print("WordDocument 스트림에 변경사항 저장 완료")
     print(f"결과 파일: {output_name}")
 else:
-    # 변경이 없으면 열린 핸들을 정리만
     write_ole.close()
     print("치환할 내용이 없어 저장하지 않았습니다")
-

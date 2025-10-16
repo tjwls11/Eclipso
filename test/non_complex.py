@@ -79,6 +79,7 @@ def extract_plcpcd(clx: bytes) -> bytes:
                 raise ValueError("잘못된 Clx: Prc 헤더가 짧음")
             cb = struct.unpack_from("<H", clx, i)[0]
             i += 2 + cb
+
         elif tag == 0x02:  # Pcdt
             if i + 4 > len(clx):
                 raise ValueError("잘못된 Clx: Pcdt 길이 누락")
@@ -87,6 +88,7 @@ def extract_plcpcd(clx: bytes) -> bytes:
             if i + lcb > len(clx):
                 raise ValueError("잘못된 Clx: PlcPcd 범위 초과")
             return clx[i:i+lcb]  # 정상 반환
+        
         else:
             raise ValueError(f"알 수 없는 CLX 태그: 0x{tag:02X}")
 
