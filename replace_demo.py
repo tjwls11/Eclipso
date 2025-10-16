@@ -57,6 +57,16 @@ print(f"lcbClx = {hex(lcbClx)} ({lcbClx})")
 print(f"이 문서는 {'1Table' if fWhichTblStm else '0Table'} 스트림입니다.")
 print("Table 스트림 크기:", len(table_data))
 
+#Clx 블록 추출
+if lcbClx == 0:
+    raise ValueError("CLX 길이가 0입니다 (텍스트 조각 정보 없음)")
+if fcClx + lcbClx > len(table_data):
+    raise ValueError("CLX 범위가 테이블 스트림을 벗어납니다")
+clx = table_data[fcClx:fcClx + lcbClx]
+print("CLx 크기:", len(clx), "bytes")
+print("Clx 시작 바이트:", clx[:16])
+
+
 #CLx 안에서 PlcPcd 추출
 def extract_plcpcd(clx: bytes) -> bytes:
     i = 0
