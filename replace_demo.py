@@ -9,7 +9,7 @@ def le16(b, off):
 
 def le32(b, off):
     return struct.unpack_from("<I", b, off)[0]
-
+'''
 # --- CLI 부분 (디버깅용)
 parser = argparse.ArgumentParser(description="MS Word .doc 레닥션 (동일 길이 치환)")
 parser.add_argument("doc_path", help="레닥션할 doc 파일 경로")
@@ -26,10 +26,10 @@ output_name = f"{base}_replaced{ext}"
 
 # 원본 보존 (original copy)
 shutil.copy2(doc_path, output_name)
-
+'''
 
 # WordDocument 파싱
-with olefile.OleFileIO(output_name) as ole:
+with olefile.OleFileIO("test.doc") as ole:
     # WordDocument 스트림 읽기
     word_data = ole.openstream("WordDocument").read()
     
@@ -188,7 +188,7 @@ full_text = extract_full_text(word_data, pieces)
 print("==== 추출된 텍스트 ====")
 print(full_text)
 
-
+'''
 # ============ 치환 부분 ============
 replaced_word_data = bytearray(word_data)
 total_replacement = 0
@@ -240,3 +240,5 @@ if total_replacement > 0:
 else:
     write_ole.close()
     print("치환할 내용이 없어 저장하지 않았습니다")
+    
+'''
