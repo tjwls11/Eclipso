@@ -1,4 +1,4 @@
-import sys, struct, olefile, argparse, os
+import struct, olefile, argparse, os
 
 SST = 0x00FC
 ENDOFCHAIN = 0xFFFFFFFE
