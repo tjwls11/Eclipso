@@ -14,8 +14,12 @@ def apply_redaction_rules(text: str, rules: dict = None, mask: str = "***") -> s
         rules = RULES
 
     new_text = text
-    for name, pattern in rules.items():
-        new_text = re.sub(pattern, mask, new_text)
+    for name, info in rules.items():
+        pattern = info["regex"]
+        if isinstance(pattern, re.Pattern):
+            new_text = pattern.sub(mask, new_text)
+        else:
+            new_text = re.sub(pattern, mask, new_text)
     return new_text
 
 # 주민등록번호

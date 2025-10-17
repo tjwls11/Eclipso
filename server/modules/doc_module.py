@@ -111,10 +111,39 @@ def extract_text(file_bytes: bytes) -> dict:
         return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
 
 def redact(file_bytes: bytes) -> bytes:
-    """DOC 텍스트 기반 레닥션"""
-    result = extract_text(file_bytes)
-    text = result.get("full_text", "")
-    if not text.strip():
-        return b""
-    redacted = apply_redaction_rules(text)
-    return redacted.encode("utf-8")
+    """DOC 포맷 유지형 레닥션"""
+    buf = io.BytesIO()
+    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+        if not ole.exists("WordDocument"):
+            return b""
+
+        word_data = bytearray(ole.openstream("WordDocument").read())
+        fib_flags = struct.unpack_from("<H", word_data, 0x000A)[0]
+        fWhichTblStm = (fib_flags & 0x0200) != 0
+        tbl_name = "1Table" if fWhichTblStm and ole.exists("1Table") else "0Table"
+        if not ole.exists(tbl_name):
+            return file_bytes
+
+        table_data = ole.openstream(tbl_name).read()
+        fcClx = struct.unpack_from("<I", word_data, 0x01A2)[0]
+        lcbClx = struct.unpack_from("<I", word_data, 0x01A6)[0]
+        clx = table_data[fcClx:fcClx + lcbClx]
+        start = clx.find(b"\x02")
+        if start < 0:
+            return file_bytes
+
+        text_chunks = []
+        pos = 0
+        while pos + 2 < len(word_data):
+            try:
+                chunk = word_data[pos:pos+512]
+                decoded = chunk.decode("utf-16le", errors="ignore")
+                redacted = apply_redaction_rules(decoded)
+                enc = redacted.encode("utf-16le")
+                word_data[pos:pos+len(enc)] = enc[:len(chunk)]
+                pos += 512
+            except Exception:
+                break
+
+        buf = io.BytesIO(word_data)
+        return buf.getvalue()

@@ -1,6 +1,7 @@
 import io
 import re
 import olefile
+import struct
 from server.core.redaction_rules import apply_redaction_rules
 
 ASCII_PRINT = (0x0020, 0x007E)       # space ~ '~'
@@ -118,10 +119,24 @@ def extract_text(file_bytes: bytes) -> dict:
     return {"full_text": full_text, "pages": [{"page": 1, "text": full_text}]}
 
 def redact(file_bytes: bytes) -> bytes:
-    """PPT 텍스트 기반 레닥션"""
-    result = extract_text(file_bytes)
-    text = result.get("full_text", "")
-    if not text.strip():
-        return b""
-    redacted = apply_redaction_rules(text)
-    return redacted.encode("utf-8")
+    """PPT TextCharsAtom 기반 치환"""
+    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+        if not ole.exists("PowerPoint Document"):
+            return file_bytes
+        buf = bytearray(ole.openstream("PowerPoint Document").read())
+
+    off = 0
+    while off + 8 < len(buf):
+        recVer, recInstance, recType, recLen = struct.unpack_from("<HHII", buf, off)
+        off += 8
+        if recType == 0x0FA0:  # TextCharsAtom
+            raw = buf[off:off + recLen]
+            try:
+                text = raw.decode("utf-16le", errors="ignore")
+                redacted = apply_redaction_rules(text)
+                enc = redacted.encode("utf-16le")
+                buf[off:off+recLen] = enc[:recLen].ljust(recLen, b"\x00")
+            except Exception:
+                pass
+        off += recLen
+    return bytes(buf)

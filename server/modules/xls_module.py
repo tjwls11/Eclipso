@@ -107,11 +107,33 @@ def extract_text_from_xls(file_bytes: bytes):
         print("XLS 추출 중 예외:", e)
         return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
 
+
 def redact(file_bytes: bytes) -> bytes:
-    """XLS 텍스트 기반 레닥션"""
-    result = extract_text_from_xls(file_bytes)
-    text = result.get("full_text", "")
-    if not text.strip():
-        return b""
-    redacted = apply_redaction_rules(text)
-    return redacted.encode("utf-8")
+    """XLS SST 내부 문자열 동일길이 치환"""
+    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+        if not ole.exists("Workbook"):
+            return file_bytes
+        wb = bytearray(ole.openstream("Workbook").read())
+
+    off = 0
+    while off + 4 < len(wb):
+        opcode, length = struct.unpack_from("<HH", wb, off)
+        off += 4
+        payload_off = off
+        payload_end = off + length
+
+        if opcode in (0x00FC, 0x00FD, 0x0204):
+            chunk = wb[payload_off:payload_end]
+            try:
+                txt = chunk.decode("utf-16le", errors="ignore") or chunk.decode("cp949", errors="ignore")
+                redacted = apply_redaction_rules(txt)
+                enc = redacted.encode("utf-16le") if len(txt.encode("utf-16le")) == len(chunk) else redacted.encode("cp949", errors="ignore")
+                wb[payload_off:payload_off+len(enc)] = enc.ljust(len(chunk), b"\x00")
+            except Exception:
+                pass
+        off = payload_end
+    return bytes(wb)
+
+def extract_text(file_bytes: bytes) -> dict:
+    """text_api.py 에서 호출되는 공통 인터페이스"""
+    return extract_text_from_xls(file_bytes)
