@@ -1,4 +1,4 @@
-import sys, os, re, zlib, struct, argparse, hashlib, io
+import sys, os, re, zlib, struct, argparse, hashlib
 import olefile
 
 ENDOFCHAIN = 0xFFFFFFFE
@@ -7,15 +7,19 @@ REC_TAG_BITS = (0, 10); REC_LEVEL_BITS = (10, 10); REC_SIZE_BITS = (20, 12)
 
 def bits(v, o, n): return (v >> o) & ((1 << n) - 1)
 
-def hexdump(b: bytes, width=16): return " ".join(f"{x:02X}" for x in b[:width])
-def sha256(b: bytes) -> str: return hashlib.sha256(b).hexdigest()[:16]
+def hexdump(b: bytes, width=16):
+    return " ".join(f"{x:02X}" for x in b[:width])
+
+def sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()[:16]
 
 def pad_to_length(blob: bytes, target: int) -> bytes:
     if len(blob) < target: return blob + b"\x00" * (target - len(blob))
     if len(blob) > target: return blob[:target]
     return blob
 
-def list_all_streams(ole): return ["/".join(p) for p in ole.listdir(streams=True, storages=False)]
+def list_all_streams(ole):
+    return ["/".join(p) for p in ole.listdir(streams=True, storages=False)]
 
 def find_direntry_by_tail(ole, name_tail: str):
     for e in ole.direntries:
@@ -102,7 +106,7 @@ def build_records(recs):
         out += data
     return bytes(out)
 
-# ---------- 치환 로직 ----------
+# ---------- 치환 로직----------
 def utf16_same_len_replace_with_logs(data: bytes, old: str, max_log=3):
     old_u16 = old.encode("utf-16le")
     ba = bytearray(data)
@@ -161,13 +165,14 @@ def visible_replace_keep_len_with_logs(data: bytes, old: str, max_log=3):
         return data, 0, logs + [" no match"]
     return struct.pack("<" + "H"*len(u16), *u16), total, logs
 
-# ---------- 스트림 처리 ----------
 def process_stream_with_logs(name: str, raw: bytes, old: str, max_log=3):
+
     try:
         dec = zlib.decompress(raw, -15)
         compressed = True
     except zlib.error:
         dec = raw; compressed = False
+    mode = "zlib" if compressed else "plain"
 
     reco_logs = []
     if name.startswith("BodyText/Section"):
@@ -175,46 +180,27 @@ def process_stream_with_logs(name: str, raw: bytes, old: str, max_log=3):
         n67 = sum(1 for t,_,_ in recs if t == TAG_PARA_TEXT)
         reco_logs.append(f" records: total={len(recs)}, TAG67={n67}")
 
+    # 치환
     new_dec, hits, rep_logs = visible_replace_keep_len_with_logs(dec, old, max_log)
     altered = (new_dec != dec)
     reco_logs += rep_logs + [f" hits={hits}, altered={altered}"]
 
+    # 재압축
     if compressed:
         cobj = zlib.compressobj(level=9, wbits=-15)
         re_raw = cobj.compress(new_dec) + cobj.flush()
     else:
         re_raw = new_dec
+
+    # 길이 보존
     re_raw_padded = pad_to_length(re_raw, len(raw))
     return re_raw_padded, compressed, hits, reco_logs, sha256(raw), sha256(re_raw_padded)
-
-# ---------- 차트(OLE) 수정 ----------
-def process_chart_stream(name: str, raw: bytes, chart_old: str, max_log=3):
-    logs = []
-    hits = 0
-    try:
-        o2 = olefile.OleFileIO(io.BytesIO(raw))
-    except Exception as e:
-        return raw, 0, [f"[error] inner OLE open failed: {e}"]
-
-    for s in o2.listdir():
-        sname = "/".join(s)
-        if sname.lower() in ("workbook", "chartdata"):
-            blob = o2.openstream(sname).read()
-            new_blob, cnt, rep_logs = utf16_same_len_replace_with_logs(blob, chart_old, max_log)
-            if cnt > 0:
-                raw = raw.replace(blob, new_blob, 1)
-                hits += cnt
-                logs += [f"[chart] {sname}: hits={cnt}"] + rep_logs
-    if hits == 0:
-        logs.append("[chart] no matches in OLE inner streams")
-    return raw, hits, logs
 
 # ---------- 메인 ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file")
-    ap.add_argument("--old", required=False)
-    ap.add_argument("--chart-old", required=False, help="OLE 내부(차트)에서 교체할 문자열")
+    ap.add_argument("--old", required=True)
     ap.add_argument("--dry-run", action="store_true", help="실제 쓰기 없이 로그만")
     ap.add_argument("--max-log", type=int, default=3, help="매칭 로그 최대 표시 개수")
     args = ap.parse_args()
@@ -236,26 +222,20 @@ def main():
         tail = name.split("/")[-1]
         entry = find_direntry_by_tail(ole, tail)
         if entry is None:
-            continue
+            print(f"[WARN] cannot find direntry for '{name}'"); continue
         cutoff = getattr(ole, "minisector_cutoff", 4096)
         which = "MiniFAT" if entry.size < cutoff else "FAT"
 
-        hits = 0
-        logs = []
-        new_raw = raw
-
-        if args.old:
-            new_raw, compressed, hits, logs, h0, h1 = process_stream_with_logs(name, raw, args.old, args.max_log)
-        elif args.chart_old and name.startswith("BinData/") and name.endswith(".OLE"):
-            new_raw, hits, logs = process_chart_stream(name, raw, args.chart_old, args.max_log)
-        else:
-            continue
-
+        new_raw, compressed, hits, logs, h0, h1 = process_stream_with_logs(name, raw, args.old, args.max_log)
         if hits == 0:
+            if name.startswith("BodyText/") or name.startswith("PrvText") or name.endswith("SummaryInformation"):
+                print(f"[MISS] {name}: type={which}, comp={'zlib' if compressed else 'plain'}, len={len(raw)}, logs={logs}")
             continue
 
-        print(f"[HIT ] {name}: type={which}, len={len(raw)}, hits={hits}")
+        print(f"[HIT ] {name}: type={which}, comp={'zlib' if compressed else 'plain'}, "
+              f"len={len(raw)}, hits={hits}, sha_before={h0}, sha_after={h1}")
         for L in logs: print("       -", L)
+
         total_hits += hits
 
         if args.dry_run:
@@ -264,7 +244,12 @@ def main():
             written = overwrite_minifat_chain(ole, container, entry.isectStart, new_raw)
         else:
             written = overwrite_bigfat_chain(ole, container, entry.isectStart, new_raw)
-        print(f"[WR  ] {name}: wrote {len(written)} blocks")
+        try:
+            nbytes = sum(w for _,w in written)
+            wspan = f"{len(written)} blocks, total_written={nbytes}"
+        except Exception:
+            wspan = "unknown"
+        print(f"[WR  ] {name}: wrote {wspan}")
 
     out = os.path.splitext(args.file)[0] + "_edit.hwp"
     if not args.dry_run:
