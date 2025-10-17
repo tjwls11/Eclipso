@@ -6,7 +6,10 @@ PDF 레닥션 엔진 (PyMuPDF)
   apply_redaction(pdf_bytes, boxes: List[Box], fill: Literal["black","white"]) -> bytes
 
 핵심 포인트
-- 이메일: page.search_for로 서브스트링 bbox 확보 → 문자 단위 bbox로 분해하여 '@'만 제외하고 전부 가림('.' 포함)
+- 이메일: '@'만 남기고 나머지(로컬파트·도메인·점 포함) 전부 가림
+  * PyMuPDF 버전마다 page.get_text("chars") 지원이 달라 AssertionError가 날 수 있어
+    문자 단위 bbox는 사용하지 않고, **이메일을 '@' 기준으로 분해한 세그먼트**를
+    이메일 전체 bbox 내부에서 search_for로 다시 찾아 그 영역을 가리는 방식으로 호환 처리.
 - 카드: 숫자/하이픈/공백 토큰 버퍼링 → 숫자만 추출 → 15~16자리 + Luhn/IIN validator
 - 최종 적용은 PyMuPDF 버전에 따라 문서 단위(doc.apply_redactions) 또는 페이지 단위(page.apply_redactions)로 호환 처리
 """
@@ -49,7 +52,7 @@ def _compile_pattern(p: PatternItem) -> re.Pattern:
     pattern = p.regex
     if getattr(p, "whole_word", False):
         pattern = rf"\b(?:{pattern})\b"
-    logger.debug("Compiling pattern: %s -> %s", p.name, pattern)
+    logger.debug("Compiling pattern: %s -> %s", getattr(p, "name", "?"), pattern)
     return re.compile(pattern, flags)
 
 def _page_words(page: fitz.Page) -> List[Tuple[float, float, float, float, str, int, int, int]]:
@@ -78,61 +81,84 @@ def _word_spans_to_rects(words: List[tuple], spans: List[Tuple[int, int]]) -> Li
     return rects
 
 def _build_box(page: int, rect: fitz.Rect, pattern_name: str, matched_text: str, valid: bool = True) -> Box:
+    # schemas.Box에 맞춰 필드 구성 (pattern_name / value는 라우팅에서 사용)
     return Box(
         page=page,
         x0=float(rect.x0), y0=float(rect.y0),
         x1=float(rect.x1), y1=float(rect.y1),
         pattern_name=pattern_name,
-        matched_text=matched_text,
+        value=matched_text,
         valid=valid,
     )
 
 # --------------------------------------------------------------------
-# 이메일 특수 처리: '@'만 남기고 문자 단위로 가리기
+# 이메일 특수 처리: '@'만 남기고 문자 단위로 가리기(버전 호환)
 # --------------------------------------------------------------------
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@(?:[A-Za-z0-9\-]+\.)+[A-Za-z]{2,}")
 
-def _merge_rects(rects: List[fitz.Rect], y_tol: float = 1.5, x_gap_tol: float = 1.5) -> List[fitz.Rect]:
-    """
-    문자 단위 rect들을 줄 단위로 뭉쳐 annotation 수를 줄임.
-    """
-    if not rects:
-        return []
-    rects = sorted(rects, key=lambda r: (round(r.y0, 1), r.x0))
-    merged: List[fitz.Rect] = []
-    cur = rects[0]
-    for r in rects[1:]:
-        same_line = abs(r.y0 - cur.y0) <= y_tol and abs(r.y1 - cur.y1) <= y_tol
-        touch = r.x0 - cur.x1 <= x_gap_tol
-        if same_line and touch:
-            cur = fitz.Rect(min(cur.x0, r.x0), min(cur.y0, r.y0), max(cur.x1, r.x1), max(cur.y1, r.y1))
-        else:
-            merged.append(cur)
-            cur = r
-    merged.append(cur)
-    return merged
+def _union_rect_of_quads(quads: list) -> Optional[fitz.Rect]:
+    if not quads:
+        return None
+    x0 = min(q.rect.x0 for q in quads); y0 = min(q.rect.y0 for q in quads)
+    x1 = max(q.rect.x1 for q in quads); y1 = max(q.rect.y1 for q in quads)
+    return fitz.Rect(x0, y0, x1, y1)
 
-def _email_char_rects(page: fitz.Page, email_rect: fitz.Rect) -> List[fitz.Rect]:
+def _search_within(page: fitz.Page, text: str, clip: Optional[fitz.Rect] = None) -> List[fitz.Rect]:
     """
-    이메일 영역 내부 문자 bbox 추출 → '@'만 제외하고 모두 마스킹 대상.
-    '.' 포함 모든 문자 가림.
+    페이지에서 텍스트를 찾되, PyMuPDF 버전별로 quads 지원 유무를 안전하게 처리.
+    clip 사각형이 주어지면 그 내부에서만 검색.
     """
-    char_rects: List[fitz.Rect] = []
+    rects: List[fitz.Rect] = []
     try:
-        for (x0, y0, x1, y1, ch, *_rest) in page.get_text("chars", clip=email_rect):
-            if not ch or ch.isspace():
-                continue
-            if ch == "@":
-                continue  # '@'는 남김
-            char_rects.append(fitz.Rect(x0, y0, x1, y1))
-    except Exception as e:
-        logger.warning(f"[EMAIL] chars 추출 실패: {e}")
-    return _merge_rects(char_rects)
+        # 최신: quads / clip 둘 다 지원
+        quads = page.search_for(text, quads=True, clip=clip)  # type: ignore
+        if quads:
+            r = _union_rect_of_quads(quads)
+            if r:
+                rects.append(r)
+    except TypeError:
+        # 구버전: quads / clip 미지원 가능
+        try:
+            found = page.search_for(text) or []
+            if clip:
+                for r in found:
+                    if r.intersects(clip):
+                        rects.append(r & clip)
+            else:
+                rects.extend(found)
+        except Exception as e:
+            logger.debug("search_for fallback failed: %s", e)
+    return rects
+
+def _email_segment_rects(page: fitz.Page, email_rect: fitz.Rect, email_text: str) -> List[fitz.Rect]:
+    """
+    이메일을 '@' 기준으로 분해해 각 세그먼트를 email_rect 안에서 다시 검색.
+    - '@' 세그먼트는 마스킹하지 않음
+    - 나머지 세그먼트(로컬파트, 도메인 전체)는 모두 마스킹
+    """
+    targets: List[str] = []
+    if "@" in email_text:
+        left, right = email_text.split("@", 1)
+        if left:  targets.append(left)
+        if right: targets.append(right)
+    else:
+        # 혹시 정규식/엔진이 '@' 없는 문자열을 넘기면 전체 가림
+        targets.append(email_text)
+
+    out: List[fitz.Rect] = []
+    for seg in targets:
+        seg = seg.strip()
+        if not seg:
+            continue
+        seg_rects = _search_within(page, seg, clip=email_rect)
+        out.extend(seg_rects)
+    return out
 
 def _detect_emails(page: fitz.Page, words: List[tuple]) -> List[Tuple[fitz.Rect, str]]:
     """
-    이메일 전체 bbox를 찾은 다음, 문자 단위로 쪼개 '@'만 남기고 박스 생성.
-    반환되는 rect는 "가릴 부분"의 영역들.
+    1) 페이지 텍스트에서 이메일 후보를 찾고
+    2) 후보 전체 bbox를 구한 뒤
+    3) '@' 기준 분해된 세그먼트들의 bbox만 모아서 리턴(= 가릴 부분)
     """
     text = page.get_text("text") or ""
     results: List[Tuple[fitz.Rect, str]] = []
@@ -141,30 +167,15 @@ def _detect_emails(page: fitz.Page, words: List[tuple]) -> List[Tuple[fitz.Rect,
         if not is_valid_email(candidate):
             continue
 
-        # 1) 이메일 전체 매치 bbox 확보 (quads 우선)
-        email_rects: List[fitz.Rect] = []
-        try:
-            quads = page.search_for(candidate, quads=True)
-            if quads:
-                x0 = min(q.rect.x0 for q in quads); y0 = min(q.rect.y0 for q in quads)
-                x1 = max(q.rect.x1 for q in quads); y1 = max(q.rect.y1 for q in quads)
-                email_rects = [fitz.Rect(x0, y0, x1, y1)]
-        except TypeError:
-            pass
-        if not email_rects:
-            found = page.search_for(candidate) or []
-            if found:
-                x0 = min(r.x0 for r in found); y0 = min(r.y0 for r in found)
-                x1 = max(r.x1 for r in found); y1 = max(r.y1 for r in found)
-                email_rects = [fitz.Rect(x0, y0, x1, y1)]
-
+        # 전체 후보 bbox
+        email_rects = _search_within(page, candidate)
         if not email_rects:
             continue
 
-        # 2) 각 이메일 bbox를 문자 단위로 분해 → '@' 제외 모두 결과에 추가
+        # 각 전체 bbox에 대해 세그먼트 영역 추출
         for er in email_rects:
-            for cr in _email_char_rects(page, er):
-                results.append((cr, candidate))
+            for rr in _email_segment_rects(page, er, candidate):
+                results.append((rr, candidate))
     return results
 
 # --------------------------------------------------------------------
@@ -226,7 +237,7 @@ def _detect_by_regex(page: fitz.Page, words: List[tuple], pitem: PatternItem) ->
             try:
                 ok = bool(validator(val))
             except Exception as e:
-                logger.debug("validator error for %s: %s", pitem.name, e)
+                logger.debug("validator error for %s: %s", getattr(pitem, "name", "?"), e)
                 ok = False
         if not ok:
             continue
@@ -261,14 +272,18 @@ def detect_boxes_from_patterns(pdf_bytes: bytes, patterns: List[PatternItem]) ->
         page = doc.load_page(pno)
         words = _page_words(page)
 
-        # 이메일: '@' 제외 문자 단위 박스 추가
+        # 이메일: '@' 제외 마스킹 영역 박스
         if "email" in by_name:
-            for rect, val in _detect_emails(page, words):
+            email_boxes = _detect_emails(page, words)
+            logger.debug("[PDF] page=%d emails=%d", pno, len(email_boxes))
+            for rect, val in email_boxes:
                 boxes.append(_build_box(pno, rect, "email", val, True))
 
         # 카드
         if "card" in by_name:
-            for rect, val in _detect_cards(page, words):
+            card_boxes = _detect_cards(page, words)
+            logger.debug("[PDF] page=%d cards=%d", pno, len(card_boxes))
+            for rect, val in card_boxes:
                 boxes.append(_build_box(pno, rect, "card", val, True))
 
         # 일반 정규식

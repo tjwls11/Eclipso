@@ -126,6 +126,40 @@ def _dedup_boxes(boxes: List[Box], tol: float = 0.25) -> List[Box]:
     return out
 
 # ---------------------------
+# 우선순위 기반 중복 제거 (카드 > 전화 등)
+# ---------------------------
+_PRIORITY = {
+    "card": 100,
+    "email": 90,
+    "rrn": 80,
+    "fgn": 80,
+    "phone_mobile": 60,
+    "phone_city": 60,
+    "phone_service": 60,
+    "driver_license": 40,
+    "passport": 30,
+}
+
+def _overlap_rect(a: Box, b: Box) -> bool:
+    return not (a.x1 <= b.x0 or b.x1 <= a.x0 or a.y1 <= b.y0 or b.y1 <= a.y0)
+
+def _suppress_overlapping_boxes(boxes: List[Box]) -> List[Box]:
+    """
+    같은 페이지에서 박스가 겹치면 우선순위가 높은 rule만 남김.
+    """
+    boxes = sorted(
+        boxes,
+        key=lambda b: (_PRIORITY.get((b.pattern_name or ""), 0), -(b.x1 - b.x0) * (b.y1 - b.y0)),
+        reverse=True,
+    )
+    kept: List[Box] = []
+    for b in boxes:
+        if any(b.page == k.page and _overlap_rect(b, k) for k in kept):
+            continue
+        kept.append(b)
+    return kept
+
+# ---------------------------
 # PDF 텍스트/오프셋 인덱스
 # ---------------------------
 def _pdf_text_and_word_index(pdf_bytes: bytes):
@@ -219,6 +253,9 @@ async def detect(
     patterns = _parse_patterns_json(patterns_json)
 
     boxes = detect_boxes_from_patterns(pdf, patterns)
+    # 겹침 제거
+    boxes = _suppress_overlapping_boxes(boxes)
+
     elapsed = (time.perf_counter() - t0) * 1000
     log.debug("DETECT done: total=%d elapsed=%.2fms", len(boxes), elapsed)
     return DetectResponse(total_matches=len(boxes), boxes=boxes)
@@ -264,6 +301,10 @@ async def apply(
             raise HTTPException(status_code=400, detail="boxes가 비어있습니다. (mode=strict)")
 
     final_boxes, _ = _filter_boxes(base_boxes, include_patterns=incl, exclude_patterns=excl)
+
+    # 겹침 제거 (카드 > 전화 등)
+    final_boxes = _suppress_overlapping_boxes(final_boxes)
+
     out = apply_redaction(pdf, final_boxes, fill=fill or "black")
 
     # 캐시/파일명
@@ -292,6 +333,9 @@ async def pdf_scan_endpoint(
     patterns = _parse_patterns_json(patterns_json)
 
     boxes = detect_boxes_from_patterns(pdf, patterns)
+    # 겹침 제거
+    boxes = _suppress_overlapping_boxes(boxes)
+
     full_text, index = _pdf_text_and_word_index(pdf)
     matches = _boxes_to_matches_with_offsets(boxes, index)
 
