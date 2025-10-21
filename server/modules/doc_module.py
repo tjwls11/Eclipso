@@ -1,8 +1,12 @@
 import io
 import struct
+import tempfile
+import os
 import olefile
+from typing import List, Dict, Any, Tuple, Optional
+
 from server.core.redaction_rules import apply_redaction_rules
-from typing import List, Dict, Any
+from server.core.normalize import normalize_text
 
 
 def le16(b: bytes, off: int) -> int:
@@ -12,18 +16,53 @@ def le32(b: bytes, off: int) -> int:
     return struct.unpack_from("<I", b, off)[0]
 
 
-# CLX / PlcPcd 관련 파서
+# WordDocument/Table Stream 처리
+def _get_table_stream_name(word_data: bytes, ole: olefile.OleFileIO) -> Optional[str]:
+    """테이블 스트림 이름 반환"""
+    fib_flags = le16(word_data, 0x000A)
+    fWhichTblStm = (fib_flags & 0x0200) != 0
+    tbl_name = "1Table" if fWhichTblStm and ole.exists("1Table") else "0Table"
+    return tbl_name if ole.exists(tbl_name) else None
+
+
+def _read_word_and_table_streams(file_bytes: bytes) -> Tuple[Optional[bytes], Optional[bytes], Optional[str]]:
+    """WordDocument와 Table 스트림 읽기"""
+    try:
+        buffer = io.BytesIO(file_bytes)
+        buffer.seek(0)
+        with olefile.OleFileIO(buffer) as ole:
+            if not ole.exists("WordDocument"):
+                return None, None, None
+            word_data = ole.openstream("WordDocument").read()
+            tbl_name = _get_table_stream_name(word_data, ole)
+            if not tbl_name:
+                return word_data, None, None
+            table_data = ole.openstream(tbl_name).read()
+            return word_data, table_data, tbl_name
+    except Exception:
+        return None, None, None
+
+
+def _get_clx_data(word_data: bytes, table_data: bytes) -> Optional[bytes]:
+    """CLX 데이터 추출"""
+    fcClx = le32(word_data, 0x01A2)
+    lcbClx = le32(word_data, 0x01A6)
+    if fcClx + lcbClx > len(table_data):
+        return None
+    return table_data[fcClx:fcClx + lcbClx]
+
+# CLX / PlcPcd 파서
 def _extract_plcpcd(clx: bytes) -> bytes:
     """CLX 블록에서 PlcPcd 서브블록 추출"""
     i = 0
     while i < len(clx):
         tag = clx[i]
         i += 1
-        if tag == 0x01:  # Prc (서식 정보)
+        if tag == 0x01:
             if i + 2 > len(clx): break
             cb = struct.unpack_from("<H", clx, i)[0]
             i += 2 + cb
-        elif tag == 0x02:  # Pcdt (PlcPcd)
+        elif tag == 0x02:
             if i + 4 > len(clx): break
             lcb = struct.unpack_from("<I", clx, i)[0]
             i += 4
@@ -33,28 +72,25 @@ def _extract_plcpcd(clx: bytes) -> bytes:
     return b""
 
 
+
 def _parse_plcpcd(plcpcd: bytes) -> List[Dict[str, Any]]:
     """PlcPcd에서 조각 정보 추출"""
     size = len(plcpcd)
     if size < 4 or (size - 4) % 12 != 0:
         return []
-
     n = (size - 4) // 12
     aCp = [le32(plcpcd, 4 * i) for i in range(n + 1)]
     pcd_off = 4 * (n + 1)
     pieces = []
     for k in range(n):
-        pcd_bytes = plcpcd[pcd_off + 8 * k : pcd_off + 8 * (k + 1)]
+        pcd_bytes = plcpcd[pcd_off + 8*k : pcd_off + 8*(k+1)]
         fc_raw = le32(pcd_bytes, 2)
-
         fc = fc_raw & 0x3FFFFFFF
         fCompressed = (fc_raw & 0x40000000) != 0
-
         cp_start = aCp[k]
-        cp_end = aCp[k + 1]
+        cp_end = aCp[k+1]
         char_count = cp_end - cp_start
         byte_count = char_count if fCompressed else char_count * 2
-
         pieces.append({
             "index": k,
             "fc": fc,
@@ -67,236 +103,141 @@ def _parse_plcpcd(plcpcd: bytes) -> List[Dict[str, Any]]:
 def _decode_piece(chunk: bytes, fCompressed: bool) -> str:
     """조각 디코딩"""
     try:
-        if fCompressed:
-            return chunk.decode("cp1252", errors="ignore")
-        else:
-            return chunk.decode("utf-16le", errors="ignore")
+        return chunk.decode("cp1252" if fCompressed else "utf-16le", errors="ignore")
     except Exception:
         return ""
 
 
-
-# 텍스트 추출
+# 텍스트 추출 (정규화 포함)
 def extract_text(file_bytes: bytes) -> dict:
     """DOC 본문 텍스트 추출"""
     try:
-        buffer = io.BytesIO(file_bytes)
-        buffer.seek(0)
+        word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
+        if not word_data:
+            print("WordDocument 스트림 없음 → 빈 텍스트 반환")
+            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        if not table_data:
+            print("Table 스트림 없음:", tbl_name)
+            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        clx = _get_clx_data(word_data, table_data)
+        if not clx:
+            print("CLX 범위 초과 → 무시")
+            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        plcpcd = _extract_plcpcd(clx)
+        if not plcpcd:
+            print("PlcPcd 없음")
+            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        pieces = _parse_plcpcd(plcpcd)
 
-        with olefile.OleFileIO(buffer) as ole:
-            if not ole.exists("WordDocument"):
-                print("WordDocument 스트림 없음 → 빈 텍스트 반환")
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        texts = []
+        for p in pieces:
+            start, end = p["fc"], p["fc"] + p["byte_count"]
+            if end > len(word_data): continue
+            chunk = word_data[start:end]
+            texts.append(_decode_piece(chunk, p["fCompressed"]))
 
-            word_data = ole.openstream("WordDocument").read()
-            fib_flags = le16(word_data, 0x000A)
-            fWhichTblStm = (fib_flags & 0x0200) != 0
-            tbl_name = "1Table" if fWhichTblStm and ole.exists("1Table") else "0Table"
-
-            if not ole.exists(tbl_name):
-                print("Table 스트림 없음:", tbl_name)
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
-
-            table_data = ole.openstream(tbl_name).read()
-            fcClx = le32(word_data, 0x01A2)
-            lcbClx = le32(word_data, 0x01A6)
-
-            if fcClx + lcbClx > len(table_data):
-                print("CLX 범위 초과 → 무시")
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
-
-            clx = table_data[fcClx:fcClx + lcbClx]
-            plcpcd = _extract_plcpcd(clx)
-            if not plcpcd:
-                print("PlcPcd 없음")
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
-
-            pieces = _parse_plcpcd(plcpcd)
-            texts = []
-            for p in pieces[:5]:
-                start, end = p["fc"], p["fc"] + p["byte_count"]
-                if end > len(word_data):
-                    continue
-                chunk = word_data[start:end]
-                texts.append(_decode_piece(chunk, p["fCompressed"]))
-
-            full_text = "\n".join(texts)
-            return {"full_text": full_text, "pages": [{"page": 1, "text": full_text}]}
-
+        full_text = "\n".join(texts)
+        normalized_text = normalize_text(full_text)
+        return {"full_text": normalized_text, "pages": [{"page": 1, "text": normalized_text}]}
     except Exception as e:
         print("DOC 추출 중 예외:", e)
         return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
-
-
-# DOC 포맷 유지형 레닥션 (파일 구조 보존)
-def redact(file_bytes: bytes) -> bytes:
-    """DOC 포맷 유지하면서 레닥션"""
+# 동일 길이 치환 (*)
+def replace_text(file_bytes: bytes, targets: List[str], replacement_char: str = "*") -> bytes:
+    """정규화 기반 탐지 결과를 반영하여 동일 길이 '*'로 치환"""
     try:
-        print("DOC DEBUG HEADER:", file_bytes[:32].hex().upper())
-        print("파일 전체 크기:", len(file_bytes))
+        word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
+        if not word_data or not table_data:
+            raise ValueError("WordDocument 또는 Table 스트림을 읽을 수 없습니다")
+        clx = _get_clx_data(word_data, table_data)
+        if not clx:
+            raise ValueError("CLX 데이터를 추출할 수 없습니다")
+        plcpcd = _extract_plcpcd(clx)
+        if not plcpcd:
+            raise ValueError("PlcPcd 데이터를 추출할 수 없습니다")
 
-        # 헤더 검사
-        if not file_bytes.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
-            print("[ERROR] Doc 파일이 아닙니다.")
+        pieces = _parse_plcpcd(plcpcd)
+        replaced_word_data = bytearray(word_data)
+        total_replacement = 0
+
+        for target_text in targets:
+            replacement_text = "".join(c if c == "-" else replacement_char for c in target_text)
+            for p in pieces:
+                start_pos = p["fc"]
+                end_pos = p["fc"] + p["byte_count"]
+                if end_pos > len(word_data): continue
+                chunk = word_data[start_pos:end_pos]
+                original_text = _decode_piece(chunk, p["fCompressed"])
+                search_start = 0
+                while True:
+                    idx = original_text.find(target_text, search_start)
+                    if idx == -1: break
+                    bytes_per_char = 1 if p["fCompressed"] else 2
+                    byte_start = start_pos + idx * bytes_per_char
+                    byte_len = len(target_text) * bytes_per_char
+                    if p["fCompressed"]:
+                        replacement_bytes = b"*" * byte_len
+                    else:
+                        replacement_bytes = (b"*\x00") * (byte_len // 2)
+                    replaced_word_data[byte_start:byte_start + byte_len] = replacement_bytes
+                    total_replacement += 1
+                    search_start = idx + len(target_text)
+
+        print(f"총 {total_replacement}개 치환 완료")
+        return _create_new_ole_file(file_bytes, bytes(replaced_word_data))
+    except Exception as e:
+        print(f"텍스트 치환 중 오류: {e}")
+        return file_bytes
+
+
+# WordDocument 스트림 교체
+def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
+    """olefile 공식 write_stream()을 사용해 WordDocument만 교체"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
+            tmp.write(original_file_bytes)
+            tmp_path = tmp.name
+        with olefile.OleFileIO(tmp_path, write_mode=True) as ole:
+            if not ole.exists("WordDocument"):
+                print("[WARN] WordDocument 스트림 없음")
+                return original_file_bytes
+            old_data = ole.openstream("WordDocument").read()
+            if len(old_data) != len(new_word_data):
+                print(f"[WARN] WordDocument 길이 불일치 → 교체 중단 ({len(new_word_data)} vs {len(old_data)})")
+                return original_file_bytes
+            ole.write_stream("WordDocument", new_word_data)
+            print("[OK] WordDocument 스트림 교체 완료")
+        with open(tmp_path, "rb") as f:
+            result = f.read()
+        os.remove(tmp_path)
+        return result
+    except Exception as e:
+        print(f"OLE 파일 생성 중 오류: {e}")
+        return original_file_bytes
+
+# 레닥션
+def redact(file_bytes: bytes) -> bytes:
+    try:
+        extracted_data = extract_text(file_bytes)
+        normalized_text = extracted_data["full_text"]
+        if not normalized_text:
+            print("추출된 텍스트가 없어 레닥션을 건너뜀")
+            return file_bytes
+        redacted_text = apply_redaction_rules(normalized_text)
+        if redacted_text == normalized_text:
+            print("민감정보가 발견되지 않아 원본 파일 반환")
             return file_bytes
 
-        buffer = io.BytesIO(file_bytes)
-        buffer.seek(0)
+        # apply_redaction_rules 결과에서 마스킹된 구간을 추출하는 대신,
+        # 탐지된 문자열을 '*'로 치환하도록 replace_text 호출
+        targets = []
+        for match in apply_redaction_rules(normalized_text).split("*"):
+            if match and match in normalized_text:
+                targets.append(match)
 
-        with olefile.OleFileIO(buffer) as ole:
-            if not ole.exists("WordDocument"):
-                print("WordDocument 스트림 없음")
-                return file_bytes
-
-            # WordDocument 스트림 수정
-            word_data = bytearray(ole.openstream("WordDocument").read())
-
-            # 단순 텍스트 블록 단위 레닥션
-            for i in range(0, len(word_data), 512):
-                chunk = word_data[i:i + 512]
-                try:
-                    txt = chunk.decode("utf-16le", errors="ignore")
-                    red = apply_redaction_rules(txt)
-                    enc = red.encode("utf-16le")
-                    word_data[i:i + len(enc)] = enc[:len(chunk)].ljust(len(chunk), b"\x00")
-                except Exception:
-                    continue
-
-            print("[OK] WordDocument 수정 완료")
-            return bytes(word_data)
-
-    except Exception as e:
-        print(f"DOC 기본 레닥션 중 오류: {e}")
-        return file_bytes
-
-
-
-# 특정 문자열 동일 길이 치환
-def replace_text(file_bytes: bytes, targets: List[str], replacement_char: str = "*") -> bytes:
-    """DOC 파일에서 특정 문자열을 동일 길이로 치환"""
-    try:
-        buffer = io.BytesIO(file_bytes)
-        buffer.seek(0)
-
-        with olefile.OleFileIO(buffer) as ole:
-            if not ole.exists("WordDocument"):
-                return file_bytes
-
-            word_data = ole.openstream("WordDocument").read()
-            fib_flags = le16(word_data, 0x000A)
-            fWhichTblStm = (fib_flags & 0x0200) != 0
-            tbl_stream = "1Table" if fWhichTblStm else "0Table"
-
-            if not ole.exists(tbl_stream):
-                return file_bytes
-
-            table_data = ole.openstream(tbl_stream).read()
-            fcClx = le32(word_data, 0x01A2)
-            lcbClx = le32(word_data, 0x01A6)
-
-            if lcbClx == 0 or fcClx + lcbClx > len(table_data):
-                return file_bytes
-
-            clx = table_data[fcClx:fcClx + lcbClx]
-            plcpcd = _extract_plcpcd(clx)
-            pieces = _parse_plcpcd(plcpcd)
-
-            replaced_word_data = bytearray(word_data)
-            total_replacement = 0
-
-            for target_text in targets:
-                replacement_text = "".join(c if c == "-" else replacement_char for c in target_text)
-                for p in pieces:
-                    start_pos = p["fc"]
-                    end_pos = p["fc"] + p["byte_count"]
-                    if end_pos > len(word_data):
-                        continue
-
-                    chunk = word_data[start_pos:end_pos]
-                    text = _decode_piece(chunk, p["fCompressed"])
-
-                    search_start = 0
-                    while True:
-                        idx = text.find(target_text, search_start)
-                        if idx == -1:
-                            break
-
-                        bytes_per_char = 1 if p["fCompressed"] else 2
-                        byte_start = start_pos + idx * bytes_per_char
-                        byte_len = len(target_text) * bytes_per_char
-
-                        enc = "cp1252" if p["fCompressed"] else "utf-16le"
-                        replacement_bytes = replacement_text.encode(enc, errors="replace")
-
-                        if len(replacement_bytes) != byte_len:
-                            replacement_bytes = replacement_bytes.ljust(byte_len, b"\x00")
-
-                        replaced_word_data[byte_start:byte_start + byte_len] = replacement_bytes
-                        total_replacement += 1
-                        search_start = idx + len(target_text)
-
-            print(f"총 {total_replacement}개 치환 완료")
-            return bytes(replaced_word_data)
-
-    except Exception as e:
-        print(f"DOC 치환 중 오류: {e}")
-        return file_bytes
-
-
-
-def redact_with_targets(file_bytes: bytes, targets: List[str] = None) -> bytes:
-    """target이 없으면 기본 레닥션, 있으면 직접 치환"""
-    if not targets:
-        return redact(file_bytes)
-    else:
         return replace_text(file_bytes, targets)
-
-
-def validate_doc_file(file_bytes: bytes) -> bool:
-    """DOC 파일이 올바른 OLE 컨테이너인지 검증"""
-    try:
-        buffer = io.BytesIO(file_bytes)
-        buffer.seek(0)
-        with olefile.OleFileIO(buffer) as ole:
-            if not ole.exists("WordDocument"):
-                print("WordDocument 스트림 없음")
-                return False
-            ole.openstream("WordDocument").read()
-            print("DOC 파일 검증 성공")
-            return True
     except Exception as e:
-        print(f"DOC 파일 검증 실패: {e}")
-        return False
-
-
-def get_doc_info(file_bytes: bytes) -> dict:
-    """DOC 파일 기본 구조 정보 반환"""
-    try:
-        buffer = io.BytesIO(file_bytes)
-        buffer.seek(0)
-        with olefile.OleFileIO(buffer) as ole:
-            info = {
-                "is_valid_ole": True,
-                "streams": ole.listdir(),
-                "worddocument_size": 0,
-                "has_table_stream": False
-            }
-            if ole.exists("WordDocument"):
-                word_data = ole.openstream("WordDocument").read()
-                info["worddocument_size"] = len(word_data)
-                fib_flags = le16(word_data, 0x000A)
-                fWhichTblStm = (fib_flags & 0x0200) != 0
-                tbl_name = "1Table" if fWhichTblStm else "0Table"
-                info["has_table_stream"] = ole.exists(tbl_name)
-                info["table_stream_name"] = tbl_name
-            return info
-    except Exception as e:
-        return {
-            "is_valid_ole": False,
-            "error": str(e),
-            "streams": [],
-            "worddocument_size": 0,
-            "has_table_stream": False
-        }
+        print(f"DOC 레닥션 중 오류: {e}")
+        return file_bytes
