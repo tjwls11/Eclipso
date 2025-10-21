@@ -1,7 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Response, HTTPException, Form
 from pathlib import Path
 from server.modules import doc_module, hwp_module, ppt_module, xls_module, pdf_module
-import json
 
 router = APIRouter(prefix="/redact", tags=["redact"])
 

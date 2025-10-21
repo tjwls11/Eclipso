@@ -5,8 +5,8 @@ import os
 import olefile
 from typing import List, Dict, Any, Tuple, Optional
 
-from server.core.redaction_rules import apply_redaction_rules
-from server.core.normalize import normalize_text
+from server.core.normalize import normalization_text, normalization_index
+from server.core.matching import find_sensitive_spans
 
 
 def le16(b: bytes, off: int) -> int:
@@ -92,10 +92,12 @@ def _parse_plcpcd(plcpcd: bytes) -> List[Dict[str, Any]]:
         char_count = cp_end - cp_start
         byte_count = char_count if fCompressed else char_count * 2
         pieces.append({
-            "index": k,
-            "fc": fc,
-            "byte_count": byte_count,
-            "fCompressed": fCompressed
+        "index": k,
+        "fc": fc,
+        "byte_count": byte_count,
+        "fCompressed": fCompressed,
+        "cp_start": cp_start, 
+        "cp_end": cp_end     
         })
     return pieces
 
@@ -137,7 +139,7 @@ def extract_text(file_bytes: bytes) -> dict:
             texts.append(_decode_piece(chunk, p["fCompressed"]))
 
         full_text = "\n".join(texts)
-        normalized_text = normalize_text(full_text)
+        normalized_text = normalization_text(full_text)
         return {"full_text": normalized_text, "pages": [{"page": 1, "text": normalized_text}]}
     except Exception as e:
         print("DOC 추출 중 예외:", e)
@@ -145,7 +147,7 @@ def extract_text(file_bytes: bytes) -> dict:
 
 
 # 동일 길이 치환 (*)
-def replace_text(file_bytes: bytes, targets: List[str], replacement_char: str = "*") -> bytes:
+def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replacement_char: str = "*") -> bytes:
     """정규화 기반 탐지 결과를 반영하여 동일 길이 '*'로 치환"""
     try:
         word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
@@ -162,28 +164,22 @@ def replace_text(file_bytes: bytes, targets: List[str], replacement_char: str = 
         replaced_word_data = bytearray(word_data)
         total_replacement = 0
 
-        for target_text in targets:
-            replacement_text = "".join(c if c == "-" else replacement_char for c in target_text)
+        for start, end, _ in targets:
             for p in pieces:
-                start_pos = p["fc"]
-                end_pos = p["fc"] + p["byte_count"]
-                if end_pos > len(word_data): continue
-                chunk = word_data[start_pos:end_pos]
-                original_text = _decode_piece(chunk, p["fCompressed"])
-                search_start = 0
-                while True:
-                    idx = original_text.find(target_text, search_start)
-                    if idx == -1: break
-                    bytes_per_char = 1 if p["fCompressed"] else 2
-                    byte_start = start_pos + idx * bytes_per_char
-                    byte_len = len(target_text) * bytes_per_char
-                    if p["fCompressed"]:
-                        replacement_bytes = b"*" * byte_len
-                    else:
-                        replacement_bytes = (b"*\x00") * (byte_len // 2)
-                    replaced_word_data[byte_start:byte_start + byte_len] = replacement_bytes
+                fc_base = p["fc"]
+                byte_per_char = 1 if p["fCompressed"] else 2
+                cp_start = p["cp_start"]
+                cp_end = p["cp_end"]
+
+                # 탐지된 인덱스가 이 조각 범위에 포함될 때만
+                if start >= cp_start and start < cp_end:
+                    real_byte_start = fc_base + (start - cp_start) * byte_per_char
+                    real_byte_end   = fc_base + (end - cp_start) * byte_per_char
+
+                    replacement_bytes = b"*" * (real_byte_end - real_byte_start)
+                    replaced_word_data[real_byte_start:real_byte_end] = replacement_bytes
                     total_replacement += 1
-                    search_start = idx + len(target_text)
+
 
         print(f"총 {total_replacement}개 치환 완료")
         return _create_new_ole_file(file_bytes, bytes(replaced_word_data))
@@ -221,23 +217,30 @@ def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> by
 def redact(file_bytes: bytes) -> bytes:
     try:
         extracted_data = extract_text(file_bytes)
-        normalized_text = extracted_data["full_text"]
-        if not normalized_text:
-            print("추출된 텍스트가 없어 레닥션을 건너뜀")
+        original_text = extracted_data["full_text"]
+        if not original_text:
+            print("추출된 텍스트가 없음. 레닥션 건너뜀")
             return file_bytes
-        redacted_text = apply_redaction_rules(normalized_text)
-        if redacted_text == normalized_text:
+        
+        #정규화 + 인덱스 맵 생성
+        normalized_text, index_map = normalization_index(original_text)
+
+        #정규식 기반 탐지 결과 
+        matches = find_sensitive_spans(normalized_text)
+        if not matches: 
             print("민감정보가 발견되지 않아 원본 파일 반환")
             return file_bytes
 
-        # apply_redaction_rules 결과에서 마스킹된 구간을 추출하는 대신,
-        # 탐지된 문자열을 '*'로 치환하도록 replace_text 호출
+        #원문 인덱스로 변환
         targets = []
-        for match in apply_redaction_rules(normalized_text).split("*"):
-            if match and match in normalized_text:
-                targets.append(match)
+        for start, end, value, _ in matches:
+            orig_start = index_map[start]
+            orig_end = index_map[end - 1] + 1
+            targets.append((orig_start, orig_end, value))
 
+        # 실제 바이트 치환 수행
         return replace_text(file_bytes, targets)
+
     except Exception as e:
         print(f"DOC 레닥션 중 오류: {e}")
         return file_bytes

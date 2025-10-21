@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import List, Optional, Literal, Tuple, Set
+from typing import Dict, List, Optional, Literal, Tuple, Set
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 from server.core.schemas import DetectResponse, PatternItem, Box
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
 from server.core.redaction_rules import PRESET_PATTERNS
+from server.core.matching import find_sensitive_spans
 
 
 router = APIRouter(tags=["redaction"])
@@ -254,49 +255,31 @@ async def apply(
     )
 
 def match_text(text: str):
-    import re
-    from ..core.redaction_rules import PRESET_PATTERNS
-    import traceback
-
     try:
         if not isinstance(text, str):
-            print("[match_text] text 타입:", type(text))
             text = str(text)
 
+        results = find_sensitive_spans(text)
         matches = []
-        counts = {}
+        counts: Dict[str, int] = {}
 
-        for rule in PRESET_PATTERNS:
-            pattern = rule.get("regex")
-            name = rule.get("name", "")
-            if not pattern:
-                continue
-
-            try:
-                regex = re.compile(pattern, re.IGNORECASE)
-            except re.error as err:
-                print(f"정규식 컴파일 실패: {name} ({err})")
-                continue
-
-            found = list(regex.finditer(text))
-            counts[name] = len(found)
-
-            for m in found:
-                ctx_start = max(0, m.start() - 20)
-                ctx_end = min(len(text), m.end() + 20)
-                matches.append({
-                    "rule": name,
-                    "value": m.group(),
-                    "start": m.start(),
-                    "end": m.end(),
-                    "context": text[ctx_start:ctx_end],
-                    "valid": True,
-                })
+        for start, end, value, rule_name in results:
+            ctx_start = max(0, start - 20)
+            ctx_end = min(len(text), end + 20)
+            matches.append({
+                "rule": rule_name,
+                "value": value,
+                "start": start,
+                "end": end,
+                "context": text[ctx_start:ctx_end],
+                "valid": True,
+            })
+            counts[rule_name] = counts.get(rule_name, 0) + 1
 
         print(f"매칭 완료: 총 {len(matches)}개 발견")
         return {"items": matches, "counts": counts}
 
     except Exception as e:
         print("match_text 내부 오류:", e)
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")
+
