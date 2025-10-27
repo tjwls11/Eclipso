@@ -1,4 +1,4 @@
-# server/xml/common.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io, re, zipfile, xml.etree.ElementTree as ET
 from typing import Tuple, List, Dict
@@ -238,3 +238,26 @@ def redact_ole_conservative(data: bytes) -> bytes:
     _mask_regex_ascii(b, _CARD_ASCII_RX)
     _mask_regex_u16(b, _CARD_U16_RX)
     return bytes(b)
+
+# ---------- 차트 RELS 정리(중요: 복구 팝업 방지) ----------
+def chart_rels_sanitize(xml_bytes: bytes) -> tuple[bytes, int]:
+    """
+    word/charts/_rels/chartN.xml.rels 에서 외부데이터/임베딩으로 가는 관계 제거.
+    - Target에 'embeddings/' 또는 'externalLinks/'가 포함
+    - 또는 Type이 '/package'로 끝나는 Relationship
+    """
+    try:
+        tree, enc = et_from_bytes(xml_bytes)
+        root = tree.getroot()
+        hits = 0
+        for rel in list(root):
+            # '{ns}Relationship' -> 'Relationship'
+            if rel.tag.rsplit("}", 1)[-1] != "Relationship":
+                continue
+            target = rel.attrib.get("Target", "")
+            rtype  = rel.attrib.get("Type", "")
+            if ("embeddings/" in target) or ("externalLinks/" in target) or rtype.endswith("/package"):
+                root.remove(rel); hits += 1
+        return (et_to_bytes(tree, enc), hits) if hits else (xml_bytes, 0)
+    except Exception:
+        return xml_bytes, 0

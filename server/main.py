@@ -1,38 +1,54 @@
-# server/main.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from fastapi import FastAPI
+import logging, traceback
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
 
-app = FastAPI(title="Redaction Demo API", version="2.0.0")
+from .routes.redaction import router as redaction_router
 
-# CORS (필요 시 도메인 제한)
+# ── 콘솔 로깅 포맷 고정 ───────────────────────────────────────────────────
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+fmt = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
+if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+    h = logging.StreamHandler()
+    h.setFormatter(fmt)
+    root.addHandler(h)
+
+logging.getLogger("ole_redactor").setLevel(logging.INFO)
+logging.getLogger("xml_redaction").setLevel(logging.INFO)
+
+# ── FastAPI ───────────────────────────────────────────────────────────────
+app = FastAPI(title="Eclipso XML Demo")
+
+# CORS: 로컬 프론트에서 fetch 실패 방지
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # 필요 시 프론트 주소로 좁히세요
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 정적 UI 서빙 (원하면 사용)
-# app.mount("/ui", StaticFiles(directory="client", html=True), name="ui")
+# ── 전역 예외 핸들러: 500도 JSON으로, 터미널에는 스택 출력 ───────────────
+@app.exception_handler(Exception)
+async def _unhandled_ex(request: Request, exc: Exception):
+    logging.error("UNHANDLED %s %s", request.method, request.url.path)
+    logging.error("TRACEBACK:\n%s", "".join(traceback.format_exc()))
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "path": request.url.path},
+    )
 
-# 라우터 연결
-# 프로젝트마다 파일명이 다를 수 있어 둘 다 시도
-try:
-    from .routes import redaction as redaction_routes
-    app.include_router(redaction_routes.router)
-except Exception:
-    pass
+@app.exception_handler(RequestValidationError)
+async def _validation_ex(request: Request, exc: RequestValidationError):
+    logging.error("VALIDATION ERROR %s %s -> %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-try:
-    # 네가 올린 파일명이 server/routes_redaction.py 라면 이쪽
-    from . import routes_redaction as routes_redaction_module
-    app.include_router(routes_redaction_module.router)
-except Exception:
-    pass
+# 라우터
+app.include_router(redaction_router)
 
 @app.get("/healthz")
 def healthz():
