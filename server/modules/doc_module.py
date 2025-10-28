@@ -108,6 +108,117 @@ def _decode_piece(chunk: bytes, fCompressed: bool) -> str:
         return ""
 
 
+# ====== [DEBUG] 조각별 텍스트/메타 확인 유틸 ======
+
+def _safe_preview(s: str, head: int = 80, tail: int = 80) -> Tuple[str, str, int]:
+    """문자열 앞/뒤 일부만 미리보기로 자르고 중간 길이를 알려줌"""
+    if len(s) <= head + tail:
+        return (s, "", 0)
+    return (s[:head], s[-tail:], len(s) - head - tail)
+
+def debug_dump_doc(file_bytes: bytes) -> Dict[str, Any]:
+    """
+    Word 97-2003(.doc) 문서에서
+    - pieces 메타(cp_start/cp_end, fc, byte_count, fCompressed)
+    - 각 piece의 텍스트 샘플(앞/뒤)과 길이
+    - 전체 raw_text/normalized_text 길이
+    를 한 번에 확인.
+    """
+    dump: Dict[str, Any] = {"ok": False, "error": None}
+
+    try:
+        word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
+        if not word_data or not table_data:
+            dump["error"] = "WordDocument 또는 Table 스트림 없음"
+            return dump
+
+        clx = _get_clx_data(word_data, table_data)
+        if not clx:
+            dump["error"] = "CLX 없음/범위 초과"
+            return dump
+
+        plcpcd = _extract_plcpcd(clx)
+        if not plcpcd:
+            dump["error"] = "PlcPcd 없음"
+            return dump
+
+        pieces = _parse_plcpcd(plcpcd)
+
+        piece_reports = []
+        texts = []
+        for p in pieces:
+            start, end = p["fc"], p["fc"] + p["byte_count"]
+            if end > len(word_data):
+                # WordDocument 범위를 벗어난 조각 (깨진 piece)
+                piece_reports.append({
+                    **p,
+                    "status": "out_of_range",
+                    "preview_head": "",
+                    "preview_tail": "",
+                    "omitted_len": 0,
+                })
+                continue
+
+            chunk = word_data[start:end]
+            text = _decode_piece(chunk, p["fCompressed"])
+            texts.append(text)
+
+            head, tail, omitted = _safe_preview(text)
+            piece_reports.append({
+                **p,
+                "status": "ok",
+                "preview_head": head,
+                "preview_tail": tail,
+                "omitted_len": omitted,
+                "text_len": len(text),
+            })
+
+        raw_text = "".join(texts)
+        normalized_text = normalization_text(raw_text)
+
+        dump.update({
+            "ok": True,
+            "table_stream": tbl_name,
+            "piece_count": len(pieces),
+            "pieces": piece_reports,
+            "raw_text_len": len(raw_text),
+            "normalized_text_len": len(normalized_text),
+            # 필요 시 전체 텍스트도 보고 싶으면 True로 바꿔 사용
+            "raw_text_sample": _safe_preview(raw_text, 200, 200),
+        })
+        return dump
+
+    except Exception as e:
+        dump["error"] = f"debug_dump_doc 예외: {e}"
+        return dump
+
+
+def print_debug_dump(dump: Dict[str, Any]) -> None:
+    """콘솔에 간단히 정리 출력"""
+    if not dump.get("ok"):
+        print("[DEBUG] 실패:", dump.get("error"))
+        return
+    print(f"[DEBUG] Table: {dump.get('table_stream')} | pieces: {dump.get('piece_count')}")
+    print(f"[DEBUG] raw_text_len={dump.get('raw_text_len')}, normalized_text_len={dump.get('normalized_text_len')}")
+    for p in dump["pieces"]:
+        idx = p.get("index")
+        cp_s, cp_e = p.get("cp_start"), p.get("cp_end")
+        fc = p.get("fc")
+        bc = p.get("byte_count")
+        comp = p.get("fCompressed")
+        status = p.get("status")
+        tlen = p.get("text_len", 0)
+        head = p.get("preview_head", "")
+        tail = p.get("preview_tail", "")
+        omit = p.get("omitted_len", 0)
+        print(f"\n[Piece {idx}] cp=[{cp_s},{cp_e}) fc=0x{fc:X} bytes={bc} comp={comp} status={status} text_len={tlen}")
+        if status == "ok":
+            print(f"  head: {repr(head)}")
+            if omit:
+                print(f"  ... omitted {omit} chars ...")
+            print(f"  tail: {repr(tail)}")
+
+
 # 텍스트 추출 (정규화 포함)
 def extract_text(file_bytes: bytes) -> dict:
     pieces: List[Dict[str, Any]] = [] 
@@ -119,6 +230,7 @@ def extract_text(file_bytes: bytes) -> dict:
         if not table_data:
             print("Table 스트림 없음:", tbl_name)
             return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
+
         clx = _get_clx_data(word_data, table_data)
         if not clx:
             print("CLX 범위 초과 → 무시")
@@ -127,7 +239,18 @@ def extract_text(file_bytes: bytes) -> dict:
         if not plcpcd:
             print("PlcPcd 없음")
             return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
+
         pieces = _parse_plcpcd(plcpcd)
+
+        # 추가: 디버그 출력 자동 호출
+        print("\n=== [DEBUG] Word Piece Dump ===")
+        dump = {"ok": False}
+        try:
+            dump = debug_dump_doc(file_bytes)
+            print_debug_dump(dump)
+        except Exception as e:
+            print(f"[DEBUG] dump 실패: {e}")
+        print("=== [DEBUG] End ===\n")
 
         texts = []
         for p in pieces:
@@ -264,3 +387,4 @@ def redact(file_bytes: bytes) -> bytes:
     except Exception as e:
         print(f"DOC 레닥션 중 오류: {e}")
         return file_bytes
+
