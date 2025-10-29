@@ -4,7 +4,8 @@ import io, re, zipfile
 from typing import List, Tuple
 from .common import (
     cleanup_text, compile_rules, sub_text_nodes, chart_sanitize,
-    xlsx_text_from_zip, redact_embedded_xlsx_bytes, chart_rels_sanitize
+    xlsx_text_from_zip, redact_embedded_xlsx_bytes, chart_rels_sanitize,
+    sanitize_docx_content_types
 )
 from ..schemas import XmlMatch, XmlLocation
 
@@ -58,21 +59,25 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
 
-    # 본문 XML
+    # 0) DOCX 루트 컨텐츠 타입 정리 (externalLinks 오버라이드 제거)
+    if low == "[content_types].xml":
+        return sanitize_docx_content_types(data)
+
+    # 1) 본문 XML
     if low == "word/document.xml":
         return sub_text_nodes(data, comp)[0]
 
-    # 차트 XML: 외부데이터 제거 + 라벨/캐시 마스킹 + 텍스트노드 마스킹
+    # 2) 차트 XML: 외부데이터 제거 + 라벨/캐시 마스킹 + 텍스트노드 마스킹
     if low.startswith("word/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
         return sub_text_nodes(b2, comp)[0]
 
-    # 차트 RELS: 외부데이터/임베딩 링크 제거(복구 팝업 방지)
+    # 3) 차트 RELS: 외부데이터/임베딩/외부링크 링크 제거(복구 팝업 방지)
     if low.startswith("word/charts/_rels/") and low.endswith(".rels"):
         b2, _ = chart_rels_sanitize(data)
         return b2
 
-    # 임베디드 XLSX: 내부까지 무해화
+    # 4) 임베디드 XLSX: 내부까지 무해화(외부링크 제거 포함)
     if low.startswith("word/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)
 

@@ -2,9 +2,12 @@
 from __future__ import annotations
 import io, re, zipfile, xml.etree.ElementTree as ET
 from typing import Tuple, List, Dict
+import logging
 from ..redac_rules import PRESET_PATTERNS, RULES
 
-# ---------- 옵션(HWPX에서 사용) ----------
+log = logging.getLogger("xml_redaction")
+
+# ---------- 옵션(HWPX) ----------
 HWPX_STRIP_PREVIEW = True
 HWPX_DISABLE_CACHE = True
 HWPX_BLANK_PREVIEW = False
@@ -42,6 +45,7 @@ def compile_rules():
         prio = _RULE_PRIORITY.get(name, 0)
         comp.append((name, re.compile(pat, flags), bool(r.get("ensure_valid", False)), prio))
     comp.sort(key=lambda t: t[3], reverse=True)
+    log.debug("compile_rules: %s", [n for n, *_ in comp])
     return comp
 
 def is_valid(kind: str, value: str) -> bool:
@@ -62,7 +66,7 @@ def mask_for(rule: str, v: str) -> str:
     return _mask_email(v) if (rule or "").lower()=="email" else _mask_keep_seps(v)
 
 def mask_text_with_priority(txt: str, comp) -> tuple[str, int]:
-    if not txt: return "", 0
+    if not txt: return txt, 0
     taken: List[tuple[int,int]] = []; repls: List[tuple[int,int,str]] = []
     def ov(a0,a1,b0,b1): return not (a1<=b0 or b1<=a0)
     for name, rx, need_valid, _prio in comp:
@@ -83,7 +87,10 @@ _TEXT_NODE_RE = re.compile(r">(?!\s*<)([^<]+)<", re.DOTALL)
 def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes,int]:
     s = xml_bytes.decode("utf-8", "ignore")
     def _apply(txt: str) -> str:
-        masked, _ = mask_text_with_priority(txt, comp); return masked
+        masked, cnt = mask_text_with_priority(txt, comp)
+        if cnt:
+            log.debug("sub_text_nodes masked %d hit(s)", cnt)
+        return masked
     out = _TEXT_NODE_RE.sub(lambda m: ">" + _apply(m.group(1)) + "<", s)
     return out.encode("utf-8","ignore"), 0
 
@@ -108,33 +115,71 @@ _NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
 }
+
+# 외부 데이터 연결만 제거 (차트는 그대로 보이게)
 _C_EXTERNAL_RE = re.compile(rb"(?is)<\s*c:externalData\b[^>]*>.*?</\s*c:externalData\s*>")
 def _strip_chart_external_data(xml_bytes: bytes) -> tuple[bytes,int]:
-    after = _C_EXTERNAL_RE.sub(b"", xml_bytes); return (after,1) if after!=xml_bytes else (xml_bytes,0)
+    after = _C_EXTERNAL_RE.sub(b"", xml_bytes)
+    if after != xml_bytes:
+        log.debug("removed <c:externalData>")
+        return after, 1
+    return xml_bytes, 0
 
 def chart_sanitize(xml_bytes: bytes, comp) -> tuple[bytes,int]:
-    b2, ext = _strip_chart_external_data(xml_bytes)
-    tree, enc = et_from_bytes(b2); root = tree.getroot(); hits = ext
-    for f in root.findall(".//c:f", _NS):
-        if f.text: f.text = ""; hits += 1
-    # strCache
-    for v in root.findall(".//c:strCache//c:pt/c:v", _NS):
-        if v.text is not None:
-            new, cnt = mask_text_with_priority(v.text, comp)
-            if cnt: v.text = new; hits += cnt
-    # numCache
-    for v in root.findall(".//c:numCache//c:pt/c:v", _NS):
-        if v.text is not None:
-            new, cnt = mask_text_with_priority(v.text, comp)
-            if cnt: v.text = new; hits += cnt
-    # labels
-    for t in root.findall(".//a:t", _NS):
-        if t.text:
-            new, cnt = mask_text_with_priority(t.text, comp)
-            if cnt: t.text = new; hits += cnt
-    return et_to_bytes(tree, enc), hits
+    """
+    ⚠️ 중요: 차트가 사라지는 원인 방지
+    - c:numCache 숫자 값은 **절대 마스킹하지 않음**
+    - c:f(시트 참조 수식)도 그대로 둠
+    - 라벨 텍스트만 마스킹: a:t, c:strCache//c:pt/c:v
+    - c:externalData만 제거
+    """
+    b2, hits = _strip_chart_external_data(xml_bytes)
+    tree, enc = et_from_bytes(b2); root = tree.getroot()
 
-# ---------- XLSX 텍스트 수집(공유) ----------
+    # 문자열 캐시 / 라벨만 마스킹
+    def _apply_and_count(elems, label):
+        nonlocal hits
+        cnt_all = 0
+        for v in elems:
+            if v.text is not None:
+                new, cnt = mask_text_with_priority(v.text, comp)
+                if cnt:
+                    v.text = new; hits += cnt; cnt_all += cnt
+        if cnt_all:
+            log.debug("chart_sanitize: masked %s hits=%d", label, cnt_all)
+
+    # 텍스트 라벨 (제목/범례/데이터 레이블 등)
+    _apply_and_count(root.findall(".//a:t", _NS), "a:t")
+    # 문자열 캐시 (범주축, 항목명)
+    _apply_and_count(root.findall(".//c:strCache//c:pt/c:v", _NS), "strCache")
+
+    # ✅ 숫자 캐시는 건드리지 않는다.
+    #    _apply_and_count(root.findall(".//c:numCache//c:pt/c:v", _NS), "numCache")  # <-- 금지
+
+    out = et_to_bytes(tree, enc)
+    return out, hits
+
+# ---------- DOCX: Content_Types에서 externalLinks 제거 ----------
+def sanitize_docx_content_types(xml_bytes: bytes) -> bytes:
+    try:
+        tree, enc = et_from_bytes(xml_bytes)
+        root = tree.getroot()
+        removed = 0
+        for el in list(root):
+            tag = el.tag.rsplit("}", 1)[-1]
+            if tag != "Override":
+                continue
+            part = el.attrib.get("PartName", "")
+            if part.startswith("/word/charts/externalLinks/"):
+                root.remove(el); removed += 1
+        if removed:
+            log.debug("sanitize_docx_content_types: removed=%d", removed)
+            return et_to_bytes(tree, enc)
+        return xml_bytes
+    except Exception:
+        return xml_bytes
+
+# ---------- XLSX 텍스트 수집 ----------
 def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
     out = []
     for name in zipf.namelist():
@@ -150,17 +195,77 @@ def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
             if v: out.append(v)
     return cleanup_text("\n".join(out))
 
-# ---------- 내장 XLSX 레닥션(공유) ----------
+# ---------- XLSX: externalLinks/관계/ContentTypes 정리 ----------
+def _xlsx_sanitize_workbook_rels(xml_bytes: bytes) -> bytes:
+    try:
+        tree, enc = et_from_bytes(xml_bytes)
+        root = tree.getroot()
+        changed = 0
+        for rel in list(root):
+            if rel.tag.rsplit("}",1)[-1] != "Relationship":
+                continue
+            target = rel.attrib.get("Target","")
+            rtype  = rel.attrib.get("Type","")
+            if target.startswith("externalLinks/") or rtype.endswith("/externalLink"):
+                root.remove(rel); changed += 1
+        if changed:
+            log.debug("workbook.xml.rels: removed externalLinks=%d", changed)
+            return et_to_bytes(tree, enc)
+        return xml_bytes
+    except Exception:
+        return xml_bytes
+
+def _xlsx_sanitize_content_types(xml_bytes: bytes) -> bytes:
+    try:
+        tree, enc = et_from_bytes(xml_bytes)
+        root = tree.getroot()
+        changed = 0
+        for el in list(root):
+            if el.tag.rsplit("}",1)[-1] != "Override":
+                continue
+            part = el.attrib.get("PartName","")
+            if part.startswith("/xl/externalLinks/"):
+                root.remove(el); changed += 1
+        if changed:
+            log.debug("[Content_Types].xml: removed xl/externalLinks entries=%d", changed)
+            return et_to_bytes(tree, enc)
+        return xml_bytes
+    except Exception:
+        return xml_bytes
+
+def _xlsx_drop_if_external_link(name: str) -> bool:
+    low = name.lower()
+    return (
+        low.startswith("xl/externallinks/") or
+        low.startswith("xl/_rels/externallink") or
+        low == "xl/connections.xml"
+    )
+
+# ---------- 내장 XLSX 레닥션 ----------
 def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
     comp = compile_rules()
     bio_in = io.BytesIO(xlsx_bytes); bio_out = io.BytesIO()
     with zipfile.ZipFile(bio_in,"r") as zin, zipfile.ZipFile(bio_out,"w",zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
             name = it.filename; data = zin.read(name); low = name.lower()
+
+            if _xlsx_drop_if_external_link(low):
+                log.debug("drop external link part: %s", name)
+                continue
+
+            if low == "[content_types].xml":
+                data = _xlsx_sanitize_content_types(data)
+
+            elif low == "xl/_rels/workbook.xml.rels":
+                data = _xlsx_sanitize_workbook_rels(data)
+
             if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
                 data, _ = sub_text_nodes(data, comp)
             elif low.startswith("xl/charts/") and low.endswith(".xml"):
-                data, _ = chart_sanitize(data, comp)
+                data, hits = chart_sanitize(data, comp)
+                if hits:
+                    log.debug("chart_sanitize hits=%d for %s", hits, name)
+
             zout.writestr(it, data)
     return bio_out.getvalue()
 
@@ -239,25 +344,22 @@ def redact_ole_conservative(data: bytes) -> bytes:
     _mask_regex_u16(b, _CARD_U16_RX)
     return bytes(b)
 
-# ---------- 차트 RELS 정리(중요: 복구 팝업 방지) ----------
+# ---------- 차트 RELS 정리(복구 팝업 방지) ----------
 def chart_rels_sanitize(xml_bytes: bytes) -> tuple[bytes, int]:
-    """
-    word/charts/_rels/chartN.xml.rels 에서 외부데이터/임베딩으로 가는 관계 제거.
-    - Target에 'embeddings/' 또는 'externalLinks/'가 포함
-    - 또는 Type이 '/package'로 끝나는 Relationship
-    """
     try:
         tree, enc = et_from_bytes(xml_bytes)
         root = tree.getroot()
         hits = 0
         for rel in list(root):
-            # '{ns}Relationship' -> 'Relationship'
             if rel.tag.rsplit("}", 1)[-1] != "Relationship":
                 continue
             target = rel.attrib.get("Target", "")
             rtype  = rel.attrib.get("Type", "")
             if ("embeddings/" in target) or ("externalLinks/" in target) or rtype.endswith("/package"):
                 root.remove(rel); hits += 1
-        return (et_to_bytes(tree, enc), hits) if hits else (xml_bytes, 0)
+        if hits:
+            log.debug("chart_rels_sanitize removed=%d", hits)
+            return et_to_bytes(tree, enc), hits
+        return xml_bytes, 0
     except Exception:
         return xml_bytes, 0

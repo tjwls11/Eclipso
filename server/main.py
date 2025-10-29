@@ -17,22 +17,22 @@ if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
     h.setFormatter(fmt)
     root.addHandler(h)
 
-logging.getLogger("ole_redactor").setLevel(logging.INFO)
+logging.getLogger("redaction.router").setLevel(logging.INFO)
 logging.getLogger("xml_redaction").setLevel(logging.INFO)
 
 # ── FastAPI ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Eclipso XML Demo")
 
-# CORS: 로컬 프론트에서 fetch 실패 방지
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 필요 시 프론트 주소로 좁히세요
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── 전역 예외 핸들러: 500도 JSON으로, 터미널에는 스택 출력 ───────────────
+# ── 전역 예외 핸들러 ─────────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def _unhandled_ex(request: Request, exc: Exception):
     logging.error("UNHANDLED %s %s", request.method, request.url.path)

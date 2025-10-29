@@ -88,7 +88,6 @@ def _office_to_pdf_with_soffice(in_path: str, out_dir: str) -> str:
     pdf_name = base + ".pdf"
     pdf_path = os.path.join(out_dir, pdf_name)
     if not os.path.exists(pdf_path):
-        # 드물게 다른 이름으로 나올 수도 있어서 보정
         cands = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.lower().endswith(".pdf")]
         if not cands:
             raise RuntimeError("PDF 결과를 찾지 못했습니다.")
@@ -140,31 +139,25 @@ def _rewrite_zip_replacing_previews(
         # 교체 대상 이름 목록(없으면 새 이름 생성)
         preview_names = _list_preview_names(zin)
         if not preview_names:
-            # 원본 zip에서 얻어둔 이름이 있으면 그걸 사용, 없으면 생성
             if original_preview_names:
                 preview_names = original_preview_names[:]
             else:
-                # 새로 생성: page_001.png, page_002.png ...
                 preview_names = [f"Preview/page_{i+1:03d}.png" for i in range(len(new_images))]
 
-        # 새 이미지 매핑 (개수 차이나면 min 길이만 대체)
         replace_map = {preview_names[i]: new_images[i] for i in range(min(len(preview_names), len(new_images)))}
 
-        # 기존 엔트리를 순회하며 작성
         used = set()
         for item in zin.infolist():
             name = item.filename
             low = name.lower()
             if name == "mimetype":
-                # 이미 위에서 썼음
                 continue
             if low.startswith("preview/") and low.endswith((".png", ".jpg", ".jpeg")) and name in replace_map:
-                zout.writestr(name, replace_map[name])  # 새 이미지로 치환
+                zout.writestr(name, replace_map[name])
                 used.add(name)
             else:
-                zout.writestr(item, zin.read(name))     # 그대로 복사
+                zout.writestr(item, zin.read(name))
 
-        # 기존에 없던 Preview 엔트리는 새로 추가
         for n in preview_names:
             if n not in used and n in replace_map:
                 zout.writestr(n, replace_map[n])
@@ -188,13 +181,11 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
                 secrets = _collect_hwpx_secrets(zin)
             except Exception:
                 secrets = []
-            # 프리뷰 파일명도 미리 확보(추후 동일 파일명으로 덮어쓰기 위함)
             original_preview_names = _list_preview_names(zin)
         hwpx.set_hwpx_secrets(secrets)
         log.info("HWPX secrets collected: %d", len(secrets))
 
     # ---------- 1차: 임시 레닥션 결과 만들기 ----------
-    #    (이 파일을 PDF로 변환해 프리뷰를 만든 다음, 최종 ZIP을 다시 작성)
     with tempfile.TemporaryDirectory() as td:
         tmp_redacted = os.path.join(td, os.path.splitext(os.path.basename(dst_path))[0] + ".tmp.hwpx")
 
@@ -204,51 +195,65 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
                 zi = zipfile.ZipInfo("mimetype"); zi.compress_type = zipfile.ZIP_STORED
                 zout.writestr(zi, zin.read("mimetype"))
 
+            kept = dropped = modified = 0
+
             for item in zin.infolist():
                 name = item.filename
                 data = zin.read(name)
 
+                def _write_decision(red: Optional[bytes]):
+                    nonlocal kept, dropped, modified
+                    # 규칙:
+                    #   red is None  -> 원본 그대로 기록(keep)
+                    #   red == b""   -> 이 파트는 ZIP에 기록하지 않음(drop)
+                    #   else bytes   -> 수정된 바이트로 기록(modify)
+                    if red is None:
+                        zout.writestr(item, data); kept += 1
+                        log.debug("[%s] keep   %s", kind.upper(), name)
+                    elif isinstance(red, (bytes, bytearray)) and len(red) == 0:
+                        dropped += 1
+                        log.debug("[%s] drop   %s", kind.upper(), name)
+                        # 기록 생략
+                    else:
+                        zout.writestr(item, red); modified += 1
+                        log.debug("[%s] modify %s", kind.upper(), name)
+
                 if kind == "docx":
                     red = docx.redact_item(name, data, comp)
-                    zout.writestr(item, data if red is None else red)
+                    _write_decision(red)
 
                 elif kind == "xlsx":
                     red = xlsx.redact_item(name, data, comp)
-                    zout.writestr(item, data if red is None else red)
+                    _write_decision(red)
 
                 elif kind == "pptx":
                     red = pptx.redact_item(name, data, comp)
-                    zout.writestr(item, data if red is None else red)
+                    _write_decision(red)
 
                 elif kind == "hwpx":
                     red = hwpx.redact_item(name, data, comp)
-                    if red is None:
-                        zout.writestr(item, data)
-                    elif red == b"":
-                        # (예) Preview 삭제 설정 시 발생
-                        continue
-                    else:
-                        zout.writestr(item, red)
+                    _write_decision(red)
 
                 else:
-                    zout.writestr(item, data)
+                    # 알 수 없는 형식 → 그대로
+                    zout.writestr(item, data); kept += 1
+                    log.debug("[OTHER] keep %s", name)
+
+            log.info("%s ZIP result: kept=%d modified=%d dropped=%d",
+                     kind.upper(), kept, modified, dropped)
 
         # ---------- 옵션: 프리뷰 재생성 ----------
         regen = (os.getenv("HWPX_REGEN_PREVIEW", "0") in ("1", "true", "TRUE"))
         if kind == "hwpx" and regen:
             log.info("HWPX preview regen: start (env HWPX_REGEN_PREVIEW=1)")
             try:
-                # 1) HWPX → PDF
                 pdf_path = _office_to_pdf_with_soffice(tmp_redacted, td)
-                # 2) PDF → PNG bytes
                 dpi = int(os.getenv("HWPX_PREVIEW_DPI", "144") or "144")
                 images = _render_pdf_to_png_bytes(pdf_path, dpi=dpi)
                 if not images:
                     log.warning("HWPX preview regen: 렌더 결과가 비어있습니다. 원본 프리뷰 유지.")
-                    # 최종 파일은 1차 결과로 마무리
                     shutil.copyfile(tmp_redacted, dst_path)
                 else:
-                    # 3) 최종 ZIP 재작성(Preview/* 치환)
                     _rewrite_zip_replacing_previews(
                         redacted_tmp_hwpx=tmp_redacted,
                         dst_path=dst_path,
@@ -259,7 +264,6 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
                 log.warning("HWPX preview regen: 실패 → 원본 프리뷰 유지 (%s)", e)
                 shutil.copyfile(tmp_redacted, dst_path)
         else:
-            # 재생성 비활성화 → 1차 결과를 그대로 출력
             shutil.copyfile(tmp_redacted, dst_path)
 
     if kind == "hwpx":

@@ -101,7 +101,7 @@ def is_valid_card(number: str, options: dict | None = None) -> bool:
             prefix4 = int(d[:4])
             if d[0] == "4":        # Visa
                 pass
-            elif d[0] == "5" and 51 <= prefix2 <= 55:  # Master (51–55)
+            elif d[0] == "5" and 51 <= prefix2 <= 55:  # Master
                 pass
             elif d[0] == "2" and 2221 <= prefix4 <= 2720:  # Master 2-series
                 pass
@@ -130,21 +130,18 @@ def is_valid_phone_city(number: str, options: dict | None = None) -> bool:
         return True
     return False
 
-# ★ 대표번호/특수번호(070/050/15xx/16xx/18xx)
+# 대표번호/특수번호(070/050/15xx/16xx/18xx)
 _SERVICE_PREFIX4 = {
-    # 대표번호들(필요 시 추가)
     "1522","1525","1533","1544","1566","1577","1588",
     "1599","1600","1608","1644","1661","1666","1670",
     "1688","1800","1811","1833","1855","1877","1899"
 }
 def is_valid_phone_service(number: str, options: dict | None = None) -> bool:
     d = _digits(number)
-    # 070/050(x) VoIP/안심번호
     if d.startswith("070") and len(d) == 11:
         return True
     if d.startswith("050") and len(d) in (10, 11):
         return True
-    # 15xx/16xx/18xx 대표번호 (4-4)
     if len(d) == 8 and d[:4] in _SERVICE_PREFIX4:
         return True
     return False
