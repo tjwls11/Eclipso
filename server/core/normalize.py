@@ -38,11 +38,18 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
     for i, ch in enumerate(s):
         # 1) NFKC
         norm = unicodedata.normalize("NFKC", ch)
+
         # 2) 제로폭 제거
         if _ZERO_WIDTH.match(norm):
+            if out_chars:
+                index_map[len(out_chars)] = i
             continue
+
         # 3) NBSP류 → ' '
         norm = _NBSP.sub(" ", norm)
+        if out_chars:
+            index_map[len(out_chars)] = i
+
         # 4) 대시류 → '-'
         norm = _DASHES.sub("-", norm)
 
@@ -50,9 +57,9 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
             # 탭 → 공백
             if c == "\t":
                 c = " "
-            # CR/LF 정규화: \r?\n → \n  (여기서는 이미 원문 문자 단위에서 처리)
+            # CR/LF 정규화:
             if c == "\r":
-                continue
+                c = "\n"
 
             # 연속 공백 압축 (줄바꿈 제외)
             if c == " ":
@@ -60,9 +67,6 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
                     continue
                 prev_space = True
             else:
-                if c == "\n":
-                    prev_space = False
-                else:
                     prev_space = False
 
             out_chars.append(c)
@@ -70,5 +74,5 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
             norm_i += 1
 
     text = "".join(out_chars)
-    # 후처리 제거: 여기서 공백/개행을 또 건드리면 index_map이 틀어질 수 있음.
     return text, index_map
+
