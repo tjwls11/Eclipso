@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from server.api import text_api, redaction_api, file_redact_api
+from server.api import text_api, redaction_api, file_redact_api, ner_api
 
 app = FastAPI(title="Eclipso Redaction Server")
 
@@ -16,6 +16,7 @@ app.add_middleware(
 app.include_router(text_api.router)
 app.include_router(redaction_api.router)
 app.include_router(file_redact_api.router)
+app.include_router(ner_api.router)      
 
 @app.get("/health")
 async def health():
