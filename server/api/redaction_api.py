@@ -1,34 +1,41 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import json
 import logging
-import time
 import re
-import types
-from typing import Dict, List, Optional, Literal, Tuple, Set, Any
-from urllib.parse import quote
+import traceback
+import os
+import tempfile
+import urllib.parse
+from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 
-from server.core.schemas import DetectResponse, PatternItem, Box
+from server.core.schemas import DetectResponse, PatternItem
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
-from server.core.redaction_rules import PRESET_PATTERNS
-from server.modules.common import compile_rules  # ★ 추가
-# 더 이상 find_sensitive_spans 는 사용하지 않음
-# from server.core.matching import find_sensitive_spans
+from server.core.redaction_rules import PRESET_PATTERNS, RULES
+
+# XML 계열 처리 모듈 (존재/시그니처 불일치까지 호환)
+try:
+    from server.modules.xml_redaction import xml_scan, xml_redact_to_file
+except Exception:
+    xml_scan = None
+    xml_redact_to_file = None
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
 
 
+# ---------------------------
+# 공통 유틸
+# ---------------------------
 def _ensure_pdf(file: UploadFile) -> None:
     if file is None:
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
 
-
-def _read_pdf(file: UploadFile) -> bytes:
+def _read_all(file: UploadFile) -> bytes:
     data = file.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
@@ -36,17 +43,8 @@ def _read_pdf(file: UploadFile) -> bytes:
 
 
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    """
-    입력 허용
-    - None / "" / 공백 / "null" / "None" -> PRESET_PATTERNS
-    - 배열: [ { ... } ]
-    - 객체: { "patterns": [ { ... } ] }
-    """
-    if patterns_json is None:
-        return [PatternItem(**p) for p in PRESET_PATTERNS]
-
-    s = str(patterns_json).strip()
-    if not s or s.lower() in ("null", "none"):
+    """프론트 patterns_json -> PatternItem[] (없으면 PRESET 전체)."""
+    if not patterns_json:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
     try:
@@ -79,52 +77,62 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
     try:
         return [PatternItem(**p) for p in arr]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"잘못된 patterns 항목: {e}")
+        raise HTTPException(status_code=400, detail=f"잘못된 patterns_json: {e}")
 
+def _as_jsonable(obj: Any) -> Any:
+    try:
+        if obj is None:
+            return {}
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            return obj.model_dump()
+        if hasattr(obj, "dict") and callable(obj.dict):
+            return obj.dict()
+        if isinstance(obj, (list, dict, str, int, float, bool)):
+            return obj
+        return json.loads(json.dumps(obj, default=str))
+    except Exception:
+        return {"result": str(obj)}
 
-def _compile_patterns(items: List[PatternItem]) -> List[Any]:
+def build_disposition(filename: str) -> str:
     """
-    PatternItem -> 어댑터 객체(SimpleNamespace)
-    - compiled: re.Pattern
-    - 기존 필드: 그대로 속성화
+    라틴-1만 허용되는 헤더 특성 때문에:
+      - ASCII로 안전한 대체값을 filename에 넣고
+      - 원래 UTF-8 파일명은 RFC 5987 형식의 filename*로 추가
     """
-    compiled: List[Any] = []
-    for it in items:
-        # PatternItem 속성 추출
-        try:
-            regex = getattr(it, "regex")
-        except AttributeError:
-            raise HTTPException(status_code=400, detail="PatternItem에 'regex' 누락")
-
-        try:
-            rp = re.compile(regex)
-        except re.error as e:
-            name_for_msg = getattr(it, "name", getattr(it, "label", "UNKNOWN"))
-            raise HTTPException(
-                status_code=400, detail=f"정규식 컴파일 실패({name_for_msg}): {e}"
-            )
-
-        # 네임스페이스로 래핑(+ compiled)
-        ns = types.SimpleNamespace(**it.dict())
-        setattr(ns, "compiled", rp)
-        compiled.append(ns)
-    return compiled
+    base = filename or "download.bin"
+    # ASCII 대체: 알파벳/숫자/._-만 남기고 나머지는 _
+    ascii_fallback = re.sub(r'[^A-Za-z0-9._-]', '_', base)
+    # RFC 5987 percent-encoding
+    quoted = urllib.parse.quote(base, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
 
 
-@router.post(
-    "/redactions/detect",
-    response_model=DetectResponse,
-    summary="PDF 패턴 박스 탐지",
-    description=(
-        "- 정규식 패턴 → 좌표 박스\n"
-        "- 입력: file(PDF), patterns_json(JSON 문자열 | 생략)\n"
-        "- 출력: total_matches, boxes"
-    ),
-)
-async def detect(
-    file: UploadFile = File(..., description="PDF 파일"),
-    patterns_json: Optional[str] = Form(None, description="패턴 목록 JSON(옵션)"),
-):
+# ---------------------------
+# /patterns  (프론트 초기 로딩)
+# ---------------------------
+@router.get("/patterns")
+def get_patterns() -> Dict[str, Any]:
+    """규칙 목록 제공 (프론트 app.js 에서 호출)"""
+    return {
+        "patterns": [
+            {
+                "name": p.get("name"),
+                "regex": p.get("regex"),
+                "case_sensitive": bool(p.get("case_sensitive", False)),
+                "whole_word": bool(p.get("whole_word", False)),
+                # validator 통과시에만 OK로 취급하도록 기본 True
+                "ensure_valid": bool(p.get("ensure_valid", True)),
+            }
+            for p in PRESET_PATTERNS
+        ]
+    }
+
+
+# ---------------------------
+# PDF: 박스 검출 / 적용 (기존 유지)
+# ---------------------------
+@router.post("/redactions/detect", response_model=DetectResponse)
+async def detect(file: UploadFile = File(...), patterns_json: Optional[str] = Form(None)):
     _ensure_pdf(file)
     pdf = await file.read()
 
@@ -150,93 +158,205 @@ async def apply(
     file: UploadFile = File(..., description="PDF 파일"),
 ):
     _ensure_pdf(file)
-    pdf = _read_pdf(file)
-    fill = "black"
-
+    pdf = _read_all(file)
     boxes = detect_boxes_from_patterns(pdf, [PatternItem(**p) for p in PRESET_PATTERNS])
     out = apply_redaction(pdf, boxes, fill=fill)
-
-    return Response(
-        content=out,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="redacted.pdf"'},
-    )
+    disp = build_disposition("redacted.pdf")
+    return Response(content=out, media_type="application/pdf",
+                    headers={"Content-Disposition": disp})
 
 
-# ─────────────────────────────────────────────────────────────
-# 텍스트 매칭 (정규식 + validator)  →  /text/match 가 이 함수 사용
-# ─────────────────────────────────────────────────────────────
+# ---------------------------
+# 프론트 호환 라우트: /redactions/pdf/scan
+# ---------------------------
+@router.post("/redactions/pdf/scan")
+async def pdf_scan(file: UploadFile = File(...), patterns_json: Optional[str] = Form(None)):
+    _ensure_pdf(file)
+    pdf = await file.read()
+    patterns = _parse_patterns_json(patterns_json)
 
-def match_text(text: str):
-    """
-    정규식 기반 민감정보 매칭
+    boxes = detect_boxes_from_patterns(pdf, patterns)
+    # 프론트 호환 형태로 변환 (필요 최소 필드)
+    matches = []
+    for b in boxes:
+        matches.append({
+            "rule": getattr(b, "rule", getattr(b, "name", "pdf")),
+            "value": "",
+            "page": getattr(b, "page", None),
+            "location": None,
+            "context": "",
+            "valid": True,
+        })
 
-    - 입력: text
-    - 출력: { items, counts }
+    return {
+        "file_type": "pdf",
+        "extracted_text": "",   # 원하면 /text/extract 연동 가능
+        "matches": matches,
+    }
 
-    items:
-      - rule   : 룰 이름 (rrn, phone_mobile, ...)
-      - value  : 매칭 문자열
-      - start  : 텍스트 내 시작 오프셋
-      - end    : 텍스트 내 끝 오프셋
-      - context: 주변 20자 전후
-      - valid  : validator 기준 유효 여부 (True = OK, False = FAIL)
 
-    counts:
-      - OK(True) 인 것만 rule 별로 카운트 (FAIL 은 카운트에서 제외)
-    """
+# ---------------------------
+# 프론트 호환 라우트: /redactions/xml/scan
+# ---------------------------
+@router.post("/redactions/xml/scan")
+async def xml_scan_endpoint(
+    file: UploadFile = File(...),
+    patterns_json: Optional[str] = Form(None),
+):
+    if xml_scan is None:
+        raise HTTPException(status_code=500, detail="xml_redaction 모듈을 불러오지 못했습니다.")
+
+    data = _read_all(file)
+
     try:
-        if not isinstance(text, str):
-            text = str(text)
+        # 신형: xml_scan(bytes, filename)
+        res = xml_scan(data, file.filename or "")
+    except TypeError:
+        # 구형: xml_scan(bytes)
+        res = xml_scan(data)
 
-        # modules.common.compile_rules() 는 이미
-        # PRESET_PATTERNS + RULES 기반으로
-        # (name, compiled_regex, need_valid, priority, validator) 튜플을 만들어줌.
-        comp = compile_rules()
+    return _as_jsonable(res)
 
-        matches: List[Dict[str, Any]] = {}
-        matches = []
-        counts: Dict[str, int] = {}
 
-        for name, rx, need_valid, prio, validator in comp:
-            if rx is None:
-                continue
+# ---------------------------
+# 프론트 호환 라우트: /redactions/xml/apply
+#   ※ 경로 기반/바이트 기반 모든 시그니처를 순차 지원
+# ---------------------------
+@router.post("/redactions/xml/apply", response_class=Response)
+async def xml_apply_endpoint(file: UploadFile = File(...)):
+    if xml_redact_to_file is None:
+        raise HTTPException(status_code=500, detail="xml_redaction 모듈을 불러오지 못했습니다.")
 
-            for m in rx.finditer(text):
-                s, e = m.span()
-                val = m.group(0)
+    data = _read_all(file)
+    base = (file.filename or "output")
+    stem = base.rsplit(".", 1)[0]
+    ext = base.rsplit(".", 1)[-1].lower() if "." in base else "bin"
 
-                ok = True
-                if need_valid and validator:
-                    try:
-                        try:
-                            ok = bool(validator(val))
-                        except TypeError:
-                            ok = bool(validator(val, None))
-                    except Exception:
-                        ok = False  # 검증 중 예외는 FAIL 취급
+    # MIME 대략치
+    ext_to_mime = {
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "hwpx": "application/haansofthwp",
+        "hwp":  "application/x-hwp",
+        "xml":  "application/xml",
+        "zip":  "application/zip",
+        "bin":  "application/octet-stream",
+    }
+    default_mime = ext_to_mime.get(ext, "application/octet-stream")
 
-                ctx_start = max(0, s - 20)
-                ctx_end = min(len(text), e + 20)
+    # 업로드 바이트를 임시 원본 파일로 저장 → 경로 기반 호출
+    with tempfile.TemporaryDirectory(prefix="eclipso_") as tdir:
+        src_path = os.path.join(tdir, base)
+        with open(src_path, "wb") as wf:
+            wf.write(data)
 
-                matches.append(
-                    {
-                        "rule": name,
-                        "value": val,
-                        "start": s,
-                        "end": e,
-                        "context": text[ctx_start:ctx_end],
-                        "valid": ok,
-                    }
-                )
+        dst_path = os.path.join(tdir, f"{stem}.redacted.{ext}")
 
-                # counts 는 OK 만 집계
-                if ok:
-                    counts[name] = counts.get(name, 0) + 1
+        # 1) (src_path, dst_path, filename)
+        try:
+            res = xml_redact_to_file(src_path, dst_path, base)
+            # 결과가 바이트면 즉시 사용, 아니면 dst_path에서 읽음
+            if isinstance(res, (bytes, bytearray)):
+                out_bytes = bytes(res)
+                out_name = f"{stem}.redacted.{ext}"
+            else:
+                if not os.path.exists(dst_path):
+                    if isinstance(res, str) and os.path.exists(res):
+                        dst_path = res
+                    elif res and isinstance(res, (list, tuple)) and len(res) > 0 and isinstance(res[0], str) and os.path.exists(res[0]):
+                        dst_path = res[0]
+                    else:
+                        raise HTTPException(status_code=500, detail="레닥션 결과 파일이 생성되지 않았습니다.")
+                with open(dst_path, "rb") as rf:
+                    out_bytes = rf.read()
+                out_name = os.path.basename(dst_path)
+            disp = build_disposition(out_name)
+            return Response(content=out_bytes, media_type=default_mime,
+                            headers={"Content-Disposition": disp})
+        except TypeError:
+            pass
 
-        log.debug("regex match count=%d", len(matches))
-        return {"items": matches, "counts": counts}
+        # 2) (src_path, filename)
+        try:
+            res = xml_redact_to_file(src_path, base)
+            if isinstance(res, (bytes, bytearray)):
+                out_bytes = bytes(res)
+                out_name = f"{stem}.redacted.{ext}"
+                disp = build_disposition(out_name)
+                return Response(content=out_bytes, media_type=default_mime,
+                                headers={"Content-Disposition": disp})
+            else:
+                # (bytes, name, mime) 또는 경로 반환일 수 있음
+                if isinstance(res, str) and os.path.exists(res):
+                    with open(res, "rb") as rf:
+                        out_bytes = rf.read()
+                    out_name = os.path.basename(res)
+                    disp = build_disposition(out_name)
+                    return Response(content=out_bytes, media_type=default_mime,
+                                    headers={"Content-Disposition": disp})
+                if isinstance(res, (list, tuple)) and len(res) > 0:
+                    if isinstance(res[0], (bytes, bytearray)):
+                        out_bytes = bytes(res[0])
+                        out_name = res[1] if len(res) > 1 else f"{stem}.redacted.{ext}"
+                        out_mime = res[2] if len(res) > 2 else default_mime
+                        disp = build_disposition(out_name)
+                        return Response(content=out_bytes, media_type=out_mime,
+                                        headers={"Content-Disposition": disp})
+                    if isinstance(res[0], str) and os.path.exists(res[0]):
+                        with open(res[0], "rb") as rf:
+                            out_bytes = rf.read()
+                        out_name = os.path.basename(res[0])
+                        disp = build_disposition(out_name)
+                        return Response(content=out_bytes, media_type=default_mime,
+                                        headers={"Content-Disposition": disp})
+                # 파일 생성 기대: dst_path 확인
+                if not os.path.exists(dst_path):
+                    raise HTTPException(status_code=500, detail="레닥션 결과 파일이 생성되지 않았습니다.")
+                with open(dst_path, "rb") as rf:
+                    out_bytes = rf.read()
+                out_name = os.path.basename(dst_path)
+                disp = build_disposition(out_name)
+                return Response(content=out_bytes, media_type=default_mime,
+                                headers={"Content-Disposition": disp})
+        except TypeError:
+            pass
 
-    except Exception as e:  # pragma: no cover
-        log.exception("match_text 내부 오류")
-        raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")
+        # 3) (src_path)
+        try:
+            res = xml_redact_to_file(src_path)
+            if isinstance(res, (bytes, bytearray)):
+                out_bytes = bytes(res)
+                out_name = f"{stem}.redacted.{ext}"
+            elif isinstance(res, str) and os.path.exists(res):
+                with open(res, "rb") as rf:
+                    out_bytes = rf.read()
+                out_name = os.path.basename(res)
+            else:
+                if not os.path.exists(dst_path):
+                    raise HTTPException(status_code=500, detail="레닥션 결과 파일이 생성되지 않았습니다.")
+                with open(dst_path, "rb") as rf:
+                    out_bytes = rf.read()
+                out_name = os.path.basename(dst_path)
+            disp = build_disposition(out_name)
+            return Response(content=out_bytes, media_type=default_mime,
+                            headers={"Content-Disposition": disp})
+        except TypeError:
+            # 최후: 바이트 시그니처 시도
+            try:
+                res = xml_redact_to_file(data, base)
+                if isinstance(res, (bytes, bytearray)):
+                    out_bytes = bytes(res)
+                    out_name = f"{stem}.redacted.{ext}"
+                    disp = build_disposition(out_name)
+                    return Response(content=out_bytes, media_type=default_mime,
+                                    headers={"Content-Disposition": disp})
+                else:
+                    out_bytes = res[0]
+                    out_name = res[1] if len(res) > 1 else f"{stem}.redacted.{ext}"
+                    out_mime = res[2] if len(res) > 2 else default_mime
+                    disp = build_disposition(out_name)
+                    return Response(content=out_bytes, media_type=out_mime,
+                                    headers={"Content-Disposition": disp})
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"xml_redact_to_file 시그니처 불일치: {e2}")
