@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import json
 import logging
 import re
-import traceback
 import os
 import tempfile
 import urllib.parse
@@ -13,13 +13,13 @@ from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 
 from server.core.schemas import DetectResponse, PatternItem
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
-from server.core.redaction_rules import PRESET_PATTERNS, RULES
+from server.core.redaction_rules import PRESET_PATTERNS
 
-# XML 계열 처리 모듈 (존재/시그니처 불일치까지 호환)
+# XML 계열 처리 모듈 (있는 버전/시그니처에 최대 호환)
 try:
     from server.modules.xml_redaction import xml_scan, xml_redact_to_file
 except Exception:
-    xml_scan = None
+    xml_scan = None          # 타입: Callable | None
     xml_redact_to_file = None
 
 router = APIRouter(tags=["redaction"])
@@ -44,42 +44,40 @@ def _read_all(file: UploadFile) -> bytes:
 
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
     """프론트 patterns_json -> PatternItem[] (없으면 PRESET 전체)."""
-    if not patterns_json:
+    if patterns_json is None:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
+
+    s = str(patterns_json).strip()
+    if not s or s.lower() in ("null", "none"):
+        return [PatternItem(**p) for p in PRESET_PATTERNS]
+
 
     try:
         obj = json.loads(s)
     except json.JSONDecodeError as e:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
-                f"구체적 오류: {e}"
-            ),
+            detail=("잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
+                    f"구체적 오류: {e}")
         )
 
     if isinstance(obj, dict):
         if "patterns" in obj and isinstance(obj["patterns"], list):
             arr = obj["patterns"]
         else:
-            raise HTTPException(
-                status_code=400,
-                detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요",
-            )
+            raise HTTPException(status_code=400, detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요")
     elif isinstance(obj, list):
         arr = obj
     else:
-        raise HTTPException(
-            status_code=400,
-            detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태",
-        )
+        raise HTTPException(status_code=400, detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태")
 
     try:
         return [PatternItem(**p) for p in arr]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"잘못된 patterns_json: {e}")
+        raise HTTPException(status_code=400, detail=f"잘못된 patterns 항목: {e}")
 
 def _as_jsonable(obj: Any) -> Any:
+    """pydantic 모델/일반객체를 프론트가 소비 가능한 형태로 변환"""
     try:
         if obj is None:
             return {}
@@ -95,14 +93,12 @@ def _as_jsonable(obj: Any) -> Any:
 
 def build_disposition(filename: str) -> str:
     """
-    라틴-1만 허용되는 헤더 특성 때문에:
-      - ASCII로 안전한 대체값을 filename에 넣고
-      - 원래 UTF-8 파일명은 RFC 5987 형식의 filename*로 추가
+    한글/유니코드 파일명을 안전하게 내려주기 위한 Content-Disposition 생성.
+    - filename : ASCII fallback
+    - filename*: RFC 5987 (UTF-8 percent-encoding)
     """
     base = filename or "download.bin"
-    # ASCII 대체: 알파벳/숫자/._-만 남기고 나머지는 _
     ascii_fallback = re.sub(r'[^A-Za-z0-9._-]', '_', base)
-    # RFC 5987 percent-encoding
     quoted = urllib.parse.quote(base, safe="")
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
 
@@ -136,31 +132,26 @@ async def detect(file: UploadFile = File(...), patterns_json: Optional[str] = Fo
     _ensure_pdf(file)
     pdf = await file.read()
 
-    # 로깅(옵션)
     if patterns_json is None:
         log.debug("patterns_json: None")
     else:
         log.debug("patterns_json(len=%d): %r", len(patterns_json), patterns_json[:200])
 
-    items = _parse_patterns_json(patterns_json)
-    patterns = _compile_patterns(items)
+    patterns = _parse_patterns_json(patterns_json)
     boxes = detect_boxes_from_patterns(pdf, patterns)
     return DetectResponse(total_matches=len(boxes), boxes=boxes)
 
 
-@router.post(
-    "/redactions/apply",
-    response_class=Response,
-    summary="PDF 레닥션 적용",
-    description="기본 정규식 패턴으로 레닥션 적용.",
-)
-async def apply(
-    file: UploadFile = File(..., description="PDF 파일"),
-):
+@router.post("/redactions/apply", response_class=Response)
+async def apply(file: UploadFile = File(...)):
     _ensure_pdf(file)
     pdf = _read_all(file)
+    # 기본 채움색
+    fill = "black"
+
     boxes = detect_boxes_from_patterns(pdf, [PatternItem(**p) for p in PRESET_PATTERNS])
     out = apply_redaction(pdf, boxes, fill=fill)
+
     disp = build_disposition("redacted.pdf")
     return Response(content=out, media_type="application/pdf",
                     headers={"Content-Disposition": disp})
@@ -176,7 +167,8 @@ async def pdf_scan(file: UploadFile = File(...), patterns_json: Optional[str] = 
     patterns = _parse_patterns_json(patterns_json)
 
     boxes = detect_boxes_from_patterns(pdf, patterns)
-    # 프론트 호환 형태로 변환 (필요 최소 필드)
+
+    # 프론트 호환 형태로 변환 (최소 필드만)
     matches = []
     for b in boxes:
         matches.append({
@@ -190,7 +182,7 @@ async def pdf_scan(file: UploadFile = File(...), patterns_json: Optional[str] = 
 
     return {
         "file_type": "pdf",
-        "extracted_text": "",   # 원하면 /text/extract 연동 가능
+        "extracted_text": "",   # 필요 시 /text/extract 연동 가능
         "matches": matches,
     }
 
@@ -201,13 +193,14 @@ async def pdf_scan(file: UploadFile = File(...), patterns_json: Optional[str] = 
 @router.post("/redactions/xml/scan")
 async def xml_scan_endpoint(
     file: UploadFile = File(...),
-    patterns_json: Optional[str] = Form(None),
+    patterns_json: Optional[str] = Form(None),   # 현재 서버쪽에서 PRESET 사용, 필드 유지만
 ):
     if xml_scan is None:
         raise HTTPException(status_code=500, detail="xml_redaction 모듈을 불러오지 못했습니다.")
 
     data = _read_all(file)
 
+    # 구현체별 시그니처 차이를 흡수
     try:
         # 신형: xml_scan(bytes, filename)
         res = xml_scan(data, file.filename or "")
@@ -245,7 +238,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
     }
     default_mime = ext_to_mime.get(ext, "application/octet-stream")
 
-    # 업로드 바이트를 임시 원본 파일로 저장 → 경로 기반 호출
+    # 업로드 바이트를 임시 파일로 저장 → 경로 기반 호출 우선
     with tempfile.TemporaryDirectory(prefix="eclipso_") as tdir:
         src_path = os.path.join(tdir, base)
         with open(src_path, "wb") as wf:
@@ -256,21 +249,23 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
         # 1) (src_path, dst_path, filename)
         try:
             res = xml_redact_to_file(src_path, dst_path, base)
-            # 결과가 바이트면 즉시 사용, 아니면 dst_path에서 읽음
             if isinstance(res, (bytes, bytearray)):
                 out_bytes = bytes(res)
                 out_name = f"{stem}.redacted.{ext}"
             else:
+                # 결과 경로 확인
                 if not os.path.exists(dst_path):
                     if isinstance(res, str) and os.path.exists(res):
                         dst_path = res
-                    elif res and isinstance(res, (list, tuple)) and len(res) > 0 and isinstance(res[0], str) and os.path.exists(res[0]):
+                    elif (isinstance(res, (list, tuple)) and res and isinstance(res[0], str)
+                          and os.path.exists(res[0])):
                         dst_path = res[0]
                     else:
                         raise HTTPException(status_code=500, detail="레닥션 결과 파일이 생성되지 않았습니다.")
                 with open(dst_path, "rb") as rf:
                     out_bytes = rf.read()
                 out_name = os.path.basename(dst_path)
+
             disp = build_disposition(out_name)
             return Response(content=out_bytes, media_type=default_mime,
                             headers={"Content-Disposition": disp})
@@ -287,7 +282,6 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
                 return Response(content=out_bytes, media_type=default_mime,
                                 headers={"Content-Disposition": disp})
             else:
-                # (bytes, name, mime) 또는 경로 반환일 수 있음
                 if isinstance(res, str) and os.path.exists(res):
                     with open(res, "rb") as rf:
                         out_bytes = rf.read()
@@ -310,6 +304,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
                         disp = build_disposition(out_name)
                         return Response(content=out_bytes, media_type=default_mime,
                                         headers={"Content-Disposition": disp})
+
                 # 파일 생성 기대: dst_path 확인
                 if not os.path.exists(dst_path):
                     raise HTTPException(status_code=500, detail="레닥션 결과 파일이 생성되지 않았습니다.")
@@ -322,7 +317,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
         except TypeError:
             pass
 
-        # 3) (src_path)
+        # 3) (src_path) 만 받는 구현체
         try:
             res = xml_redact_to_file(src_path)
             if isinstance(res, (bytes, bytearray)):
@@ -338,11 +333,12 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
                 with open(dst_path, "rb") as rf:
                     out_bytes = rf.read()
                 out_name = os.path.basename(dst_path)
+
             disp = build_disposition(out_name)
             return Response(content=out_bytes, media_type=default_mime,
                             headers={"Content-Disposition": disp})
         except TypeError:
-            # 최후: 바이트 시그니처 시도
+            # 최후: (bytes, filename) 시그니처 시도
             try:
                 res = xml_redact_to_file(data, base)
                 if isinstance(res, (bytes, bytearray)):
@@ -352,6 +348,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
                     return Response(content=out_bytes, media_type=default_mime,
                                     headers={"Content-Disposition": disp})
                 else:
+                    # (bytes, name, mime) 튜플 케이스 지원
                     out_bytes = res[0]
                     out_name = res[1] if len(res) > 1 else f"{stem}.redacted.{ext}"
                     out_mime = res[2] if len(res) > 2 else default_mime
