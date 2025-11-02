@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
 
+    <!-- UI & PDF -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script>
@@ -22,7 +23,7 @@
         }
       })();
 
-      /* HWPX 웹뷰어를 쓸 경우 설정 */
+      /* HWPX 웹뷰어 URL(선택) */
       window.HWPX_VIEWER_URL = "";
     </script>
 
@@ -47,7 +48,7 @@
       <h1 class="text-2xl font-bold mb-4">Eclipso</h1>
 
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <!-- 좌측 -->
+        <!-- 좌측 패널 -->
         <div class="bg-white rounded-2xl shadow p-5 space-y-4">
           <div>
             <label class="block text-sm font-semibold mb-1">파일 업로드</label>
@@ -65,6 +66,7 @@
           <fieldset class="border rounded p-3">
             <legend class="text-sm font-semibold">규칙 선택</legend>
 
+            <!-- app.js는 input[name="rule"] 체크 상태만 읽습니다. -->
             <label class="block"><input type="checkbox" name="rule" value="rrn" checked /> 주민등록번호</label>
             <label class="block"><input type="checkbox" name="rule" value="fgn" checked /> 외국인등록번호</label>
             <label class="block"><input type="checkbox" name="rule" value="phone_mobile" checked /> 휴대전화(010)</label>
@@ -74,7 +76,9 @@
             <label class="block"><input type="checkbox" name="rule" value="passport" checked /> 여권번호</label>
             <label class="block"><input type="checkbox" name="rule" value="driver_license" checked /> 운전면허번호</label>
 
-            <p class="text-[12px] text-gray-500 mt-2">* 선택 안 하면 서버 PRESET 전체가 사용됩니다.</p>
+            <p class="text-[12px] text-gray-500 mt-2">
+              * 선택 안 하면 서버 PRESET 전체가 사용될 수 있습니다.
+            </p>
           </fieldset>
 
           <div class="space-y-2">
@@ -88,7 +92,7 @@
           </div>
         </div>
 
-        <!-- 우측 -->
+        <!-- 우측 패널 -->
         <div class="lg:col-span-2 space-y-6">
           <!-- 레닥션 미리보기(카테고리별 칩) -->
           <div class="bg-white rounded-2xl shadow p-5">
@@ -96,7 +100,10 @@
               <h2 class="font-semibold mb-2">레닥션 미리보기</h2>
               <div id="file-info" class="text-sm text-gray-600"></div>
             </div>
-            <div id="redacted-preview" class="mono whitespace-pre-wrap border rounded p-3 text-sm min-h-[12rem]"></div>
+            <div
+              id="redacted-preview"
+              class="mono whitespace-pre-wrap border rounded p-3 text-sm min-h-[12rem]"
+            ></div>
           </div>
 
           <!-- 원본 텍스트(룰별 묶음 목록) -->
@@ -122,7 +129,7 @@
       </div>
     </div>
 
-    <!-- 캐시 무력화를 위해 버전 쿼리 추가 -->
-    <script type="module" src="./app.js?v=20251101"></script>
+    <!-- 캐시 무력화 버전 쿼리 -->
+    <script type="module" src="./app.js?v=20251102"></script>
   </body>
 </html>

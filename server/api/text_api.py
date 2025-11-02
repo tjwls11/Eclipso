@@ -1,9 +1,8 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import re
 import traceback
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, UploadFile, HTTPException
 from pydantic import BaseModel
@@ -12,9 +11,13 @@ from server.utils.file_reader import extract_from_file
 from server.core.redaction_rules import PRESET_PATTERNS, RULES
 from server.core.normalize import normalize_text
 
+# 정규식 매칭 유틸과 병합 정책
+from server.api.redaction_api import match_text as regex_match_text
+from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
+
 router = APIRouter(prefix="/text", tags=["text"])
 
-# ---------- models ----------
+
 class ExtractResponse(BaseModel):
     full_text: str
 
@@ -23,6 +26,9 @@ class MatchItem(BaseModel):
     value: str
     valid: bool
     context: str
+    start: Optional[int] = None
+    end: Optional[int] = None
+    location: Optional[Dict[str, int]] = None  # {start, end}
 
 class MatchResponse(BaseModel):
     items: List[MatchItem]
@@ -30,15 +36,11 @@ class MatchResponse(BaseModel):
 
 class MatchRequest(BaseModel):
     text: str
-    rules: Optional[List[str]] = None   # 지정 안 하면 PRESET 전체
-    normalize: bool = True              # True면 서버 표준 정규화 적용
+    rules: Optional[List[str]] = None
+    normalize: bool = True
 
-# ---------- helpers ----------
 def _compile_selected(selected: Optional[List[str]]):
-    """
-    PRESET_PATTERNS에서 선택된 룰만 (name, compiled_regex, ensure_valid)로 컴파일.
-    - case_sensitive, whole_word 옵션 반영
-    """
+    """PRESET_PATTERNS에서 선택된 룰만 컴파일."""
     want = set(selected or [p["name"] for p in PRESET_PATTERNS])
     out = []
     for p in PRESET_PATTERNS:
@@ -51,18 +53,14 @@ def _compile_selected(selected: Optional[List[str]]):
             pat = rf"\b(?:{pat})\b"
         try:
             rx = re.compile(pat, flags)
-        except re.error as e:
-            # 문제가 있는 정규식은 스킵(서버 죽지 않도록)
+        except re.error:
             continue
         ensure_valid = bool(p.get("ensure_valid", True))
         out.append((name, rx, ensure_valid))
     return out
 
 def _validate(name: str, value: str) -> bool:
-    """
-    RULES에 등록된 validator가 있으면 그것으로 OK/FAIL 판정.
-    없으면 True(OK).
-    """
+    """RULES.validator가 있으면 OK/FAIL 판정, 없으면 True."""
     rule = RULES.get((name or "").lower())
     if not rule:
         return True
@@ -72,7 +70,6 @@ def _validate(name: str, value: str) -> bool:
     try:
         return bool(fn(value))
     except TypeError:
-        # 시그니처 차이 허용 (value, _context)
         return bool(fn(value, None))
 
 def _ctx(s: str, i: int, j: int, pad: int = 30) -> str:
@@ -80,14 +77,15 @@ def _ctx(s: str, i: int, j: int, pad: int = 30) -> str:
     b = min(len(s), j + pad)
     return s[a:b]
 
-# ---------- endpoints ----------
-@router.post("/extract", response_model=ExtractResponse)
+@router.post(
+    "/extract",
+    response_model=ExtractResponse,
+    summary="파일에서 텍스트 추출",
+    description="업로드한 문서에서 본문 텍스트를 추출하여 반환"
+)
 async def extract_text(file: UploadFile):
-    """
-    업로드 문서에서 텍스트를 추출해 { full_text }로 반환.
-    """
     try:
-        raw = await extract_from_file(file)  # 문자열
+        raw = await extract_from_file(file)
         text = normalize_text(raw or "")
         return ExtractResponse(full_text=text)
     except HTTPException:
@@ -96,19 +94,21 @@ async def extract_text(file: UploadFile):
         traceback.print_exc()
         raise HTTPException(500, detail=f"서버 내부 오류: {e}")
 
-@router.get("/rules")
+@router.get(
+    "/rules",
+    summary="정규식 규칙 이름 목록",
+    description="서버에 등록된 개인정보 정규식 규칙들의 이름 배열을 반환"
+)
 async def list_rules():
-    """정의된 정규식 룰 이름 배열 반환"""
     return [r["name"] for r in PRESET_PATTERNS]
 
-@router.post("/match", response_model=MatchResponse)
+@router.post(
+    "/match",
+    response_model=MatchResponse,
+    summary="정규식 매칭 실행",
+    description="입력 텍스트에 대해 선택 규칙으로 정규식 매칭 결과를 반환"
+)
 async def match(req: MatchRequest):
-    """
-    선택 룰로 정규식 매칭 수행.
-    - req.normalize=True 면 서버 표준 정규화 후 매칭
-    - RULES.validator 로 OK/FAIL 판정
-    - 컨텍스트 스니펫 포함
-    """
     try:
         text = normalize_text(req.text or "") if req.normalize else (req.text or "")
         comp = _compile_selected(req.rules)
@@ -119,6 +119,7 @@ async def match(req: MatchRequest):
         for (name, rx, need_valid) in comp:
             c = 0
             for m in rx.finditer(text):
+                i, j = m.start(), m.end()
                 val = m.group(0)
                 ok = _validate(name, val) if need_valid else True
                 items.append(
@@ -126,7 +127,10 @@ async def match(req: MatchRequest):
                         rule=name,
                         value=val,
                         valid=ok,
-                        context=_ctx(text, m.start(), m.end())
+                        context=_ctx(text, i, j),
+                        start=i,
+                        end=j,
+                        location={"start": i, "end": j}
                     )
                 )
                 c += 1
@@ -136,3 +140,86 @@ async def match(req: MatchRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, detail=f"매칭 오류: {e}")
+
+@router.get(
+    "/policy",
+    summary="기본 병합 정책 조회",
+    description="정규식·NER 탐지 결과 병합에 사용하는 기본 정책을 반환"
+)
+async def get_policy():
+    return DEFAULT_POLICY
+
+@router.put(
+    "/policy",
+    summary="병합 정책 설정",
+    description="허용 라벨·우선순위 등 병합 정책을 갱신(전달값을 그대로 반환)"
+)
+async def set_policy(policy: dict):
+    return {"ok": True, "policy": policy}
+
+@router.post(
+    "/detect",
+    summary="정규식+NER 통합 탐지",
+    description="정규식과 NER을 선택 실행하고 정책에 따라 병합된 결과를 반환"
+)
+async def detect(req: dict):
+    text = (req or {}).get("text", "") or ""
+    options = (req or {}).get("options", {}) or {}
+    policy = (req or {}).get("policy") or DEFAULT_POLICY
+
+    run_regex_opt = bool(options.get("run_regex", True))
+    run_ner_opt = bool(options.get("run_ner", True))
+
+    # 1) 정규식 결과(유틸 재사용)
+    regex_result = {"items": []}
+    if run_regex_opt:
+        try:
+            regex_result = regex_match_text(text)
+        except Exception as e:
+            regex_result = {"items": [], "error": f"regex_failed: {e}"}
+
+    regex_spans: List[Dict[str, Any]] = []
+    for it in regex_result.get("items", []):
+        s, e = it.get("start"), it.get("end")
+        if s is None or e is None or e <= s:
+            continue
+        label = it.get("rule") or it.get("label") or it.get("name") or "REGEX"
+        regex_spans.append({
+            "start": int(s),
+            "end": int(e),
+            "label": str(label),
+            "source": "regex",
+            "score": None
+        })
+
+    # 2) NER 결과
+    ner_spans: List[Dict[str, Any]] = []
+    ner_raw_preview: Any = None
+    if run_ner_opt:
+        try:
+            from server.api.ner_api import ner_predict_blocking
+            raw_res = ner_predict_blocking(text, labels=policy.get("allowed_labels"))
+            ner_raw_preview = raw_res.get("raw")
+        except Exception:
+            ner_raw_preview = {"error": "ner_raw_preview_failed"}
+        from server.modules.ner_module import run_ner
+        ner_spans = run_ner(text=text, policy=policy)
+
+    # 3) 병합
+    merger = MergePolicy(policy)
+    final_spans, report = merger.merge(
+        text, regex_spans, ner_spans, degrade=(run_ner_opt is False)
+    )
+
+    return {
+        "text": text,
+        "final_spans": final_spans,
+        "report": report,
+        "debug": {
+            "run_regex": run_regex_opt,
+            "run_ner": run_ner_opt,
+            "ner_span_count": len(ner_spans),
+            "ner_span_head": ner_spans[:5],
+            "ner_raw_preview": ner_raw_preview
+        }
+    }

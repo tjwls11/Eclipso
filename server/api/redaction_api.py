@@ -1,34 +1,31 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
 import logging
-import re
 import os
+import re
 import tempfile
 import urllib.parse
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 
 from server.core.schemas import DetectResponse, PatternItem
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
 from server.core.redaction_rules import PRESET_PATTERNS
+from server.core.matching import find_sensitive_spans
 
-# XML 계열 처리 모듈 (있는 버전/시그니처에 최대 호환)
+# XML 계열 처리 모듈(존재/시그니처 호환)
 try:
     from server.modules.xml_redaction import xml_scan, xml_redact_to_file
-except Exception:
-    xml_scan = None          # 타입: Callable | None
+except Exception:  # pragma: no cover
+    xml_scan = None
     xml_redact_to_file = None
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
 
 
-# ---------------------------
-# 공통 유틸
-# ---------------------------
 def _ensure_pdf(file: UploadFile) -> None:
     if file is None:
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
@@ -71,7 +68,7 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
 
     try:
         return [PatternItem(**p) for p in arr]
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         raise HTTPException(status_code=400, detail=f"잘못된 patterns 항목: {e}")
 
 def _as_jsonable(obj: Any) -> Any:
@@ -90,23 +87,19 @@ def _as_jsonable(obj: Any) -> Any:
         return {"result": str(obj)}
 
 def build_disposition(filename: str) -> str:
-    """
-    한글/유니코드 파일명을 안전하게 내려주기 위한 Content-Disposition 생성.
-    - filename : ASCII fallback
-    - filename*: RFC 5987 (UTF-8 percent-encoding)
-    """
+    """Content-Disposition 헤더(UTF-8 안전) 생성"""
     base = filename or "download.bin"
     ascii_fallback = re.sub(r'[^A-Za-z0-9._-]', '_', base)
     quoted = urllib.parse.quote(base, safe="")
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
 
 
-# ---------------------------
-# /patterns  (프론트 초기 로딩)
-# ---------------------------
-@router.get("/patterns")
+@router.get(
+    "/patterns",
+    summary="패턴 목록",
+    description="서버에 등록된 정규식 패턴(PRESET) 목록 제공"
+)
 def get_patterns() -> Dict[str, Any]:
-    """규칙 목록 제공 (프론트 app.js 에서 호출)"""
     return {
         "patterns": [
             {
@@ -114,19 +107,22 @@ def get_patterns() -> Dict[str, Any]:
                 "regex": p.get("regex"),
                 "case_sensitive": bool(p.get("case_sensitive", False)),
                 "whole_word": bool(p.get("whole_word", False)),
-                # validator 통과시에만 OK로 취급하도록 기본 True
                 "ensure_valid": bool(p.get("ensure_valid", True)),
             }
             for p in PRESET_PATTERNS
         ]
     }
 
-
-# ---------------------------
-# PDF: 박스 검출 / 적용 (기존 유지)
-# ---------------------------
-@router.post("/redactions/detect", response_model=DetectResponse)
-async def detect(file: UploadFile = File(...), patterns_json: Optional[str] = Form(None)):
+@router.post(
+    "/redactions/detect",
+    response_model=DetectResponse,
+    summary="PDF 패턴 박스 검출",
+    description="PDF에서 정규식 패턴 위치를 박스로 탐지"
+)
+async def detect(
+    file: UploadFile = File(..., description="PDF 파일"),
+    patterns_json: Optional[str] = Form(None, description="패턴 목록 JSON(옵션)")
+):
     _ensure_pdf(file)
     pdf = await file.read()
 
@@ -139,34 +135,49 @@ async def detect(file: UploadFile = File(...), patterns_json: Optional[str] = Fo
     boxes = detect_boxes_from_patterns(pdf, patterns)
     return DetectResponse(total_matches=len(boxes), boxes=boxes)
 
-
-@router.post("/redactions/apply", response_class=Response)
-async def apply(file: UploadFile = File(...)):
+@router.post(
+    "/redactions/apply",
+    response_class=Response,
+    summary="PDF 레닥션 적용",
+    description="PDF에 감지 박스를 채워 레닥션된 PDF 반환"
+)
+async def apply_pdf(
+    file: UploadFile = File(..., description="PDF 파일"),
+    mode: Optional[str] = Form(None),
+    fill: Optional[str] = Form("black"),
+    patterns_json: Optional[str] = Form(None),
+):
     _ensure_pdf(file)
     pdf = _read_all(file)
-    # 기본 채움색
-    fill = "black"
 
-    boxes = detect_boxes_from_patterns(pdf, [PatternItem(**p) for p in PRESET_PATTERNS])
-    out = apply_redaction(pdf, boxes, fill=fill)
+    patterns = _parse_patterns_json(patterns_json)
+    fill_color = (fill or "black").lower()
+
+    boxes = detect_boxes_from_patterns(pdf, patterns)
+    out = apply_redaction(pdf, boxes, fill=fill_color)
 
     disp = build_disposition("redacted.pdf")
-    return Response(content=out, media_type="application/pdf",
-                    headers={"Content-Disposition": disp})
+    return Response(
+        content=out,
+        media_type="application/pdf",
+        headers={"Content-Disposition": disp},
+    )
 
-
-# ---------------------------
-# 프론트 호환 라우트: /redactions/pdf/scan
-# ---------------------------
-@router.post("/redactions/pdf/scan")
-async def pdf_scan(file: UploadFile = File(...), patterns_json: Optional[str] = Form(None)):
+@router.post(
+    "/redactions/pdf/scan",
+    summary="프론트 호환: PDF 스캔",
+    description="프론트 공통 스키마로 PDF 스캔 결과 반환"
+)
+async def pdf_scan(
+    file: UploadFile = File(...),
+    patterns_json: Optional[str] = Form(None),
+):
     _ensure_pdf(file)
     pdf = await file.read()
     patterns = _parse_patterns_json(patterns_json)
 
     boxes = detect_boxes_from_patterns(pdf, patterns)
 
-    # 프론트 호환 형태로 변환 (최소 필드만)
     matches = []
     for b in boxes:
         matches.append({
@@ -180,25 +191,23 @@ async def pdf_scan(file: UploadFile = File(...), patterns_json: Optional[str] = 
 
     return {
         "file_type": "pdf",
-        "extracted_text": "",   # 필요 시 /text/extract 연동 가능
+        "extracted_text": "",
         "matches": matches,
     }
 
-
-# ---------------------------
-# 프론트 호환 라우트: /redactions/xml/scan
-# ---------------------------
-@router.post("/redactions/xml/scan")
+@router.post(
+    "/redactions/xml/scan",
+    summary="프론트 호환: XML 스캔",
+    description="DOCX/XLSX/PPTX/HWPX 스캔 결과를 프론트 공통 스키마로 반환"
+)
 async def xml_scan_endpoint(
     file: UploadFile = File(...),
-    patterns_json: Optional[str] = Form(None),   # 현재 서버쪽에서 PRESET 사용, 필드 유지만
+    patterns_json: Optional[str] = Form(None),  # 구조 호환을 위해 유지(실사용 X)
 ):
     if xml_scan is None:
         raise HTTPException(status_code=500, detail="xml_redaction 모듈을 불러오지 못했습니다.")
 
     data = _read_all(file)
-
-    # 구현체별 시그니처 차이를 흡수
     try:
         # 신형: xml_scan(bytes, filename)
         res = xml_scan(data, file.filename or "")
@@ -208,12 +217,12 @@ async def xml_scan_endpoint(
 
     return _as_jsonable(res)
 
-
-# ---------------------------
-# 프론트 호환 라우트: /redactions/xml/apply
-#   ※ 경로 기반/바이트 기반 모든 시그니처를 순차 지원
-# ---------------------------
-@router.post("/redactions/xml/apply", response_class=Response)
+@router.post(
+    "/redactions/xml/apply",
+    response_class=Response,
+    summary="프론트 호환: XML 레닥션 적용",
+    description="DOCX/XLSX/PPTX/HWPX에 레닥션 적용된 파일 반환"
+)
 async def xml_apply_endpoint(file: UploadFile = File(...)):
     if xml_redact_to_file is None:
         raise HTTPException(status_code=500, detail="xml_redaction 모듈을 불러오지 못했습니다.")
@@ -223,7 +232,6 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
     stem = base.rsplit(".", 1)[0]
     ext = base.rsplit(".", 1)[-1].lower() if "." in base else "bin"
 
-    # MIME 대략치
     ext_to_mime = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -236,7 +244,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
     }
     default_mime = ext_to_mime.get(ext, "application/octet-stream")
 
-    # 업로드 바이트를 임시 파일로 저장 → 경로 기반 호출 우선
+    # 임시 디렉토리 내 경로 기반 호출 우선
     with tempfile.TemporaryDirectory(prefix="eclipso_") as tdir:
         src_path = os.path.join(tdir, base)
         with open(src_path, "wb") as wf:
@@ -315,7 +323,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
         except TypeError:
             pass
 
-        # 3) (src_path) 만 받는 구현체
+        # 3) (src_path)
         try:
             res = xml_redact_to_file(src_path)
             if isinstance(res, (bytes, bytearray)):
@@ -336,7 +344,7 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
             return Response(content=out_bytes, media_type=default_mime,
                             headers={"Content-Disposition": disp})
         except TypeError:
-            # 최후: (bytes, filename) 시그니처 시도
+            # 4) 최후: (bytes, filename) / (bytes, name, mime)
             try:
                 res = xml_redact_to_file(data, base)
                 if isinstance(res, (bytes, bytearray)):
@@ -346,12 +354,46 @@ async def xml_apply_endpoint(file: UploadFile = File(...)):
                     return Response(content=out_bytes, media_type=default_mime,
                                     headers={"Content-Disposition": disp})
                 else:
-                    # (bytes, name, mime) 튜플 케이스 지원
                     out_bytes = res[0]
                     out_name = res[1] if len(res) > 1 else f"{stem}.redacted.{ext}"
                     out_mime = res[2] if len(res) > 2 else default_mime
                     disp = build_disposition(out_name)
                     return Response(content=out_bytes, media_type=out_mime,
                                     headers={"Content-Disposition": disp})
-            except Exception as e2:
+            except Exception as e2:  # pragma: no cover
                 raise HTTPException(status_code=500, detail=f"xml_redact_to_file 시그니처 불일치: {e2}")
+
+
+def match_text(text: str):
+    """
+    정규식 기반 민감정보 매칭 유틸
+    반환: { items, counts }
+    항목: rule, value, start, end, context, valid
+    """
+    try:
+        if not isinstance(text, str):
+            text = str(text)
+
+        results = find_sensitive_spans(text)
+        matches = []
+        counts: Dict[str, int] = {}
+
+        for start, end, value, rule_name in results:
+            ctx_start = max(0, start - 20)
+            ctx_end = min(len(text), end + 20)
+            matches.append({
+                "rule": rule_name,
+                "value": value,
+                "start": start,
+                "end": end,
+                "context": text[ctx_start:ctx_end],
+                "valid": True,
+            })
+            counts[rule_name] = counts.get(rule_name, 0) + 1
+
+        log.debug("regex match count=%d", len(matches))
+        return {"items": matches, "counts": counts}
+
+    except Exception as e:  # pragma: no cover
+        log.exception("match_text 내부 오류")
+        raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")

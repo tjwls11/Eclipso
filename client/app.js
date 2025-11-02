@@ -1,7 +1,10 @@
-// ===== helpers / config =====
-const API_BASE = window.API_BASE || "";
+const API_BASE = (typeof window.API_BASE === 'function'
+  ? window.API_BASE()
+  : (window.API_BASE || ""));                
 const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || "";
-const $ = (id) => document.getElementById(id);
+const $  = (id)  => document.getElementById(id);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const api = (path) => `${API_BASE}${path}`;
 
 const PREVIEW_ONLY_MATCHES = true;
 
@@ -26,6 +29,7 @@ function setSaveVisible(show) {
   if (show) { b.classList.remove("hidden"); b.disabled = false; }
   else { b.classList.add("hidden"); b.disabled = true; }
 }
+function setStatus(msg) { $("status").textContent = msg || ""; }
 
 // ===== tones (칩 색상) =====
 const RULE_TONE = {
@@ -126,31 +130,56 @@ function buildPreviewHtml_Grouped(fullText, matches, fileType) {
   return html;
 }
 
+// ===== backend mode autodetect (XML vs TEXT) =====
+let MODE = 'XML'; // 'XML' | 'TEXT'  (XML=/redactions/*, TEXT=/text/*)
+
+async function detectMode() {
+  try {
+    const r = await fetch(api('/patterns'), { cache: 'no-store' });
+    if (!r.ok) throw 0;
+    MODE = 'XML';
+  } catch {
+    MODE = 'TEXT';
+  }
+}
+
 // ===== state =====
 let PRESET = [];
 let LAST_FILE = null;
 
 // ===== init =====
 init();
-function init() { bindUI(); fetchPatterns(); setSaveVisible(false); }
+async function init() {
+  await detectMode();
+  bindUI();
+  await fetchPatterns();
+  setSaveVisible(false);
+}
 function bindUI() {
   $("file").addEventListener("change", onFileChange);
   $("btn-scan").addEventListener("click", onScanClick);
   $("btn-save-redacted").addEventListener("click", onApplyClick);
 }
+
+// ===== patterns/rules (양쪽 호환) =====
 async function fetchPatterns() {
   try {
-    const res = await fetch(`${API_BASE}/patterns`, { cache: "no-store" });
-    const j = await res.json();
-    PRESET = Array.isArray(j?.patterns) ? j.patterns : [];
+    if (MODE === 'XML') {
+      const res = await fetch(api('/patterns'), { cache: "no-store" });
+      const j = await res.json();
+      PRESET = Array.isArray(j?.patterns) ? j.patterns : [];
+    } else {
+      const res = await fetch(api('/text/rules'), { cache: "no-store" });
+      const names = await res.json(); // ["rrn","email",...]
+      PRESET = (names || []).map(n => ({ name: n }));
+    }
   } catch { PRESET = []; }
 }
-
-// ===== rules UI =====
 function selectedRuleNames() {
   return Array.from(document.querySelectorAll('input[name="rule"]:checked')).map(el => el.value);
 }
 function selectedPatternsPayload() {
+  if (MODE === 'TEXT') return null; // TEXT는 이름 배열로만 처리
   const names = new Set(selectedRuleNames());
   if (!names.size || !PRESET.length) return null;
   const chosen = PRESET.filter(p => names.has(p.name));
@@ -177,7 +206,8 @@ function onFileChange() {
 }
 
 // ===== actions =====
-async function onScanClick() {
+async function onScanClick(e) {
+  if (e) e.preventDefault();
   const f = $("file").files?.[0];
   if (!f) return alert("파일을 선택하세요.");
 
@@ -225,7 +255,8 @@ async function onScanClick() {
   }
 }
 
-async function onApplyClick() {
+async function onApplyClick(e) {
+  if (e) e.preventDefault();
   const f = $("file").files?.[0];
   if (!f) return alert("파일을 선택하세요.");
   setStatus("레닥션 중…");
@@ -253,17 +284,47 @@ async function scanFile(file) {
   const fd = new FormData();
   fd.append("file", file);
 
-  const pj = selectedPatternsPayload();
-  if (pj) fd.append("patterns_json", JSON.stringify(pj));
+  if (MODE === 'XML') {
+    const pj = selectedPatternsPayload();
+    if (pj) fd.append("patterns_json", JSON.stringify(pj));
 
-  const url = isPdfName(file.name)
-    ? `${API_BASE}/redactions/pdf/scan`
-    : `${API_BASE}/redactions/xml/scan`;
+    const url = isPdfName(file.name)
+      ? api('/redactions/pdf/scan')
+      : api('/redactions/xml/scan');
 
-  const res = await fetch(url, { method: "POST", body: fd, cache: "no-store" });
-  if (!res.ok) throw new Error(await res.text());
-  return await res.json();
+    const res = await fetch(url, { method: "POST", body: fd, cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    return await res.json(); // { extracted_text, file_type, matches: [...] }
+  } else {
+    // TEXT: /text/extract → /text/match
+    const extResp = await fetch(api('/text/extract'), { method: 'POST', body: fd });
+    if (!extResp.ok) throw new Error(await extResp.text());
+    const extData = await extResp.json(); // { full_text }
+
+    const rules = selectedRuleNames();
+    const matchResp = await fetch(api('/text/match'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: extData.full_text || "", rules, normalize: true }),
+    });
+    if (!matchResp.ok) throw new Error(await matchResp.text());
+    const rj = await matchResp.json(); // { items: [...] }
+
+    // 공통 스키마로 변환
+    return {
+      extracted_text: extData.full_text || "",
+      file_type: isPdfName(file.name) ? "pdf" : "xml",
+      matches: (rj.items || []).map(r => ({
+        rule: r.rule,
+        value: r.value,
+        valid: r.valid,
+        location: r.location || null,
+        page: r.page,
+      })),
+    };
+  }
 }
+
 function _parseDownloadFilename(res) {
   const cd = res.headers.get("content-disposition") || "";
   const mStar = cd.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
@@ -271,29 +332,40 @@ function _parseDownloadFilename(res) {
   const m = cd.match(/filename\s*=\s*"([^"]+)"/i) || cd.match(/filename\s*=\s*([^;]+)/i);
   return m ? m[1].trim() : "";
 }
+
 async function applyAndGetBlob(file) {
   const fd = new FormData();
   fd.append("file", file);
 
-  let url = "";
-  if (isPdfName(file.name)) {
-    fd.append("mode", "auto_all");
-    fd.append("fill", "black");
-    const pj = selectedPatternsPayload();
-    if (pj) fd.append("patterns_json", JSON.stringify(pj));
-    url = `${API_BASE}/redactions/apply`;
-  } else if (isXmlDoc(file.name)) {
-    url = `${API_BASE}/redactions/xml/apply`;
+  if (MODE === 'XML') {
+    let url = "";
+    if (isPdfName(file.name)) {
+      fd.append("mode", "auto_all");
+      fd.append("fill", "black");
+      const pj = selectedPatternsPayload();
+      if (pj) fd.append("patterns_json", JSON.stringify(pj));
+      url = api('/redactions/apply');
+    } else if (isXmlDoc(file.name)) {
+      url = api('/redactions/xml/apply');
+    } else {
+      throw new Error("이 형식은 레닥션 적용을 지원하지 않습니다.");
+    }
+
+    const res = await fetch(url, { method: "POST", body: fd, cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const filename = _parseDownloadFilename(res)
+      || `${file.name.replace(/\.[^.]+$/, "")}.redacted.${extOf(file.name)}`;
+    return { blob, filename };
   } else {
-    throw new Error("이 형식은 레닥션 적용을 지원하지 않습니다.");
+    // TEXT: 단일 업로드 엔드포인트
+    const res = await fetch(api('/redact/file'), { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const filename = _parseDownloadFilename(res)
+      || `${file.name.replace(/\.[^.]+$/, "")}.redacted.${extOf(file.name)}`;
+    return { blob, filename };
   }
-
-  const res = await fetch(url, { method: "POST", body: fd, cache: "no-store" });
-  if (!res.ok) throw new Error(await res.text());
-
-  const blob = await res.blob();
-  const filename = _parseDownloadFilename(res) || `${file.name.replace(/\.[^.]+$/, "")}.redacted.${extOf(file.name)}`;
-  return { blob, filename };
 }
 
 // ===== chips list (하단 위젯) =====
@@ -343,6 +415,3 @@ function renderRuleChips(container, list, isNG=false) {
   });
   container.innerHTML = sections.join("");
 }
-
-// ===== status =====
-function setStatus(msg) { $("status").textContent = msg || ""; }
