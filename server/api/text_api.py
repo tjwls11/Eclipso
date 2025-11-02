@@ -9,14 +9,32 @@ from pydantic import BaseModel
 
 from server.utils.file_reader import extract_from_file
 from server.core.redaction_rules import PRESET_PATTERNS, RULES
-from server.core.normalize import normalize_text
+
+# --- 정규화 함수 호환 래퍼 (normalize_text 없는 브랜치 대비) ---
+try:
+    # 신형: normalize_text 존재
+    from server.core.normalize import normalize_text  # type: ignore
+except Exception:
+    # 구형: normalize()만 있는 경우
+    try:
+        from server.core.normalize import normalize as _normalize  # type: ignore
+
+        def normalize_text(s: str) -> str:
+            r = _normalize(s)
+            # (정규화문자열, 인덱스맵) 형태일 수 있음 → 문자열만 사용
+            if isinstance(r, (list, tuple)):
+                return r[0]
+            return r if isinstance(r, str) else str(r)
+    except Exception:
+        # 최후 안전장치: 정규화 모듈이 전혀 없으면 원문 반환
+        def normalize_text(s: str) -> str:
+            return s
 
 # 정규식 매칭 유틸과 병합 정책
 from server.api.redaction_api import match_text as regex_match_text
 from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 
 router = APIRouter(prefix="/text", tags=["text"])
-
 
 class ExtractResponse(BaseModel):
     full_text: str
@@ -39,6 +57,7 @@ class MatchRequest(BaseModel):
     rules: Optional[List[str]] = None
     normalize: bool = True
 
+
 def _compile_selected(selected: Optional[List[str]]):
     """PRESET_PATTERNS에서 선택된 룰만 컴파일."""
     want = set(selected or [p["name"] for p in PRESET_PATTERNS])
@@ -54,7 +73,7 @@ def _compile_selected(selected: Optional[List[str]]):
         try:
             rx = re.compile(pat, flags)
         except re.error:
-            continue
+            continue  # 문제가 있는 정규식은 스킵(서버 안정성 우선)
         ensure_valid = bool(p.get("ensure_valid", True))
         out.append((name, rx, ensure_valid))
     return out
@@ -70,12 +89,14 @@ def _validate(name: str, value: str) -> bool:
     try:
         return bool(fn(value))
     except TypeError:
+        # 일부 validator는 (value, context) 시그니처
         return bool(fn(value, None))
 
 def _ctx(s: str, i: int, j: int, pad: int = 30) -> str:
     a = max(0, i - pad)
     b = min(len(s), j + pad)
     return s[a:b]
+
 
 @router.post(
     "/extract",
@@ -85,7 +106,7 @@ def _ctx(s: str, i: int, j: int, pad: int = 30) -> str:
 )
 async def extract_text(file: UploadFile):
     try:
-        raw = await extract_from_file(file)
+        raw = await extract_from_file(file)  # 문자열
         text = normalize_text(raw or "")
         return ExtractResponse(full_text=text)
     except HTTPException:
@@ -174,7 +195,7 @@ async def detect(req: dict):
     regex_result = {"items": []}
     if run_regex_opt:
         try:
-            regex_result = regex_match_text(text)
+            regex_result = regex_match_text(text)  # {items:[{start,end,rule,...}], counts:{...}}
         except Exception as e:
             regex_result = {"items": [], "error": f"regex_failed: {e}"}
 
