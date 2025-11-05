@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import io
-import logging
 import re
 from typing import List, Optional, Set, Dict
 
 import fitz  # PyMuPDF
 
 from server.core.schemas import Box, PatternItem
-from server.core.redaction_rules import PRESET_PATTERNS
-from server.modules.ner_module import run_ner  # 쓰일 수 있으니 그대로 둠
+from server.core.redaction_rules import PRESET_PATTERNS, RULES
+from server.modules.ner_module import run_ner  # 앞으로 쓸 수도 있으니 그대로 둠
 from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 from server.core.regex_utils import match_text
 
@@ -21,10 +20,8 @@ try:
 except Exception:  # pragma: no cover
     from server.modules.common import cleanup_text, compile_rules  # type: ignore
 
-log = logging.getLogger("pdf_redact")
 
-# 매치 단위 로그를 얼마나 찍을지 플래그
-LOG_EACH_MATCH = True  # 필요 없으면 False 로 바꿔도 됨
+log_prefix = "[PDF]"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -101,13 +98,14 @@ def _is_valid_value(need_valid: bool, validator, value: str) -> bool:
             # validator(val, ctx) 형태일 수도 있음
             return bool(validator(value, None))
     except Exception:
-        log.exception("validator error: value=%r", value)
+        # validator 내부 예외는 FAIL 처리
+        print(f"{log_prefix} VALIDATOR ERROR", repr(value))
         return False
 
 
 # ─────────────────────────────────────────────────────────────
 # PDF 내 박스 탐지
-#  - 다른 모듈(hwpx/docx/xlsx/pptx 등)과 동일하게 compile_rules() 이용
+#  - compile_rules() 기반 + validator 결과를 그대로 사용
 #  - FAIL(validator False) 인 값은 **절대로 박스 만들지 않음**
 # ─────────────────────────────────────────────────────────────
 def detect_boxes_from_patterns(
@@ -123,18 +121,18 @@ def detect_boxes_from_patterns(
     comp = compile_rules()  # [(name, rx, need_valid, prio, validator), ...]
     allowed_names = _normalize_pattern_names(patterns)
 
+    print(
+        f"{log_prefix} detect_boxes_from_patterns: rules 준비 완료",
+        "allowed_names=",
+        sorted(allowed_names) if allowed_names else "ALL",
+    )
+
     # 룰별 OK/FAIL 카운터 (디버깅용)
     stats_ok: Dict[str, int] = {}
     stats_fail: Dict[str, int] = {}
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     boxes: List[Box] = []
-
-    log.info(
-        "[PDF] detect_boxes_from_patterns: pages=%d, allowed_names=%s",
-        doc.page_count,
-        sorted(allowed_names) if allowed_names else "ALL",
-    )
 
     try:
         for pno, page in enumerate(doc):
@@ -164,15 +162,14 @@ def detect_boxes_from_patterns(
                     else:
                         stats_fail[rule_name] = stats_fail.get(rule_name, 0) + 1
 
-                    if LOG_EACH_MATCH:
-                        log.debug(
-                            "[PDF MATCH] page=%d rule=%s need_valid=%s ok=%s value=%r",
-                            pno + 1,
-                            rule_name,
-                            need_valid,
-                            ok,
-                            val,
-                        )
+                    print(
+                        f"{log_prefix} MATCH",
+                        "page=", pno + 1,
+                        "rule=", rule_name,
+                        "need_valid=", need_valid,
+                        "ok=", ok,
+                        "value=", repr(val),
+                    )
 
                     # FAIL 이면 박스 만들지 않음
                     if not ok:
@@ -181,17 +178,23 @@ def detect_boxes_from_patterns(
                     # 실제 박스 찾기
                     rects = page.search_for(val)
                     for r in rects:
+                        print(
+                            f"{log_prefix} BOX",
+                            "page=", pno + 1,
+                            "rule=", rule_name,
+                            "rect=", (r.x0, r.y0, r.x1, r.y1),
+                        )
                         boxes.append(
                             Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
                         )
     finally:
         doc.close()
 
-    log.info(
-        "[PDF] detect summary: OK=%s FAIL=%s boxes=%d",
-        ", ".join(f"{k}={v}" for k, v in sorted(stats_ok.items())),
-        ", ".join(f"{k}={v}" for k, v in sorted(stats_fail.items())),
-        len(boxes),
+    print(
+        f"{log_prefix} detect summary",
+        "OK=", {k: v for k, v in sorted(stats_ok.items())},
+        "FAIL=", {k: v for k, v in sorted(stats_fail.items())},
+        "boxes=", len(boxes),
     )
 
     return boxes
@@ -206,7 +209,7 @@ def _fill_color(fill: str):
 
 
 def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> bytes:
-    log.info("[PDF] apply_redaction: boxes=%d, fill=%s", len(boxes), fill)
+    print(f"{log_prefix} apply_redaction: boxes=", len(boxes), "fill=", fill)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         color = _fill_color(fill)
@@ -228,47 +231,18 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> 
 
 def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> bytes:
     """
-    PRESET_PATTERNS + extra_spans 기반 텍스트 레닥션.
+    PRESET_PATTERNS 기반 텍스트 레닥션.
 
-    extra_spans:
-      [{ "text_sample": "...", "decision": "highlight"|"redact" }, ...]
+    ※ 중요:
+      - 여기서는 **regex + validator 기반 박스만 사용**한다.
+      - extra_spans(NER / 기타 매칭 결과)는 PDF 레닥션에서는
+        FAIL/OK 구분이 확실하지 않아서 현재는 *레닥션에 사용하지 않는다*.
+        (필요하면 나중에 valid=True 인 것만 별도 하이라이트 용도로 쓸 수 있음)
     """
     # PRESET 전체를 PatternItem 형태로 만들어서 이름만 넘김
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
 
-    if not extra_spans:
-        return apply_redaction(pdf_bytes, boxes)
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        # 1) 기본 박스 적용
-        for b in boxes:
-            page = doc.load_page(int(b.page))
-            rect = fitz.Rect(float(b.x0), float(b.y0), float(b.x1), float(b.y1))
-            page.add_redact_annot(rect, fill=(0, 0, 0))
-
-        # 2) extra_spans 반영
-        for page in doc:
-            for s in extra_spans:
-                frag = (s.get("text_sample") or "").strip()
-                if not frag:
-                    continue
-                rects = page.search_for(frag)
-                for r in rects:
-                    if s.get("decision") == "highlight":
-                        annot = page.add_highlight_annot(r)
-                        annot.set_colors(stroke=(1, 1, 0))
-                        annot.set_opacity(0.45)
-                        annot.update()
-                    else:
-                        page.add_redact_annot(r, fill=(0, 0, 0))
-
-        for page in doc:
-            page.apply_redactions()
-
-        out = io.BytesIO()
-        doc.save(out)
-        return out.getvalue()
-    finally:
-        doc.close()
+    # extra_spans 는 지금 단계에서는 완전히 무시
+    # (FAIL 이라도 강제로 들어오는 걸 막기 위해)
+    return apply_redaction(pdf_bytes, boxes)
