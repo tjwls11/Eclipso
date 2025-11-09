@@ -1,4 +1,5 @@
 # server/modules/pptx_module.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import io
@@ -6,7 +7,7 @@ import re
 import zipfile
 from typing import List, Tuple
 
-# 공통 유틸
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
 try:
     from .common import (
         cleanup_text,
@@ -17,7 +18,7 @@ try:
         xlsx_text_from_zip,
         redact_embedded_xlsx_bytes,
     )
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - 패키지 구조 달라졌을 때 대비
     from server.modules.common import (  # type: ignore
         cleanup_text,
         compile_rules,
@@ -28,23 +29,28 @@ except Exception:  # pragma: no cover
         redact_embedded_xlsx_bytes,
     )
 
-# schemas 임포트 (core 우선)
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
 try:
-    from ..core.schemas import XmlMatch, XmlLocation
+    from ..core.schemas import XmlMatch, XmlLocation  # 현재 리포 구조
 except Exception:
     try:
-        from ..schemas import XmlMatch, XmlLocation  # type: ignore
+        from ..schemas import XmlMatch, XmlLocation   # 옛 구조 호환
     except Exception:
-        from server.core.schemas import XmlMatch, XmlLocation  # type: ignore
+        from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PPTX 텍스트 추출
+#   - ppt/slides/*.xml          : 슬라이드 본문 텍스트(<a:t>)
+#   - ppt/charts/*.xml          : 차트 라벨/값(<a:t>, <c:v>)
+#   - ppt/embeddings/*.xlsx     : 임베디드 엑셀의 셀/차트 텍스트
+# ─────────────────────────────────────────────────────────────────────────────
 def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
     parts: List[str] = []
 
-    # 차트 XML: <a:t>, <c:v> 안의 텍스트만 추출
+    # 1) 차트 XML 내부 라벨/값
     for name in sorted(
-        n
-        for n in zipf.namelist()
+        n for n in zipf.namelist()
         if n.startswith("ppt/charts/") and n.endswith(".xml")
     ):
         s = zipf.read(name).decode("utf-8", "ignore")
@@ -57,10 +63,9 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
             if v:
                 parts.append(v)
 
-    # 임베디드 XLSX (ppt/embeddings/*.xlsx)
+    # 2) 임베디드 XLSX (차트 데이터가 들어있는 통합문서)
     for name in sorted(
-        n
-        for n in zipf.namelist()
+        n for n in zipf.namelist()
         if n.startswith("ppt/embeddings/") and n.lower().endswith(".xlsx")
     ):
         try:
@@ -68,8 +73,9 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
             with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as xzf:
                 parts.append(xlsx_text_from_zip(xzf))
         except KeyError:
-            continue
+            pass
         except zipfile.BadZipFile:
+            # 깨진 임베딩은 그냥 무시
             continue
 
     return cleanup_text("\n".join(p for p in parts if p))
@@ -78,10 +84,9 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
 def pptx_text(zipf: zipfile.ZipFile) -> str:
     all_txt: List[str] = []
 
-    # 슬라이드 본문
+    # 슬라이드 본문 텍스트
     for name in sorted(
-        n
-        for n in zipf.namelist()
+        n for n in zipf.namelist()
         if n.startswith("ppt/slides/") and n.endswith(".xml")
     ):
         xml = zipf.read(name).decode("utf-8", "ignore")
@@ -90,62 +95,74 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
             for tm in re.finditer(r"<a:t[^>]*>(.*?)</a:t>", xml, re.DOTALL)
         ]
 
-    # 차트 + 임베디드 XLSX
+    # 차트 + 임베디드 XLSX 텍스트
     chart_txt = _collect_chart_and_embedded_texts(zipf)
     if chart_txt:
         all_txt.append(chart_txt)
 
-    text = cleanup_text("\n".join(all_txt))
-
-    # 시트 참조(Sheet1!$B$1, Sheet1!$B$2:$B$5 등) 제거
-    text = re.sub(
-        r"[A-Za-z0-9_]+!\$[A-Z]{1,3}\$\d+(?::\$[A-Z]{1,3}\$\d+)?",
-        "",
-        text,
-    )
-    text = re.sub(r"\b\d+\.\d{10,}\b", "", text)
-    text = text.replace("General", "")
-    text = re.sub(r"<[^>]+>", "", text)
-
-    return cleanup_text(text)
+    return cleanup_text("\n".join(all_txt))
 
 
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
 def extract_text(file_bytes: bytes) -> dict:
+    """
+    PPTX 바이트에서 텍스트만 추출.
+    full_text / pages 형식으로 반환.
+    """
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         txt = pptx_text(zipf)
 
     return {
         "full_text": txt,
-        "pages": [{"page": 1, "text": txt}],
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보 추출
+# ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = pptx_text(zipf)
     comp = compile_rules()
+    out: List[XmlMatch] = []
 
-    matches: List[XmlMatch] = []
-    debug_info: List[str] = []
+    for ent in comp:
+        try:
+            # tuple/list 계열
+            if isinstance(ent, (list, tuple)):
+                if len(ent) >= 2:
+                    rule_name, rx = ent[0], ent[1]
+                else:
+                    continue
+                need_valid = bool(ent[2]) if len(ent) >= 3 else True
+                validator = ent[4] if len(ent) >= 5 else None
+            else:
+                # 네임드 객체(SimpleNamespace 등)
+                rule_name = getattr(ent, "name", getattr(ent, "rule", "unknown"))
+                rx = getattr(ent, "rx", getattr(ent, "regex", None))
+                need_valid = bool(getattr(ent, "need_valid", True))
+                validator = getattr(ent, "validator", None)
 
-    for rule_name, cfg in comp.items():
-        pattern = cfg["pattern"]
-        validator = cfg["validator"]
-        ensure_valid = cfg["ensure_valid"]
+            if rx is None:
+                continue
+        except Exception:
+            continue
 
-        for m in pattern.finditer(text):
+        for m in rx.finditer(text):
             val = m.group(0)
             ok = True
+            if need_valid and callable(validator):
+                try:
+                    try:
+                        ok = bool(validator(val))
+                    except TypeError:
+                        ok = bool(validator(val, None))
+                except Exception:
+                    ok = False
 
-            if validator is not None:
-                valid, reason = validator(val)
-                if not valid:
-                    debug_info.append(
-                        f"[pptx] rule={rule_name} value={val} invalid: {reason}"
-                    )
-                    if ensure_valid:
-                        ok = False
-
-            matches.append(
+            out.append(
                 XmlMatch(
                     rule=rule_name,
                     value=val,
@@ -160,36 +177,32 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
                 )
             )
 
-    debug_str = "\n".join(debug_info)
-    return matches, text, debug_str
+    return out, "pptx", text
 
 
-def redact_part_bytes(name: str, data: bytes, comp) -> bytes:
-    low = name.lower()
+# ─────────────────────────────────────────────────────────────────────────────
+# 파일 단위 레닥션
+# ─────────────────────────────────────────────────────────────────────────────
+def redact_item(filename: str, data: bytes, comp):
+    low = filename.lower()
 
-    # 슬라이드 XML
+    # 1) 슬라이드 본문 XML: 텍스트 노드만 마스킹
     if low.startswith("ppt/slides/") and low.endswith(".xml"):
-        b2, _ = chart_sanitize(data, comp)
-        return sub_text_nodes(b2, comp)[0]
+        return sub_text_nodes(data, comp)[0]
 
-    # 차트 XML
+    # 2) 차트 XML: 라벨/값 + 텍스트 노드 마스킹
     if low.startswith("ppt/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
         return sub_text_nodes(b2, comp)[0]
 
-    # 차트 rels
+    # 3) 차트 RELS
     if low.startswith("ppt/charts/_rels/") and low.endswith(".rels"):
         b3, _ = chart_rels_sanitize(data)
         return b3
 
-    # 임베디드 XLSX
+    # 4) 임베디드 XLSX
     if low.startswith("ppt/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)
 
-    # 그 외는 그대로
+    # 5) 기타 파트는 그대로 유지
     return data
-
-
-def redact_item(name: str, data: bytes, comp) -> bytes:
-    # xml_redaction.xml_redact_to_file 에서 호출하는 호환 래퍼
-    return redact_part_bytes(name, data, comp)
