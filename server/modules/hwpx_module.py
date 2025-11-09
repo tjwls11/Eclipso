@@ -108,7 +108,6 @@ def hwpx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(x for x in out if x))
 
 
-
 # /text/extract 용 텍스트 추출
 def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
@@ -152,29 +151,10 @@ def extract_text(file_bytes: bytes) -> dict:
     }
 
 
-
 # 스캔: 정규식 규칙으로 추출
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = hwpx_text(zipf)
     comp = compile_rules()
-
-    # RULES에서 validator 가져오기 (없으면 None → 항상 True로 간주)
-    try:
-        # 일반적인 현재 리포 구조
-        from ..core.redaction_rules import RULES
-    except Exception:
-        try:
-            from ..redaction_rules import RULES  # type: ignore
-        except Exception:
-            from server.core.redaction_rules import RULES  # type: ignore
-
-    def _get_validator(rule_name: str):
-        v = None
-        try:
-            v = RULES.get(rule_name, {}).get("validator")
-        except Exception:
-            v = None
-        return v if callable(v) else None
 
     out: List[XmlMatch] = []
 
@@ -183,35 +163,22 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
             if isinstance(ent, (list, tuple)):
                 rule_name = ent[0]
                 rx = ent[1]
-                need_valid = bool(ent[2]) if len(ent) >= 3 else True
             else:
                 rule_name = getattr(ent, "name", getattr(ent, "rule", "unknown"))
                 rx = getattr(ent, "rx", getattr(ent, "regex", None))
-                need_valid = bool(getattr(ent, "need_valid", True))
             if rx is None:
                 continue
         except Exception:
             continue
 
-        validator = _get_validator(rule_name)
-
         for m in rx.finditer(text):
             val = m.group(0)
-            ok = True
-            if need_valid and validator:
-                try:
-                    try:
-                        ok = bool(validator(val))
-                    except TypeError:
-                        ok = bool(validator(val, None))
-                except Exception:
-                    ok = False  # 검증 예외는 실패로 간주
 
             out.append(
                 XmlMatch(
                     rule=rule_name,
                     value=val,
-                    valid=ok,
+                    valid=True,  # HWPX에서는 패턴에만 걸려도 모두 valid 로 본다
                     context=text[max(0, m.start() - 20): min(len(text), m.end() + 20)],
                     location=XmlLocation(
                         kind="hwpx",
@@ -222,8 +189,8 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
                 )
             )
 
+    # 두 번째 리턴값 "hwpx"는 기존 호출부와의 호환용 태그
     return out, "hwpx", text
-
 
 
 def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
@@ -281,7 +248,6 @@ def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
 
     # 6) 그 외 XML 파트(머리말/꼬리말/기타)도 텍스트 노드만 마스킹
     if low.endswith(".xml") and not low.startswith("preview/"):
-        # settings.xml, contents/*, charts/*, bindata/* 는 위에서 이미 처리되었으므로
         masked, _ = sub_text_nodes(data, comp)
         return masked
 
