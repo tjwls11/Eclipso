@@ -1,131 +1,168 @@
-import io
-import os
-import re
-import struct
-import tempfile
-import olefile
-from typing import List, Dict, Any, Tuple, Optional
-
-from server.core.redaction_rules import apply_redaction_rules
-from server.core.normalize import normalization_text, normalization_index
+# -*- coding: utf-8 -*-
+import io, os, re, struct, tempfile, olefile
+from typing import Optional
+from server.core.normalize import normalization_text
 from server.core.matching import find_sensitive_spans
 
-# ─────────────────────────────
-# 유틸: 리틀엔디언 헬퍼
-# ─────────────────────────────
-def le16(b: bytes, off: int) -> int:
-    return struct.unpack_from("<H", b, off)[0]
+def le16(b, off): return struct.unpack_from("<H", b, off)[0]
+def le32(b, off): return struct.unpack_from("<I", b, off)[0]
 
-def le32(b: bytes, off: int) -> int:
-    return struct.unpack_from("<I", b, off)[0]
-
-
-# ─────────────────────────────
-# 차트(BIFF) 처리
-# ─────────────────────────────
 def iter_biff_records(data: bytes):
-    off, n = 0, len(data)
+    off, n = 0, len(data); idx = 0
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
         off += 4
         payload = data[off:off + length]
-        off += length
-        yield opcode, payload
+        print(f"[CHART] record#{idx} opcode=0x{opcode:04X}, length={length}")
+        yield off - 4, opcode, length, payload
+        off += length; idx += 1
 
-def decode_chart_string(chunk: bytes) -> str:
-    """차트 BIFF 문자열 디코딩 (다중 인코딩 탐색)"""
-    encodings = ["utf-16le", "cp1252"]
-    decoded = ""
-    for enc in encodings:
+class XLUCS:
+    __slots__ = ("base","end","cch","flags","fHigh","fExt","fRich","cRun","cbExtRst","text_lo","text_hi")
+    def try_parse_at(self, payload: bytes, start: int) -> bool:
+        n = len(payload); pos = start
+        if pos + 3 > n: return False
+        cch = le16(payload, pos); pos += 2
+        flags = payload[pos]; pos += 1
+        if not (0 <= cch <= 65535): return False
+        fHigh = flags & 0x01; fExt = 1 if (flags & 0x04) else 0; fRich = 1 if (flags & 0x08) else 0
+        cRun = cbExtRst = 0
+        if fRich:
+            if pos + 2 > n: return False
+            cRun = le16(payload, pos); pos += 2
+        if fExt:
+            if pos + 4 > n: return False
+            cbExtRst = le32(payload, pos); pos += 4
+        need = cch * (2 if fHigh else 1)
+        text_lo, text_hi = pos, pos + need
+        if text_hi > n: return False
+        pos = text_hi + (cRun * 4) + cbExtRst
+        if pos > n: return False
+        self.base, self.end, self.cch, self.flags, self.fHigh = start, pos, cch, flags, fHigh
+        self.text_lo, self.text_hi = text_lo, text_hi
+        print(f"[XLUCS] parse OK at {start} cch={cch}, flags=0x{flags:02X}, fHigh={fHigh}")
+        return True
+    def decode_text(self, payload: bytes, cp="cp1252") -> str:
+        raw = payload[self.text_lo:self.text_hi]
         try:
-            txt = chunk.decode(enc, errors="ignore").strip("\x00").strip()
-            if len(re.findall(r"[가-힣A-Za-z0-9]", txt)) >= 2:
-                decoded = txt
-                break
+            return raw.decode("utf-16le" if self.fHigh else cp, errors="ignore")
         except Exception:
-            continue
-    # fallback: UTF-16 패턴 감지 (\x00 비율 높으면)
-    if not decoded and chunk.count(0) / max(len(chunk), 1) > 0.3:
+            return ""
+
+def redact_payload_ascii(wb: bytearray, payload_off: int, length: int, codepage="cp1252") -> int:
+    seg = wb[payload_off:payload_off+length]
+    ascii_texts = re.findall(rb"[ -~]{5,}", seg)
+    utf16_texts = re.findall(rb"(?:[\x20-\x7E]\x00){5,}", seg)
+    red = 0
+    for seq in ascii_texts + utf16_texts:
         try:
-            decoded = chunk.decode("utf-16le", errors="ignore").strip("\x00").strip()
+            text = seq.decode("utf-16le" if b"\x00" in seq else codepage, errors="ignore")
+            if not text.strip(): continue
+            if find_sensitive_spans(normalization_text(text)):
+                s = seg.find(seq)
+                if s != -1:
+                    e = s + len(seq)
+                    wb[payload_off+s:payload_off+e] = b"*"*len(seq)
+                    red += 1
+                    print(f"[FALLBACK] ASCII 레닥션: {repr(text)} → {'*'*len(text)}")
         except Exception:
             pass
-    if decoded:
-        print(f"[CHART] 문자열 추출 성공: {repr(decoded)} , encording : {enc}")
-    return decoded
+    return red
 
+# 텍스트 포함 가능성이 높은 BIFF 레코드들
+CHART_STRING_LIKE = {0x0004, 0x041E, 0x100D, 0x1025, 0x104B, 0x105C, 0x1024, 0x1026}
 
-def redact_biff_stream(biff_bytes: bytes) -> bytes:
-    """BIFF 문자열을 동일 길이 마스킹 포함하여 레닥션"""
-    try:
-        wb = bytearray(biff_bytes)
-        off = 0
-        while off + 4 < len(wb):
-            opcode, length = struct.unpack_from("<HH", wb, off)
-            off += 4
-            payload_off = off
-            payload_end = off + length
+def _scan_and_redact_xlucs_in_payload(wb: bytearray, payload_off: int, length: int, codepage="cp1252") -> int:
+    end = payload_off + length; pos = payload_off; red=0; seen=False
+    while pos < end:
+        x = XLUCS()
+        if not x.try_parse_at(wb[payload_off:end], start=(pos - payload_off)):
+            pos += 1; continue
+        seen = True
+        text = x.decode_text(wb[payload_off:end], codepage)
+        if text.strip():
+            if find_sensitive_spans(normalization_text(text)):
+                masked = ("*"*len(text)).encode("utf-16le" if x.fHigh else codepage)
+                raw_len = x.text_hi - x.text_lo
+                wb[payload_off + x.text_lo : payload_off + x.text_hi] = masked[:raw_len].ljust(raw_len, b'*')
+                red += 1
+                print(f"[CHART] 레닥션 적용: {repr(text)} → {'*'*len(text)}")
+            else:
+                print(f"[CHART] 매칭 없음: {repr(text)}")
+        else:
+            print(f"[XLUCS] 빈 문자열 at pos={pos}")
+        pos = payload_off + x.end
+    if not seen:
+        red += redact_payload_ascii(wb, payload_off, length, codepage)
+    return red
 
-            if opcode in (0x00FC, 0x00FD, 0x0204, 0x100D, 0x1025, 0x104B):
-                chunk = wb[payload_off:payload_end]
-                text = decode_chart_string(chunk)
-                if not text:
-                    off = payload_end
-                    continue
+def redact_biff_stream(biff_bytes: bytes, codepage="cp1252") -> bytes:
+    wb = bytearray(biff_bytes); total=0
+    for rec_off, opcode, length, payload in iter_biff_records(wb):
+        if opcode in CHART_STRING_LIKE and length>0:
+            try:
+                cnt = _scan_and_redact_xlucs_in_payload(wb, rec_off+4, length, codepage)
+                total += cnt
+                print(f"[CHART] opcode=0x{opcode:04X}에서 {cnt}개 문자열 레닥션")
+            except Exception as e:
+                print(f"[WARN] opcode=0x{opcode:04X} 처리 중 예외: {e}")
+    print(f"[CHART] 총 {total}개 문자열 레닥션 완료")
+    return bytes(wb)
 
-                # --- 정규화 & 탐지 ---
-                normalized = normalization_text(text)
-                matches = find_sensitive_spans(normalized)
+def invalidate_presentation_streams(ole: olefile.OleFileIO, storage_path: list):
+    """
+    같은 스토리지(ObjectPool/<ID>) 아래의 \x02OlePres* 스트림들을 빈 바이트로 덮어써서
+    Word가 프레젠테이션 캐시를 못 쓰도록 만든다.
+    """
+    # 현재 스토리지의 모든 스트림 풀 리스트
+    streams = ["/".join(p) for p in ole.listdir(streams=True, storages=False)]
+    prefix = "/".join(storage_path[:-1])  # ObjectPool/<ID>
+    if prefix:
+        prefix += "/"
+    nuked = 0
+    for s in streams:
+        # 같은 스토리지 하위 && 이름이 \x02OlePres 로 시작
+        tail = s[len(prefix):] if s.startswith(prefix) else None
+        if not tail: continue
+        if tail.startswith("\x02OlePres"):  # MS-OLEDS: presentation streams are named with "\2OlePres" prefix
+            ole.write_stream(s, b"")  # 캐시 무효화
+            print(f"[WRITE] 프레젠테이션 캐시 무효화: {s}")
+            nuked += 1
+    if nuked == 0:
+        print("[WARN] \x02OlePres* 프레젠테이션 스트림을 찾지 못함")
 
-                if not matches:
-                    off = payload_end
-                    continue
-
-                print(f"[CHART] 정규화 텍스트: {repr(normalized)}")
-                print(f"[CHART] 탐지된 매칭 수: {len(matches)}")
-
-                # --- 동일 길이 마스킹 ---
-                red = "*" * len(text)
-                print(f"[CHART] opcode=0x{opcode:04X} 레닥션 적용됨: {repr(text)} → {repr(red)}")
-
-                enc = red.encode("utf-16le", errors="ignore")
-                wb[payload_off:payload_end] = enc[:length].ljust(length, b"\x00")
-
-            off = payload_end
-        return bytes(wb)
-    except Exception as e:
-        print(f"[ERR] BIFF 레닥션 중 예외: {e}")
-        return biff_bytes
-
-
-def redact_workbooks(file_bytes: bytes) -> bytes:
-    """ObjectPool 내 Workbook 스트림 찾아 레닥션 (OLE로 DOC만 열고 내부는 raw BIFF)"""
+def redact_workbooks(file_bytes: bytes, codepage="cp1252") -> bytes:
+    """
+    1) ObjectPool/*/(Workbook | \x01Workbook) 내 BIFF 텍스트 레닥션
+    2) 같은 스토리지의 \x02OlePres* 프레젠테이션 스트림 무효화
+    """
     try:
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
             modified = file_bytes
             for entry in ole.listdir():
-                if len(entry) >= 2 and entry[0] == "ObjectPool" and entry[-1] in ("Workbook", "\x01Workbook"):
+                if len(entry)>=2 and entry[0]=="ObjectPool" and entry[-1] in ("Workbook","\x01Workbook"):
                     print(f"[INFO] 발견된 Workbook 스트림: {entry}")
                     wb_data = ole.openstream(entry).read()
-                    modified_biff = redact_biff_stream(wb_data)
-                    modified = replace_workbook_stream(modified, entry, modified_biff)
+                    new_biff = redact_biff_stream(wb_data, codepage)
+                    # 임시 파일로 열어 쓰기
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
+                        tmp.write(modified)
+                        path = tmp.name
+                    try:
+                        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole_debug:
+                            print("[DEBUG] 전체 OLE 스트림 목록:")
+                            for e in ole_debug.listdir():
+                                print("  ", e)
+                        with olefile.OleFileIO(path, write_mode=True) as olew:
+                            # 1) 워크북 덮어쓰기
+                            olew.write_stream("/".join(entry), new_biff)
+                            print(f"[WRITE] {'/'.join(entry)} 스트림 덮어쓰기")
+                            # 2) 프레젠테이션 캐시 무효화
+                            invalidate_presentation_streams(olew, entry)
+                        with open(path, "rb") as f: modified = f.read()
+                    finally:
+                        os.remove(path)
             return modified
     except Exception as e:
         print(f"[ERR] ObjectPool 처리 중 예외: {e}")
         return file_bytes
-
-
-def replace_workbook_stream(original_doc: bytes, entry_path, new_data: bytes) -> bytes:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
-        tmp.write(original_doc)
-        tmp_path = tmp.name
-    try:
-        with olefile.OleFileIO(tmp_path, write_mode=True) as ole:
-            if not ole.exists(entry_path):
-                return original_doc
-            ole.write_stream(entry_path, new_data)
-        with open(tmp_path, "rb") as f:
-            result = f.read()
-        return result
-    finally:
-        os.remove(tmp_path)
