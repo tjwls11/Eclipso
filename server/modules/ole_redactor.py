@@ -1,13 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-OLE(CFBF) 스트림 동일 길이 마스킹 + FAT/MiniFAT 브루트포스 쓰기 + 상세 로그.
-중요: 차트 역노출 방지 위해 OlePres***, Contents, OOXMLChartContents 는 무조건 제로필.
-
-환경변수:
-- OLE_MASK_PREVIEW=1  → (레거시) OlePres*** 블랭크. (mask_preview 인자와 병행)
-- OLE_DEBUG_DUMP=1    → ./_ole_debug/<stamp>/ 에 before/after 덤프 저장
-"""
-
 from __future__ import annotations
 
 import io

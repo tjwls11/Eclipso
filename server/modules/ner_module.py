@@ -27,6 +27,7 @@ _LABEL_MAP = {
     "LOCATION": "LC", "ADDRESS": "LC", "ADDR": "LC", "GPE": "LC", "PLACE": "LC", "FAC": "LC", "FACILITY": "LC",
     "DATE": "DT", "TIME": "DT", "DATETIME": "DT",
     "NUMBER": "QT", "QUANTITY": "QT", "CARDINAL": "QT", "NUM": "QT",
+    "B-PER": "PS", "I-PER": "PS", "B-ORG": "OG", "I-ORG": "OG", "B-LOC": "LC", "I-LOC": "LC",
 }
 def _std_label(label: str) -> str:
     if not label:
@@ -68,30 +69,41 @@ def _normalize_raw_entities(raw: Any, chunk_start: int, chunk_text: str) -> List
             except Exception:
                 score = None
 
+            txt = (e.get("text") or e.get("word") or "").strip()
+
             if start is not None and end is not None:
                 try:
-                    s = int(start) + chunk_start
-                    t = int(end) + chunk_start
+                    s_local = int(start)
+                    t_local = int(end)
                 except Exception:
-                    continue
-                if t <= s:
-                    continue
-                out.append({"start": s, "end": t, "label": std, "source": "ner", "score": score})
-                used_ranges.append((s, t))
-                continue
+                    s_local = None; t_local = None
 
-            txt = (e.get("text") or e.get("word") or "").strip()
-            if not txt:
-                continue
-            for m in re.finditer(re.escape(txt), chunk_text):
-                s_local, t_local = m.start(), m.end()
-                s = chunk_start + s_local
-                t = chunk_start + t_local
-                if any(_overlap((s, t), ur) for ur in used_ranges):
+                if s_local is not None and t_local is not None:
+                    # inclusive → exclusive 보정
+                    if txt:
+                        slice_text = chunk_text[s_local:t_local]
+                        if len(txt) == len(slice_text) + 1 and txt.startswith(slice_text):
+                            t_local += 1
+                        elif len(slice_text) == len(txt) + 1 and slice_text.startswith(txt):
+                            t_local -= 1
+                    s = chunk_start + max(0, s_local)
+                    t = chunk_start + max(s_local, t_local)
+                    if t > s and not any(_overlap((s, t), ur) for ur in used_ranges):
+                        out.append({"start": s, "end": t, "label": std, "source": "ner", "score": score})
+                        used_ranges.append((s, t))
                     continue
-                out.append({"start": s, "end": t, "label": std, "source": "ner", "score": score})
-                used_ranges.append((s, t))
-                break
+
+            # 위치가 없고 텍스트만 있을 때: chunk 내 최초 매치
+            if txt:
+                for m in re.finditer(re.escape(txt), chunk_text):
+                    s_local, t_local = m.start(), m.end()
+                    s = chunk_start + s_local
+                    t = chunk_start + t_local
+                    if any(_overlap((s, t), ur) for ur in used_ranges):
+                        continue
+                    out.append({"start": s, "end": t, "label": std, "source": "ner", "score": score})
+                    used_ranges.append((s, t))
+                    break
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,44 +127,72 @@ def _synthesize_dt_spans(text: str, policy: Dict[str, Any], existing: List[Dict[
             s, t = m.start(), m.end()
             lo, hi = max(0, s - window), min(len(text), t + window)
             ctx = text[lo:hi]
-            if dt_policy == "sensitive_only" and not any(tr in ctx for tr in triggers):
-                continue
-            synthesized.append({"start": s, "end": t, "label": "DT", "source": "ner", "score": None})
+            if dt_policy == "always" or any(k in ctx for k in triggers):
+                synthesized.append({"start": s, "end": t, "label": "DT", "source": "regex", "score": None})
     return synthesized
 
 # ──────────────────────────────────────────────────────────────────────────────
-def _merge_adjacent_same_label(spans: List[Dict[str, Any]], text: str, label: str, max_gap: int = 2) -> List[Dict[str, Any]]:
+# 개행/새주소 시작 감지자
+_NEWLINE_RX = re.compile(r"[\r\n]")
+_CITY_START_RX = re.compile(r"^\s*(?:[가-힣]{2,}시|[가-힣]{2,}군|[가-힣]{2,}구)")
+
+def _has_newline(s: str) -> bool:
+    return bool(_NEWLINE_RX.search(s or ""))
+
+def _looks_new_address(s: str) -> bool:
+    return bool(_CITY_START_RX.search(s or ""))
+
+def _merge_adjacent_same_label(spans: List[Dict[str, Any]], text: str, label: str = "LC", max_gap: int = 1) -> List[Dict[str, Any]]:
     if not spans:
         return spans
     spans = sorted(spans, key=lambda x: (x["start"], x["end"]))
     out: List[Dict[str, Any]] = []
+    buf = None
     for s in spans:
-        if not out:
-            out.append(s); continue
-        last = out[-1]
-        if last["label"] == s["label"] == label:
-            gap_text = text[last["end"]:s["start"]]
-            if len(gap_text) <= max_gap and re.fullmatch(r"[\s,\-–—]*", gap_text or ""):
-                last["end"] = s["end"]
-                continue
-        out.append(s)
+        if s.get("label") != label:
+            if buf:
+                out.append(buf); buf = None
+            out.append(s)
+            continue
+        if buf is None:
+            buf = dict(s); continue
+        gap_text = text[buf["end"]:s["start"]]
+        # 개행·새주소·과도한 구분자는 병합 금지
+        if _has_newline(gap_text) or _looks_new_address(text[s["start"]:s["end"]]):
+            out.append(buf); buf = dict(s); continue
+        if len(gap_text) <= max_gap and re.fullmatch(r"[ \t,\-–—/]*", gap_text or ""):
+            buf["end"] = max(buf["end"], s["end"])
+        else:
+            out.append(buf); buf = dict(s)
+    if buf:
+        out.append(buf)
     return out
 
-_ADDR_NUM_RX = re.compile(r"^\d+(?:-\d+)?(?:번지|호)?$")
-_ROAD_END_RX = re.compile(r"(로|길)\s*$")
-_SUFFIX_RX = re.compile(r'^[\s,\-–—]{0,3}((?:지하)?\d+(?:층|호|호실)|\d+(?:-\d+)?(?:호|호실)?|\d+동)')
+# 괄호 보조지명까지 같은 줄에서만 확장
+_PAREN_TAIL_RX = re.compile(r"^\s*\([^)]+\)")
+_SUFFIX_RX = re.compile(
+    r"^(?:\s*[-–—]?\s*(\d{1,4})(?:[-~]\d{1,4})?\s*(동|로|길|가)?\s*(\d{1,4})?(?:-\d{1,3})?\s*(번지|호|층|동|가|리)?)+"
+)
 
-def _extend_lc_suffix_by_text(text: str, end: int, max_steps: int = 3) -> int:
-    pos = end
+def _extend_lc_suffix_by_text(text: str, end: int, max_steps: int = 2) -> int:
     steps = 0
-    n = len(text)
-    while steps < max_steps and pos < n:
-        m = _SUFFIX_RX.match(text[pos:])
-        if not m:
-            break
-        pos += m.end()
-        steps += 1
-    return pos
+    i = end
+    line_end = text.find("\n", end)
+    hard_stop = len(text) if line_end == -1 else line_end  # 줄 끝까지만
+    while steps < max_steps and i < hard_stop:
+        m = _SUFFIX_RX.match(text[i:hard_stop])
+        if m:
+            i += m.end()
+            steps += 1
+            continue
+        # 괄호 보조지명: 같은 줄에서만
+        m2 = _PAREN_TAIL_RX.match(text[i:hard_stop])
+        if m2:
+            i += m2.end()
+            steps += 1
+            continue
+        break
+    return i
 
 def _attach_address_numbers(spans: List[Dict[str, Any]], text: str, max_gap: int = 2) -> List[Dict[str, Any]]:
     if not spans:
@@ -168,15 +208,20 @@ def _attach_address_numbers(spans: List[Dict[str, Any]], text: str, max_gap: int
         while j < len(spans):
             nxt = spans[j]
             gap_text = text[end:nxt["start"]]
-            if len(gap_text) > max_gap or not re.fullmatch(r"[\s,\-–—]*", gap_text or ""):
+            # 줄바꿈 또는 새주소 시작이면 중단
+            if _has_newline(gap_text) or _looks_new_address(text[nxt["start"]:nxt["end"]]):
                 break
-            is_qt_addrnum = (nxt.get("label") == "QT" and _ADDR_NUM_RX.match(text[nxt["start"]:nxt["end"]]))
-            prev_seg = text[cur["start"]:end]
-            prev_ends_with_road = _ROAD_END_RX.search(prev_seg) is not None
+            if len(gap_text) > max_gap or not re.fullmatch(r"[ \t,\-–—]*", gap_text or ""):
+                break
+            # 숫자/도로명 연속 및 짧은 이어붙임만 허용
+            if nxt.get("label") == "QT":
+                end = nxt["end"]; j += 1; continue
             if nxt.get("label") == "LC":
-                end = nxt["end"]; j += 1; continue
-            if is_qt_addrnum or prev_ends_with_road:
-                end = nxt["end"]; j += 1; continue
+                token = text[nxt["start"]:nxt["end"]]
+                if re.fullmatch(r"\d+[가-힣A-Za-z\-]*", token) or re.search(r"(로|길)$", text[cur["start"]:end]):
+                    end = nxt["end"]; j += 1; continue
+                else:
+                    break
             break
         end = _extend_lc_suffix_by_text(text, end, max_steps=3)
 
@@ -190,7 +235,9 @@ def _attach_address_numbers(spans: List[Dict[str, Any]], text: str, max_gap: int
         if not merged:
             merged.append(s); continue
         last = merged[-1]
-        if last["label"] == s["label"] == "LC" and last["end"] >= s["start"]:
+        # 같은 줄에서만 병합
+        gap = text[last["end"]:s["start"]]
+        if last["label"] == s["label"] == "LC" and not _has_newline(gap) and len(gap) <= 1:
             last["end"] = max(last["end"], s["end"])
         else:
             merged.append(s)
@@ -202,6 +249,77 @@ def _synthesize_road_names(text: str) -> List[Dict[str, Any]]:
     for m in _ROAD_RX.finditer(text):
         spans.append({"start": m.start(), "end": m.end(), "label": "LC", "source": "ner", "score": None})
     return spans
+
+# 왼쪽(상위 행정구역)까지 주소 확장 — 줄 경계는 넘지 않음
+_ADDR_HINTS = {"시","군","구","동","읍","면","리","로","길"}
+_HINT_RX = re.compile(rf'(?:{"|".join(map(re.escape, sorted(_ADDR_HINTS)) )})$')
+
+def _attach_address_left_context(spans: List[Dict[str, Any]], text: str, max_back_steps: int = 3) -> List[Dict[str, Any]]:
+    if not spans:
+        return spans
+    spans = sorted(spans, key=lambda x: (x["start"], x["end"]))
+    out: List[Dict[str, Any]] = []
+    for s in spans:
+        if s.get("label") != "LC":
+            out.append(s); continue
+        start, end = s["start"], s["end"]
+        i = start
+        steps = 0
+        # 같은 줄 범위 안에서만 왼쪽 확장
+        line_start = text.rfind("\n", 0, start) + 1
+        while i > line_start and steps < max_back_steps:
+            # 공백 트림
+            j = i
+            while j > line_start and text[j-1].isspace():
+                j -= 1
+            # 왼쪽 토큰 경계
+            k = j - 1
+            while k >= line_start and not text[k].isspace():
+                k -= 1
+            token = text[k+1:j]
+            if not token:
+                break
+            if _HINT_RX.search(token):
+                start = k+1
+                i = k+1
+                steps += 1
+                continue
+            break
+        if start < s["start"]:
+            s = dict(s); s["start"] = start
+        out.append(s)
+    out.sort(key=lambda x: (x["start"], x["end"]))
+    # 같은 줄에서만 인접 LC 병합
+    merged: List[Dict[str, Any]] = []
+    for it in out:
+        if not merged:
+            merged.append(it); continue
+        last = merged[-1]
+        gap = text[last["end"]:it["start"]]
+        if last["label"] == it["label"] == "LC" and not _has_newline(gap) and len(gap) <= 1:
+            last["end"] = max(last["end"], it["end"])
+        else:
+            merged.append(it)
+    return merged
+
+# 한 글자 LC 노이즈 제거(도로명/접미 연결 예외 허용)
+def _filter_short_lc(spans: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    if not spans:
+        return spans
+    kept: List[Dict[str, Any]] = []
+    _ROAD_RX = re.compile(r"\b[가-힣A-Za-z0-9]+(?:로|길)\b")
+    _SUFFIX_RX = re.compile(r"^(?:\s*[-–—]?\s*\d{1,4}(?:[-~]\d{1,4})?\s*(번지|호|층|동|가|리)?)+")
+    for s in spans:
+        if s.get("label") != "LC":
+            kept.append(s); continue
+        if (s["end"] - s["start"]) >= 2:
+            kept.append(s); continue
+        seg = text[s["start"]:s["end"]]
+        right = text[s["end"]:]
+        if _ROAD_RX.fullmatch(seg) or _SUFFIX_RX.match(right):
+            kept.append(s); continue
+        # drop 1-char LC
+    return kept
 
 # ──────────────────────────────────────────────────────────────────────────────
 def run_ner(text: str, policy: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -223,7 +341,7 @@ def run_ner(text: str, policy: Dict[str, Any]) -> List[Dict[str, Any]]:
         spans.extend(_synthesize_dt_spans(text, policy, spans))
 
     spans.sort(key=lambda x: (x["start"], x["end"]))
-    spans = _merge_adjacent_same_label(spans, text, label="LC", max_gap=2)
+    spans = _merge_adjacent_same_label(spans, text, label="LC", max_gap=1)
 
     try:
         road_spans = _synthesize_road_names(text)
@@ -232,6 +350,8 @@ def run_ner(text: str, policy: Dict[str, Any]) -> List[Dict[str, Any]]:
         pass
     spans.sort(key=lambda x: (x["start"], x["end"]))
 
-    spans = _attach_address_numbers(spans, text, max_gap=2)
+    spans = _attach_address_numbers(spans, text, max_gap=1)
+    spans = _attach_address_left_context(spans, text, max_back_steps=3)
+    spans = _filter_short_lc(spans, text)
     spans.sort(key=lambda x: (x["start"], x["end"]))
     return spans

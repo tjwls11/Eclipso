@@ -137,5 +137,4 @@ def redact(file_bytes: bytes) -> bytes:
     return bytes(wb)
 
 def extract_text(file_bytes: bytes) -> dict:
-    """text_api.py 에서 호출되는 공통 인터페이스"""
     return extract_text_from_xls(file_bytes)

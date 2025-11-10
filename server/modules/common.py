@@ -1,12 +1,9 @@
-# server/modules/common.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io
 import re
 import zipfile
 from typing import List, Tuple, Optional, Callable
 
-# 올바른 경로: server/core/redaction_rules.py
 try:
     from ..core.redaction_rules import PRESET_PATTERNS, RULES
 except Exception:  # pragma: no cover
@@ -51,20 +48,6 @@ _RULE_PRIORITY = {
 
 
 def compile_rules() -> List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]]:
-    """
-    PRESET_PATTERNS + RULES 기반으로 레닥션용 규칙을 컴파일한다.
-
-    반환 형식:
-        [
-          (name, compiled_regex, need_valid, priority, validator),
-          ...
-        ]
-
-    - need_valid:
-        * PRESET_PATTERNS에 ensure_valid가 명시되어 있으면 그 값을 사용
-        * 그렇지 않고 RULES에 validator가 있으면 기본적으로 True
-        * validator도 없고 ensure_valid도 없으면 False
-    """
     comp: List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]] = []
 
     for r in PRESET_PATTERNS:
@@ -118,7 +101,6 @@ def _is_valid(value: str, validator: Optional[Callable]) -> bool:
 _ENTITY_RE = re.compile(r"&(#\d+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);")
 
 def _mask_preserving_entities(v: str, mask_char_fn) -> str:
-    """XML 엔티티(&...;) 토큰은 원형 유지, 나머지 문자만 mask_char_fn으로 치환."""
     out: List[str] = []
     i = 0
     n = len(v)
@@ -145,7 +127,6 @@ def _mask_email(v: str) -> str:
 
 
 def _mask_keep_rules(v: str) -> str:
-    """공통: '-' 보존, 영숫자 및 '.' '_' 가림, 나머지 기호/공백 보존."""
     def _mask(ch: str) -> str:
         if ch == "-":
             return ch
@@ -161,7 +142,6 @@ def _mask_value(rule: str, v: str) -> str:
 # ---------- 2-패스 토큰 스캔 유틸 ----------
 
 def _collect_spans(src: str, comp) -> tuple[List[tuple], List[tuple]]:
-    """허용 구간(OK)과 금지 구간(FAIL)을 수집."""
     allowed: List[tuple] = []   # (s, e, rule, prio)
     forbidden: List[tuple] = [] # (s, e)
     for name, rx, need_valid, prio, validator in comp:
@@ -169,7 +149,6 @@ def _collect_spans(src: str, comp) -> tuple[List[tuple], List[tuple]]:
             s, e = m.span()
             val = m.group(0)
             if need_valid and not _is_valid(val, validator):
-                # FAIL → 토큰 전체 보호
                 forbidden.append((s, e))
             else:
                 allowed.append((s, e, name, prio))
@@ -210,12 +189,6 @@ def _apply_spans(src: str, allowed) -> tuple[str, int]:
 _TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.DOTALL)
 
 def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
-    """
-    XML(UTF-8 가정)에서 **태그 밖 텍스트 노드만** 토큰 단위로 2-패스 마스킹.
-
-    - 태그/속성(예: <c r="A1">, <row r="3">, 관계 ID 등)은 절대 건드리지 않음
-    - 엑셀 구조 깨짐 / 복구 팝업 방지용
-    """
     s = xml_bytes.decode("utf-8", "ignore")
 
     all_allowed: List[tuple] = []
@@ -248,8 +221,7 @@ def chart_rels_sanitize(rels_bytes: bytes) -> Tuple[bytes, int]:
     return rels_bytes, 0
 
 
-def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
-    """차트 XML도 동일 정책으로 텍스트만 마스킹."""
+def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:        
     return sub_text_nodes(xml_bytes, comp)
 
 # ---------- DOCX [Content_Types].xml 보정(스텁) ----------
@@ -297,15 +269,12 @@ def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
 
 # ---------- OOXML 내장 XLSX 레닥션 ----------
 def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
-    """
-    OOXML(예: docx/pptx) 안에 포함된 .xlsx를 레닥션.
-    구조(relationship, 주소 등)를 건드리지 않고 텍스트 노드만 마스킹한다.
-    """
+
     comp = compile_rules()
     bio_in = io.BytesIO(xlsx_bytes)
     bio_out = io.BytesIO()
     with zipfile.ZipFile(bio_in, "r") as zin, \
-         zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
+    zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
             name = it.filename
             data = zin.read(name)
