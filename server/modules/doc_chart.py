@@ -69,7 +69,7 @@ def redact_payload_ascii(wb: bytearray, payload_off: int, length: int, codepage=
             pass
     return red
 
-# 텍스트 포함 가능성이 높은 BIFF 레코드들
+
 CHART_STRING_LIKE = {0x0004, 0x041E, 0x100D, 0x1025, 0x104B, 0x105C, 0x1024, 0x1026}
 
 def _scan_and_redact_xlucs_in_payload(wb: bytearray, payload_off: int, length: int, codepage="cp1252") -> int:
@@ -109,32 +109,10 @@ def redact_biff_stream(biff_bytes: bytes, codepage="cp1252") -> bytes:
     print(f"[CHART] 총 {total}개 문자열 레닥션 완료")
     return bytes(wb)
 
-def invalidate_presentation_streams(ole: olefile.OleFileIO, storage_path: list):
-    """
-    같은 스토리지(ObjectPool/<ID>) 아래의 \x02OlePres* 스트림들을 빈 바이트로 덮어써서
-    Word가 프레젠테이션 캐시를 못 쓰도록 만든다.
-    """
-    # 현재 스토리지의 모든 스트림 풀 리스트
-    streams = ["/".join(p) for p in ole.listdir(streams=True, storages=False)]
-    prefix = "/".join(storage_path[:-1])  # ObjectPool/<ID>
-    if prefix:
-        prefix += "/"
-    nuked = 0
-    for s in streams:
-        # 같은 스토리지 하위 && 이름이 \x02OlePres 로 시작
-        tail = s[len(prefix):] if s.startswith(prefix) else None
-        if not tail: continue
-        if tail.startswith("\x02OlePres"):  # MS-OLEDS: presentation streams are named with "\2OlePres" prefix
-            ole.write_stream(s, b"")  # 캐시 무효화
-            print(f"[WRITE] 프레젠테이션 캐시 무효화: {s}")
-            nuked += 1
-    if nuked == 0:
-        print("[WARN] \x02OlePres* 프레젠테이션 스트림을 찾지 못함")
 
 def redact_workbooks(file_bytes: bytes, codepage="cp1252") -> bytes:
     """
     1) ObjectPool/*/(Workbook | \x01Workbook) 내 BIFF 텍스트 레닥션
-    2) 같은 스토리지의 \x02OlePres* 프레젠테이션 스트림 무효화
     """
     try:
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
@@ -157,8 +135,6 @@ def redact_workbooks(file_bytes: bytes, codepage="cp1252") -> bytes:
                             # 1) 워크북 덮어쓰기
                             olew.write_stream("/".join(entry), new_biff)
                             print(f"[WRITE] {'/'.join(entry)} 스트림 덮어쓰기")
-                            # 2) 프레젠테이션 캐시 무효화
-                            invalidate_presentation_streams(olew, entry)
                         with open(path, "rb") as f: modified = f.read()
                     finally:
                         os.remove(path)
