@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import io, os, re, struct, tempfile, olefile
 from typing import Optional, List, Tuple
 from server.core.normalize import normalization_text
@@ -49,54 +48,79 @@ def coalesce_with_continue(biff_bytes: bytes, off: int) -> Tuple[bytes, List[Tup
 # Excel 문자열 구조체 파서
 # ─────────────────────────────
 class XLUCS:
-    __slots__ = ("base","end","cch","flags","fHigh","fExt","fRich","cRun","cbExtRst","text_lo","text_hi")
+    __slots__ = ("base","end","cch","flags","fHigh","fExt","fRich", "cRun","cbExtRst","text_lo","text_hi","_text_data")
 
-    def try_parse_at(self, payload: bytes, start: int) -> bool:
-        n = len(payload); pos = start
+    def try_parse_at(self, payloads: list[bytes], start_index: int, start_offset: int) -> bool:
+        data = payloads[start_index]
+        n = len(data); pos = start_offset
         if pos + 3 > n: return False
-        try:
-            cch = le16(payload, pos); pos += 2
-            flags = payload[pos]; pos += 1
-            fHigh = flags & 0x01
-            fExt  = 1 if (flags & 0x04) else 0
-            fRich = 1 if (flags & 0x08) else 0
-            cRun = cbExtRst = 0
-            if fRich:
-                if pos + 2 > n: return False
-                cRun = le16(payload, pos); pos += 2
-            if fExt:
-                if pos + 4 > n: return False
-                cbExtRst = le32(payload, pos); pos += 4
-            need = cch * (2 if fHigh else 1)
-            text_lo, text_hi = pos, pos + need
-            if text_hi > n: return False
-            pos = text_hi + (cRun * 4) + cbExtRst
-            if pos > n: return False
-            self.base, self.end, self.cch, self.flags, self.fHigh = start, pos, cch, flags, fHigh
-            self.text_lo, self.text_hi = text_lo, text_hi
-            print(f"[XLUCS] OK start={start}, cch={cch}, flags=0x{flags:02X}, fHigh={fHigh}")
-            return True
-        except Exception as e:
-            print(f"[XLUCS] parse fail at {start}: {e}")
-            return False
 
-    def decode_text(self, payload: bytes, single_byte_codec="cp1252") -> str:
-        raw = payload[self.text_lo:self.text_hi]
-        # fHigh 플래그 불일치 보정 (휴리스틱)
+        cch   = le16(data, pos); pos += 2
+        flags = data[pos];       pos += 1
+        fHigh = flags & 0x01
+        fExt  = (flags >> 2) & 1
+        fRich = (flags >> 3) & 1
+
+        cRun = cbExtRst = 0
+        if fRich:
+            if pos + 2 > n: return False
+            cRun = le16(data, pos); pos += 2
+        if fExt:
+            if pos + 4 > n: return False
+            cbExtRst = le32(data, pos); pos += 4
+
+        total_chars    = cch
+        text_bytes     = bytearray()
+        chars_remain   = cch
+        cur_fHigh      = fHigh
+        cur_payload    = data
+        i              = start_index
+        pos_in_record  = pos
+
+        while chars_remain > 0:
+            need_bytes = chars_remain * (2 if cur_fHigh else 1)
+            avail      = len(cur_payload) - pos_in_record
+
+            if avail >= need_bytes:
+                text_bytes.extend(cur_payload[pos_in_record:pos_in_record+need_bytes])
+                pos_in_record += need_bytes
+                chars_remain = 0
+            else:
+                # 남은 만큼 채우고 CONTINUE로 이동
+                take = avail - (avail % (2 if cur_fHigh else 1))
+                if take > 0:
+                    text_bytes.extend(cur_payload[pos_in_record:pos_in_record+take])
+                    chars_remain -= (take // (2 if cur_fHigh else 1))
+                i += 1
+                if i >= len(payloads): break
+                cur_payload   = payloads[i]
+                # CONTINUE 첫 1바이트: 새 fHighByte
+                cur_fHigh     = payloads[i][0] & 0x01
+                pos_in_record = 1
+
+        self.base      = start_offset
+        self.cch       = total_chars
+        self.flags     = flags
+        self.fHigh     = fHigh
+        self.text_lo   = 0
+        self.text_hi   = len(text_bytes)
+        self._text_data = bytes(text_bytes)
+        return True
+
+    def decode_text(self, single_byte_codec: str = "cp949") -> str:
+        raw = self._text_data
+        # 휴리스틱: fHigh=0인데 UTF-16 패턴이면 보정
         if not self.fHigh and len(raw) >= 4 and raw[1] == 0x00 and raw[3] == 0x00:
             enc = "utf-16le"
         else:
             enc = "utf-16le" if self.fHigh else single_byte_codec
-        try:
-            return raw.decode(enc, errors="ignore")
-        except Exception as e:
-            print(f"[XLUCS] decode fail: {e}")
-            return ""
+        return raw.decode(enc, errors="ignore")
+
 
 # ─────────────────────────────
 # ASCII / UTF-16 fallback 마스킹
 # ─────────────────────────────
-def fallback_redact(wb: bytearray, off: int, length: int, single_byte_codec="cp1252") -> int:
+def fallback_redact(wb: bytearray, off: int, length: int, single_byte_codec="cp949") -> int:
     seg = wb[off:off+length]
     patterns = [
         (re.compile(rb"[ -~]{5,}"), single_byte_codec),
@@ -129,52 +153,84 @@ def fallback_redact(wb: bytearray, off: int, length: int, single_byte_codec="cp1
 # ─────────────────────────────
 CHART_STRING_LIKE = {0x0004, 0x041E, 0x100D, 0x1025, 0x104B, 0x105C, 0x1024, 0x1026}
 
-def scan_and_redact_payload(wb: bytearray, off: int, length: int, opcode: int, single_byte_codec="cp1252") -> int:
-    merged, segs, next_off = coalesce_with_continue(wb, off)
-    end = len(merged)
-    pos = 0
+def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single_byte_codec="cp949") -> int:
+    end = payload_off + length
+    payloads = [wb[payload_off:end]]
+
+    # 이어지는 CONTINUE(0x003C) 수집
+    next_off = end
+    while next_off + 4 <= len(wb):
+        next_op, next_len = struct.unpack_from("<HH", wb, next_off)
+        if next_op != 0x003C:
+            break
+        payloads.append(wb[next_off+4: next_off+4+next_len])
+        next_off += 4 + next_len
+
+    pos = 0  # 첫 payload 내 오프셋
     red = 0
-    seen = False
-    while pos < end:
+
+    while pos < len(payloads[0]):
         x = XLUCS()
-        # SeriesText류는 2바이트 offset 보정
-        start = pos
-        if opcode in (0x100D, 0x1025, 0x1026) and start == 0:
-            start += 2
-        if not x.try_parse_at(merged, start):
-            pos += 1; continue
-        seen = True
-        text = x.decode_text(merged, single_byte_codec)
-        if text.strip():
-            norm = normalization_text(text)
-            spans = find_sensitive_spans(norm)
-            if spans:
-                masked = ("*"*len(text)).encode("utf-16le" if x.fHigh else single_byte_codec)
-                raw_len = x.text_hi - x.text_lo
-                # 실제 스트림 오프셋 계산
-                wb_lo = segs[0][0] + x.text_lo
-                wb_hi = wb_lo + raw_len
-                wb[wb_lo:wb_hi] = masked[:raw_len].ljust(raw_len,b'*')
-                print(f"[CHART] redact {repr(text)} → {'*'*len(text)} (opcode=0x{opcode:04X})")
-                red += 1
-            else:
-                print(f"[CHART] no match: {repr(text)}")
-        pos = x.end
-    if not seen:
-        red += fallback_redact(wb, off, length, single_byte_codec)
+        if not x.try_parse_at(payloads, 0, pos):
+            pos += 1
+            continue
+
+        text = x.decode_text(single_byte_codec).strip()
+        if text and find_sensitive_spans(normalization_text(text)):
+            # 동일 길이 마스킹 생성
+            masked = ("*" * len(text)).encode("utf-16le" if x.fHigh else single_byte_codec)
+            masked = masked[:x.text_hi - x.text_lo].ljust(x.text_hi - x.text_lo, b'*')
+
+            # 각 payload에 나눠서 되돌려쓰기
+            remain = x.text_hi - x.text_lo
+            to_write = memoryview(masked)
+            i = 0
+            write_pos = x.text_lo
+            while remain > 0 and i < len(payloads):
+                seg = payloads[i]
+                if write_pos < len(seg):
+                    can = min(remain, len(seg) - write_pos)
+                    seg[write_pos:write_pos+can] = to_write[:can]
+                    to_write = to_write[can:]
+                    remain  -= can
+                    write_pos += can
+                    if write_pos >= len(seg):
+                        i += 1
+                        write_pos = 0
+                else:
+                    i += 1
+                    write_pos -= len(seg)
+
+            red += 1
+        # 다음 후보 탐색: 현재 시작점에서 한 바이트 전진(보수적)
+        pos += 1
+
+    # 첫 payload를 실제 wb에 반영
+    wb[payload_off:end] = payloads[0]
+    # 이어지는 CONTINUE들도 wb에 반영
+    cur = end
+    for k in range(1, len(payloads)):
+        op, ln = struct.unpack_from("<HH", wb, cur)
+        wb[cur+4:cur+4+ln] = payloads[k]
+        cur += 4 + ln
+    if red == 0:
+        # 마지막 수단: ASCII/UTF-16 패턴 기반 마스킹
+        red += fallback_redact(wb, payload_off, end - payload_off, single_byte_codec)
     return red
+
+
 
 # ─────────────────────────────
 # BIFF 스트림 전체 처리
 # ─────────────────────────────
-def redact_biff_stream(biff_bytes: bytes, single_byte_codec="cp1252") -> bytes:
+def redact_biff_stream(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
     wb = bytearray(biff_bytes)
     total = 0
     for rec_off, opcode, length, payload in iter_biff_records(wb):
         if opcode in CHART_STRING_LIKE and length > 0:
             print(f"[REC] opcode=0x{opcode:04X} len={length}")
             try:
-                cnt = scan_and_redact_payload(wb, rec_off+4, length, opcode, single_byte_codec)
+                cnt = scan_and_redact_payload(wb, rec_off+4, length, single_byte_codec)
                 total += cnt
                 print(f"[CHART] opcode=0x{opcode:04X} → {cnt} texts redacted")
             except Exception as e:
@@ -194,7 +250,7 @@ def redact_biff_stream(biff_bytes: bytes, single_byte_codec="cp1252") -> bytes:
 # ─────────────────────────────
 # OLE 레벨 Workbook 스트림 처리
 # ─────────────────────────────
-def redact_workbooks(file_bytes: bytes, single_byte_codec="cp1252") -> bytes:
+def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
     try:
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
             modified = file_bytes
@@ -233,3 +289,4 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec="cp1252") -> bytes:
     except Exception as e:
         print(f"[ERR] redact_workbooks exception: {e}")
         return file_bytes
+
