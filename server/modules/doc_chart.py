@@ -209,16 +209,24 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
             print(f"[DEBUG] wrote {len(masked)} bytes across {len(payloads)} payloads (remain={remain})")
             red += 1
 
-        # 다음 문자열 시작 위치로 이동 
-        header_len = 3 + (2 if (x.flags & 0x08) else 0) + (4 if (x.flags & 0x04) else 0)
+        # 다음 문자열 시작 위치로 이동
+        header_len = 3
+        if x.flags & 0x08:  # fRich
+            header_len += 2
+        if x.flags & 0x04:  # fExt
+            header_len += 4
+
         text_bytes = x.cch * (2 if x.fHigh else 1)
-        total_len = header_len + text_bytes + (x.cRun * 4 if hasattr(x, "cRun") else 0) + (x.cbExtRst if hasattr(x, "cbExtRst") else 0)
-        next_pos = pos + total_len
+        cRun_len   = getattr(x, "cRun", 0) * 4
+        extRst_len = getattr(x, "cbExtRst", 0)
+
+        total_len = header_len + text_bytes + cRun_len + extRst_len
 
         # 혹시라도 계산 상 전진이 없으면 1바이트 전진
-        if next_pos <= pos:
-            next_pos = pos + 1
-        pos = next_pos
+        if total_len <= 0:
+            pos += 1
+        else:
+            pos += total_len
 
     # 첫 payload를 실제 wb에 반영
     wb[payload_off:end] = payloads[0]
