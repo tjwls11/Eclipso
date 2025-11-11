@@ -13,13 +13,41 @@ from typing import List, Optional
 import fitz  # PyMuPDF
 from fastapi import HTTPException
 
-# 같은 패키지(server.modules) 내부 상대 임포트
-from server.core.schemas import XmlScanResponse
-from . import docx_module as docx
-from . import xlsx_module as xlsx
-from . import pptx_module as pptx
-from . import hwpx_module as hwpx
-from .common import compile_rules
+# ── XmlScanResponse 임포트: core 우선, 실패 시 대안 경로 ────────────────────────
+try:
+    from ..core.schemas import XmlScanResponse  # 일반적인 현재 리포 구조 (server/xml_redaction.py 기준)
+except Exception:
+    try:
+        from ..schemas import XmlScanResponse   # 일부 브랜치/옛 구조
+    except Exception:
+        from server.core.schemas import XmlScanResponse  # 절대경로 fallback
+
+# ── 같은 패키지(server.modules) 내부 모듈 임포트 ────────────────────────────────
+try:
+    from . import docx_module as docx
+except Exception:  # pragma: no cover
+    from server.modules import docx_module as docx  # type: ignore
+
+try:
+    from . import xlsx_module as xlsx
+except Exception:  # pragma: no cover
+    from server.modules import xlsx_module as xlsx  # type: ignore
+
+try:
+    from . import pptx_module as pptx
+except Exception:  # pragma: no cover
+    from server.modules import pptx_module as pptx  # type: ignore
+
+try:
+    from . import hwpx_module as hwpx
+except Exception:  # pragma: no cover
+    from server.modules import hwpx_module as hwpx  # type: ignore
+
+# compile_rules 유틸 임포트
+try:
+    from .common import compile_rules
+except Exception:  # pragma: no cover
+    from server.modules.common import compile_rules  # type: ignore
 
 log = logging.getLogger("xml_redaction")
 

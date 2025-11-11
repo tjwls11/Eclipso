@@ -1,417 +1,526 @@
-const API_BASE = (typeof window.API_BASE === 'function'
-  ? window.API_BASE()
-  : (window.API_BASE || ""));                
-const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || "";
-const $  = (id)  => document.getElementById(id);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
-const api = (path) => `${API_BASE}${path}`;
+const API_BASE = () => window.API_BASE || 'http://127.0.0.1:8000'
+const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
 
-const PREVIEW_ONLY_MATCHES = true;
+const $ = (sel) => document.querySelector(sel)
+const $$ = (sel) => Array.from(document.querySelectorAll(sel))
 
-function isPdfName(name) { return /\.pdf$/i.test(name || ""); }
-function isXmlDoc(name) { return /\.(docx|xlsx|pptx|hwpx)$/i.test(name || ""); }
-function extOf(name) { const m = (name || "").match(/\.([^.]+)$/); return (m ? m[1] : "").toLowerCase(); }
-function escapeHtml(s) {
-  return (s || "").replace(/[&<>"']/g, m => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-  }[m]));
-}
-function downloadBlob(blob, filenameFromHeader) {
-  const a = document.createElement("a");
-  const url = URL.createObjectURL(blob);
-  a.href = url;
-  if (filenameFromHeader) a.download = filenameFromHeader;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 800);
-}
-function setSaveVisible(show) {
-  const b = $("btn-save-redacted"); if (!b) return;
-  if (show) { b.classList.remove("hidden"); b.disabled = false; }
-  else { b.classList.add("hidden"); b.disabled = true; }
-}
-function setStatus(msg) { $("status").textContent = msg || ""; }
+let __lastRedactedBlob = null
+let __lastRedactedName = 'redacted.bin'
 
-// ===== tones (칩 색상) =====
-const RULE_TONE = {
-  rrn: "background:#ede9fe;color:#4c1d95;",
-  fgn: "background:#ede9fe;color:#4c1d95;",
-  email: "background:#e0f2fe;color:#075985;",
-  phone_mobile: "background:#d1fae5;color:#065f46;",
-  phone_city: "background:#d1fae5;color:#065f46;",
-  card: "background:#ffedd5;color:#9a3412;",
-  passport: "background:#e0e7ff;color:#3730a3;",
-  driver_license: "background:#fce7f3;color:#9d174d;",
-  default: "background:#f3f4f6;color:#374151;",
-};
-const toneStyle = (rule) => RULE_TONE[rule] || RULE_TONE.default;
+// html escape
+const esc = (s) =>
+  (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-// ===== masking (미리보기용) =====
-const KEEP = new Set(["-", "_", " "]);
-function maskPreview(val, rule) {
-  if ((rule || "").toLowerCase() === "email") {
-    let out = "";
-    for (const ch of val || "") {
-      if (ch === "@") out += "@";
-      else if (/[A-Za-z0-9.]/.test(ch)) out += "*";
-      else out += ch;
-    }
-    return out;
-  }
-  let out = "";
-  for (const ch of val || "") {
-    if (/[A-Za-z0-9]/.test(ch)) out += "*";
-    else if (KEEP.has(ch)) out += ch;
-    else out += ch;
-  }
-  return out;
+// 배지
+const badge = (sel, n) => {
+  const el = $(sel)
+  if (el) el.textContent = String(n ?? 0)
 }
 
-// ===== normalize & filter =====
-function normalizeMatchesText(fullText, matches) {
-  return (matches || []).map(m => ({
-    ...m,
-    value:
-      (m.value && String(m.value).trim()) ||
-      (m.location && Number.isFinite(m.location.start) && Number.isFinite(m.location.end)
-        ? fullText.slice(m.location.start, m.location.end).trim()
-        : "")
-  }));
+// 아코디언
+const setOpen = (name, open) => {
+  const cont =
+    name === 'pdf' ? $('#pdf-preview-block') : $(`#${name}-result-block`)
+  const body = $(`#${name}-body`)
+  const chev = document.querySelector(`[data-chevron="${name}"]`)
+  cont && cont.classList.remove('hidden')
+  body && body.classList.toggle('hidden', !open)
+  chev && chev.classList.toggle('rotate-180', !open)
 }
-function keepMeaningful(v) {
-  if (!v) return false;
-  return ((v.match(/[A-Za-z0-9]/g) || []).length >= 2);
-}
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-toggle]')
+  if (!btn) return
+  const name = btn.getAttribute('data-toggle')
+  const body = document.getElementById(`${name}-body`)
+  setOpen(name, body ? body.classList.contains('hidden') : true)
+})
 
-// ===== group by rule =====
-function groupByRule(fullText, matches, { fileType, valid /* 'ok'|'ng'|'all' */, masked }) {
-  const groups = new Map();
-  const seen = new Set();
-  for (const m of matches) {
-    if (fileType === "pdf" && !Number.isFinite(m.page)) continue;
-    if (valid === "ok" && m.valid !== true) continue;
-    if (valid === "ng" && m.valid !== false) continue;
-
-    const rule = (m.rule || "unknown");
-    let v = (m.value || "").trim();
-    if (!v && m.location && Number.isFinite(m.location.start) && Number.isFinite(m.location.end)) {
-      v = fullText.slice(m.location.start, m.location.end).trim();
-    }
-    if (!keepMeaningful(v)) continue;
-
-    const show = masked ? maskPreview(v, rule) : v;
-    const key = `${rule}:${show}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const arr = groups.get(rule) || [];
-    arr.push(show);
-    groups.set(rule, arr);
-  }
-  return new Map([...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])));
-}
-
-// ===== tight preview (한 줄 = 한 카테고리) =====
-function buildPreviewHtml_Grouped(fullText, matches, fileType) {
-  const grouped = groupByRule(fullText, matches, { fileType, valid: "ok", masked: true });
-  if (!grouped.size) return `<div style="font-size:12px;color:#9ca3af">감지된 항목 없음</div>`;
-
-  let html = '<div style="font-size:13px;line-height:1.15;margin:0;padding:0">';
-  grouped.forEach((vals, rule) => {
-    const chips = vals.map(v =>
-      `<span style="display:inline-block;padding:1px 6px;border-radius:8px;${toneStyle(rule)};margin:0 4px 0 0;font-size:12px;">${escapeHtml(v)}</span>`
-    ).join("");
-    html += `
-      <div style="margin:2px 0;padding:0;white-space:normal;">
-        <span style="display:inline-block;min-width:110px;color:#6b7280;font-size:12px;margin:0 6px 0 0;vertical-align:middle;">${escapeHtml(rule)}</span>
-        <span style="display:inline-block;vertical-align:middle;">${chips}</span>
-      </div>`;
-  });
-  html += "</div>";
-  return html;
-}
-
-// ===== backend mode autodetect (XML vs TEXT) =====
-let MODE = 'XML'; // 'XML' | 'TEXT'  (XML=/redactions/*, TEXT=/text/*)
-
-async function detectMode() {
+// 규칙 로드
+async function loadRules() {
   try {
-    const r = await fetch(api('/patterns'), { cache: 'no-store' });
-    if (!r.ok) throw 0;
-    MODE = 'XML';
+    const r = await fetch(`${API_BASE()}/text/rules`)
+    if (!r.ok) throw 0
+    const rules = await r.json()
+    const box = $('#rules-container')
+    if (!box) return
+    box.innerHTML = ''
+    for (const rule of rules) {
+      const el = document.createElement('label')
+      el.className = 'flex items-center gap-2'
+      el.innerHTML = `<input type="checkbox" name="rule" value="${rule}" checked><span>${esc(
+        rule
+      )}</span>`
+      box.appendChild(el)
+    }
   } catch {
-    MODE = 'TEXT';
+    console.warn('규칙 불러오기 실패')
   }
-}
-
-// ===== state =====
-let PRESET = [];
-let LAST_FILE = null;
-
-// ===== init =====
-init();
-async function init() {
-  await detectMode();
-  bindUI();
-  await fetchPatterns();
-  setSaveVisible(false);
-}
-function bindUI() {
-  $("file").addEventListener("change", onFileChange);
-  $("btn-scan").addEventListener("click", onScanClick);
-  $("btn-save-redacted").addEventListener("click", onApplyClick);
-}
-
-// ===== patterns/rules (양쪽 호환) =====
-async function fetchPatterns() {
-  try {
-    if (MODE === 'XML') {
-      const res = await fetch(api('/patterns'), { cache: "no-store" });
-      const j = await res.json();
-      PRESET = Array.isArray(j?.patterns) ? j.patterns : [];
-    } else {
-      const res = await fetch(api('/text/rules'), { cache: "no-store" });
-      const names = await res.json(); // ["rrn","email",...]
-      PRESET = (names || []).map(n => ({ name: n }));
-    }
-  } catch { PRESET = []; }
 }
 function selectedRuleNames() {
-  return Array.from(document.querySelectorAll('input[name="rule"]:checked')).map(el => el.value);
-}
-function selectedPatternsPayload() {
-  if (MODE === 'TEXT') return null; // TEXT는 이름 배열로만 처리
-  const names = new Set(selectedRuleNames());
-  if (!names.size || !PRESET.length) return null;
-  const chosen = PRESET.filter(p => names.has(p.name));
-  if (!chosen.length) return null;
-  return { patterns: chosen };
+  return $$('input[name="rule"]:checked').map((el) => el.value)
 }
 
-// ===== file change =====
-function onFileChange() {
-  const f = $("file").files?.[0];
-  LAST_FILE = f || null;
+// 드롭존
+function setupDropZone() {
+  const dz = $('#dropzone'),
+    input = $('#file'),
+    nameEl = $('#file-name'),
+    statusEl = $('#status')
+  if (!dz || !input) return
 
-  $("redacted-preview").innerHTML = "";
-  $("txt-raw").value = "";
-  $("by-rule-ok").innerHTML = "";
-  $("by-rule-ng").innerHTML = "";
-  $("summary").textContent = "";
-  $("status").textContent = "";
-  $("file-info").textContent = "";
-  setSaveVisible(false);
-
-  if (!f) return;
-  $("file-info").textContent = `${f.name} · ${(f.size/1024).toFixed(1)} KB · ${extOf(f.name).toUpperCase()}`;
-}
-
-// ===== actions =====
-async function onScanClick(e) {
-  if (e) e.preventDefault();
-  const f = $("file").files?.[0];
-  if (!f) return alert("파일을 선택하세요.");
-
-  setSaveVisible(false);
-  setStatus("스캔 중…");
-  try {
-    const data = await scanFile(f);
-    const fullText = data?.extracted_text || "";
-    const fileType = data?.file_type || (isPdfName(f.name) ? "pdf" : "xml");
-    const matches = normalizeMatchesText(fullText, Array.isArray(data?.matches) ? data.matches : []);
-
-    // 상단 미리보기 (타이트 칩)
-    const html = PREVIEW_ONLY_MATCHES ? buildPreviewHtml_Grouped(fullText, matches, fileType) : "";
-    $("redacted-preview").innerHTML = html;
-    const rp = $("redacted-preview");
-    rp.style.lineHeight = "1.15";
-    rp.style.padding = "4px 0";
-    rp.style.margin = "0";
-
-    // 하단 원본 텍스트: 룰별 묶음
-    const allGrouped = groupByRule(fullText, matches, { fileType, valid: "all", masked: false });
-    const lines = [];
-    allGrouped.forEach((vals, rule) => {
-      lines.push(`${rule}`);
-      vals.forEach(v => lines.push(`  ${v}`));
-      lines.push("");
-    });
-    while (lines.length && lines[lines.length - 1] === "") lines.pop();
-    $("txt-raw").value = lines.join("\n");
-
-    // OK/NG 칩
-    renderDetectedLists(matches, fileType);
-
-    // 요약
-    let total = 0; allGrouped.forEach(v => total += v.length);
-    $("summary").textContent = `파일형식=${fileType || "-"} · 총 ${total}건`;
-
-    setSaveVisible(true);
-    setStatus("스캔 완료");
-  } catch (e) {
-    console.error(e);
-    setSaveVisible(false);
-    setStatus("");
-    alert("스캔 중 오류: " + (e?.message || e));
+  let depth = 0
+  const setActive = (on) => {
+    dz.classList.toggle('ring-2', on)
+    dz.classList.toggle('ring-blue-400', on)
+    dz.classList.toggle('bg-blue-50', on)
   }
-}
+  const showName = (f) => {
+    if (nameEl) nameEl.textContent = f ? `선택됨: ${f.name}` : ''
+  }
 
-async function onApplyClick(e) {
-  if (e) e.preventDefault();
-  const f = $("file").files?.[0];
-  if (!f) return alert("파일을 선택하세요.");
-  setStatus("레닥션 중…");
-  try {
-    const { blob, filename } = await applyAndGetBlob(f);
-    downloadBlob(blob, filename);
-
-    if (/\.hwpx$/i.test(filename || "")) {
-      if (HWPX_VIEWER_URL) {
-        const url = URL.createObjectURL(blob);
-        window.open(`${HWPX_VIEWER_URL}?file=${encodeURIComponent(url)}&v=${Date.now()}`, "_blank");
-        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  ;['dragover', 'drop'].forEach((ev) =>
+    window.addEventListener(ev, (e) => e.preventDefault())
+  )
+  dz.addEventListener('dragenter', (e) => {
+    e.preventDefault()
+    depth++
+    setActive(true)
+    e.dataTransfer && (e.dataTransfer.dropEffect = 'copy')
+  })
+  dz.addEventListener('dragover', (e) => {
+    e.preventDefault()
+    e.dataTransfer && (e.dataTransfer.dropEffect = 'copy')
+  })
+  ;['dragleave', 'dragend'].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault()
+      depth = Math.max(0, depth - 1)
+      if (!depth) setActive(false)
+    })
+  )
+  dz.addEventListener('drop', (e) => {
+    e.preventDefault()
+    depth = 0
+    setActive(false)
+    const dt = e.dataTransfer
+    let file = (dt.files && dt.files[0]) || null
+    if (!file && dt.items) {
+      for (const it of dt.items) {
+        if (it.kind === 'file') {
+          const f = it.getAsFile()
+          if (f) {
+            file = f
+            break
+          }
+        }
       }
     }
+    if (!file) {
+      statusEl && (statusEl.textContent = '드래그한 항목이 파일이 아닙니다.')
+      return
+    }
+    const repl = new DataTransfer()
+    repl.items.add(file)
+    input.files = repl.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    showName(file)
+    statusEl &&
+      (statusEl.textContent = '파일 선택 완료 — 스캔 실행을 눌러주세요.')
+  })
+  input.addEventListener('change', (e) => showName(e.target.files?.[0] || null))
+}
 
-    setStatus("레닥션 완료. 파일이 저장되었습니다.");
-  } catch (e) {
-    console.error(e); setStatus("");
-    alert("레닥션 중 오류: " + (e?.message || e));
+// PDF 프리뷰(1페이지)
+async function renderRedactedPdfPreview(blob) {
+  const cv = $('#pdf-preview')
+  if (!cv) return
+  const g = cv.getContext('2d')
+  if (!blob) return g.clearRect(0, 0, cv.width, cv.height)
+  const pdf = await pdfjsLib.getDocument({ data: await blob.arrayBuffer() })
+    .promise
+  const page = await pdf.getPage(1)
+  const vp = page.getViewport({ scale: 1.2 })
+  cv.width = vp.width
+  cv.height = vp.height
+  await page.render({ canvasContext: g, viewport: vp }).promise
+}
+
+// 텍스트 하이라이트
+const take = (s, n) => (s.length <= n ? s : s.slice(0, n) + '…')
+function highlightFrag(ctx, val, pad = 60) {
+  const i = (ctx || '').indexOf(val || '')
+  if (i < 0) return esc(take(ctx || '', 140))
+  const start = Math.max(0, i - pad)
+  const end = Math.min((ctx || '').length, i + (val || '').length + pad)
+  const pre = esc((ctx || '').slice(start, i))
+  const mid = esc(val || '')
+  const post = esc((ctx || '').slice(i + (val || '').length, end))
+  return pre + `<mark class="bg-yellow-200 rounded px-1">${mid}</mark>` + post
+}
+
+let __segFilter = 'all' // all | ok | fail
+function applySegmentFilter(root) {
+  root.querySelectorAll('[data-valid]').forEach((el) => {
+    const ok = el.getAttribute('data-valid') === '1'
+    let show = true
+    if (__segFilter === 'ok') show = ok
+    else if (__segFilter === 'fail') show = !ok
+    el.style.display = show ? '' : 'none'
+  })
+}
+function wireSegmentButtons(root) {
+  const setActive = (which) => {
+    __segFilter = which
+    ;['all', 'ok', 'fail'].forEach((k) => {
+      const btn = $(`#seg-${k}`)
+      if (!btn) return
+      btn.classList.remove(
+        'bg-gray-900',
+        'text-white',
+        'bg-emerald-600',
+        'bg-rose-600'
+      )
+      if (k === 'all' && which === 'all')
+        btn.classList.add('bg-gray-900', 'text-white')
+      if (k === 'ok' && which === 'ok')
+        btn.classList.add('bg-emerald-600', 'text-white')
+      if (k === 'fail' && which === 'fail')
+        btn.classList.add('bg-rose-600', 'text-white')
+    })
+    applySegmentFilter(root)
   }
+  $('#seg-all')?.addEventListener('click', () => setActive('all'))
+  $('#seg-ok')?.addEventListener('click', () => setActive('ok'))
+  $('#seg-fail')?.addEventListener('click', () => setActive('fail'))
+  setActive(__segFilter)
 }
+function renderRegexResults(res) {
+  const items = Array.isArray(res?.items) ? res.items : []
+  badge('#match-badge', items.length)
 
-// ===== server calls =====
-async function scanFile(file) {
-  const fd = new FormData();
-  fd.append("file", file);
-
-  if (MODE === 'XML') {
-    const pj = selectedPatternsPayload();
-    if (pj) fd.append("patterns_json", JSON.stringify(pj));
-
-    const url = isPdfName(file.name)
-      ? api('/redactions/pdf/scan')
-      : api('/redactions/xml/scan');
-
-    const res = await fetch(url, { method: "POST", body: fd, cache: "no-store" });
-    if (!res.ok) throw new Error(await res.text());
-    return await res.json(); // { extracted_text, file_type, matches: [...] }
-  } else {
-    // TEXT: /text/extract → /text/match
-    const extResp = await fetch(api('/text/extract'), { method: 'POST', body: fd });
-    if (!extResp.ok) throw new Error(await extResp.text());
-    const extData = await extResp.json(); // { full_text }
-
-    const rules = selectedRuleNames();
-    const matchResp = await fetch(api('/text/match'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: extData.full_text || "", rules, normalize: true }),
-    });
-    if (!matchResp.ok) throw new Error(await matchResp.text());
-    const rj = await matchResp.json(); // { items: [...] }
-
-    // 공통 스키마로 변환
-    return {
-      extracted_text: extData.full_text || "",
-      file_type: isPdfName(file.name) ? "pdf" : "xml",
-      matches: (rj.items || []).map(r => ({
-        rule: r.rule,
-        value: r.value,
-        valid: r.valid,
-        location: r.location || null,
-        page: r.page,
-      })),
-    };
+  const summary = $('#summary')
+  if (summary) {
+    const counts = res?.counts || {}
+    summary.textContent = `검출: ${
+      Object.keys(counts).length
+        ? Object.entries(counts)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(', ')
+        : '없음'
+    }`
   }
-}
 
-function _parseDownloadFilename(res) {
-  const cd = res.headers.get("content-disposition") || "";
-  const mStar = cd.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-  if (mStar) return decodeURIComponent(mStar[1].replace(/["']/g, ""));
-  const m = cd.match(/filename\s*=\s*"([^"]+)"/i) || cd.match(/filename\s*=\s*([^;]+)/i);
-  return m ? m[1].trim() : "";
-}
+  const wrap = $('#match-groups')
+  if (!wrap) return
+  wrap.innerHTML = ''
 
-async function applyAndGetBlob(file) {
-  const fd = new FormData();
-  fd.append("file", file);
+  const groups = {}
+  for (const it of items) (groups[it.rule || 'UNKNOWN'] ??= []).push(it)
 
-  if (MODE === 'XML') {
-    let url = "";
-    if (isPdfName(file.name)) {
-      fd.append("mode", "auto_all");
-      fd.append("fill", "black");
-      const pj = selectedPatternsPayload();
-      if (pj) fd.append("patterns_json", JSON.stringify(pj));
-      url = api('/redactions/apply');
-    } else if (isXmlDoc(file.name)) {
-      url = api('/redactions/xml/apply');
-    } else {
-      throw new Error("이 형식은 레닥션 적용을 지원하지 않습니다.");
+  for (const [rule, arr] of Object.entries(groups).sort(
+    (a, b) => b[1].length - a[1].length
+  )) {
+    const ok = arr.filter((x) => x.valid).length
+    const fail = arr.length - ok
+
+    const container = document.createElement('div')
+    container.className = 'rounded-2xl border border-gray-200'
+    container.innerHTML = `
+      <button class="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 rounded-t-2xl">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-semibold">${esc(rule)}</span>
+          <span class="text-xs text-gray-500">총 ${arr.length}건</span>
+          <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">OK ${ok}</span>
+          ${
+            fail
+              ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">FAIL ${fail}</span>`
+              : ''
+          }
+        </div>
+        <svg class="h-4 w-4 text-gray-500 transition-transform" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" clip-rule="evenodd"/>
+        </svg>
+      </button>
+      <div class="p-3 grid gap-2 rounded-b-2xl"></div>
+    `
+    const body = container.querySelector('.p-3')
+
+    for (const r of arr) {
+      const isOk = !!r.valid
+      const ctx = r.context || ''
+      const val = r.value || ''
+      const card = document.createElement('div')
+      card.dataset.valid = isOk ? '1' : '0'
+      card.className =
+        'border rounded-xl p-3 bg-white hover:shadow-sm transition ' +
+        (isOk ? 'border-emerald-200' : 'border-rose-200')
+
+      // 값은 평문 모노스페이스, 불필요한 배경/박스 제거
+      card.innerHTML = `
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <div class="text-sm font-mono break-all">${esc(val)}</div>
+            <div class="text-[12px] text-gray-600 mt-1 leading-relaxed break-words">
+              ${highlightFrag(ctx, val)}
+            </div>
+          </div>
+          <div class="shrink-0">
+            <span class="inline-block text-[11px] px-1.5 py-0.5 rounded border ${
+              isOk
+                ? 'border-emerald-300 text-emerald-700'
+                : 'border-rose-300 text-rose-700'
+            }">${isOk ? 'OK' : 'FAIL'}</span>
+          </div>
+        </div>
+      `
+      body.appendChild(card)
     }
 
-    const res = await fetch(url, { method: "POST", body: fd, cache: "no-store" });
-    if (!res.ok) throw new Error(await res.text());
-    const blob = await res.blob();
-    const filename = _parseDownloadFilename(res)
-      || `${file.name.replace(/\.[^.]+$/, "")}.redacted.${extOf(file.name)}`;
-    return { blob, filename };
-  } else {
-    // TEXT: 단일 업로드 엔드포인트
-    const res = await fetch(api('/redact/file'), { method: 'POST', body: fd });
-    if (!res.ok) throw new Error(await res.text());
-    const blob = await res.blob();
-    const filename = _parseDownloadFilename(res)
-      || `${file.name.replace(/\.[^.]+$/, "")}.redacted.${extOf(file.name)}`;
-    return { blob, filename };
+    let open = arr.length <= 10
+    body.style.display = open ? '' : 'none'
+    container.querySelector('button')?.addEventListener('click', () => {
+      open = !open
+      body.style.display = open ? '' : 'none'
+      container.querySelector('svg')?.classList.toggle('rotate-180', !open)
+    })
+
+    wrap.appendChild(container)
+  }
+
+  wireSegmentButtons(wrap)
+
+  $('#filter-search')?.addEventListener('input', (e) => {
+    const q = (e.target.value || '').toLowerCase()
+    wrap.querySelectorAll('[data-valid]').forEach((el) => {
+      const txt = el.textContent.toLowerCase()
+      const match = !q || txt.includes(q)
+      el.style.display = match ? '' : 'none'
+    })
+    applySegmentFilter(wrap)
+  })
+
+  applySegmentFilter(wrap)
+}
+
+function normalizeNerItems(raw, srcText = '') {
+  if (!raw) return { items: [] }
+  let arr = []
+  if (Array.isArray(raw.items)) arr = raw.items
+  else if (Array.isArray(raw.entities)) arr = raw.entities
+  else if (Array.isArray(raw.result?.entities)) arr = raw.result.entities
+  else if (Array.isArray(raw)) arr = raw
+
+  // /text/detect 폴백 형태: final_spans에서 source==='ner'
+  if (!arr.length && Array.isArray(raw.final_spans)) {
+    const spans = raw.final_spans.filter(
+      (s) => (s.source || '').toLowerCase() === 'ner'
+    )
+    arr = spans.map((s) => {
+      const start = Number(s.start ?? 0)
+      const end = Number(s.end ?? 0)
+      const text =
+        start >= 0 && end > start && srcText
+          ? srcText.slice(start, end)
+          : s.text || ''
+      return {
+        label: s.label || '',
+        text,
+        score: s.score ?? s.prob,
+        start,
+        end,
+      }
+    })
+  }
+
+  // 필드 스펙 표준화
+  const map = (e) => ({
+    label: e.label ?? e.entity ?? e.tag ?? '',
+    text: e.text ?? e.word ?? e.value ?? '',
+    score:
+      typeof e.score === 'number'
+        ? e.score
+        : typeof e.confidence === 'number'
+        ? e.confidence
+        : undefined,
+    start: typeof e.start === 'number' ? e.start : 0,
+    end:
+      typeof e.end === 'number'
+        ? e.end
+        : typeof e.length === 'number'
+        ? (e.start || 0) + e.length
+        : 0,
+  })
+  return { items: arr.map(map) }
+}
+async function requestNerSmart(text) {
+  // 1) /text/ner
+  try {
+    const r = await fetch(`${API_BASE()}/text/ner`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (r.ok) {
+      const j = await r.json()
+      const n = normalizeNerItems(j)
+      if (n.items.length) return n
+    }
+  } catch {}
+  // 2) /text/detect (run_ner)
+  const r2 = await fetch(`${API_BASE()}/text/detect`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text,
+      options: { run_regex: false, run_ner: true },
+    }),
+  })
+  if (!r2.ok) return { items: [] }
+  const j2 = await r2.json()
+  return normalizeNerItems(j2, j2.text || text || '')
+}
+
+// NER 테이블
+function renderNerTable(ner) {
+  const rows = $('#ner-rows')
+  const sum = $('#ner-summary')
+  const allow = new Set()
+  $('#ner-show-ps')?.checked !== false && allow.add('PS')
+  $('#ner-show-lc')?.checked !== false && allow.add('LC')
+  $('#ner-show-og')?.checked !== false && allow.add('OG')
+
+  const items = (ner.items || []).filter((it) =>
+    allow.has((it.label || '').toUpperCase())
+  )
+  if (rows) rows.innerHTML = ''
+  for (const it of items) {
+    const tr = document.createElement('tr')
+    tr.className = 'border-b align-top'
+    tr.innerHTML = `
+      <td class="py-2 px-2 font-mono">${esc(it.label)}</td>
+      <td class="py-2 px-2 font-mono">${esc(it.text)}</td>
+      <td class="py-2 px-2 font-mono">${
+        typeof it.score === 'number' ? it.score.toFixed(2) : '-'
+      }</td>
+      <td class="py-2 px-2 font-mono">${it.start}-${it.end}</td>`
+    rows?.appendChild(tr)
+  }
+  badge('#ner-badge', items.length)
+  if (sum) {
+    const counts = {}
+    for (const it of items) counts[it.label] = (counts[it.label] || 0) + 1
+    sum.textContent = `검출: ${
+      Object.keys(counts).length
+        ? Object.entries(counts)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(', ')
+        : '없음'
+    }`
   }
 }
 
-// ===== chips list (하단 위젯) =====
-function renderDetectedLists(matches, fileType) {
-  let ok, ng;
-  if (fileType === "pdf") {
-    ok = matches.filter(m => m.valid === true && Number.isFinite(m.page));
-    ng = matches.filter(m => !(m.valid === true && Number.isFinite(m.page)));
-  } else {
-    ok = matches.filter(m => m.valid === true);
-    ng = matches.filter(m => m.valid === false);
-  }
-  renderRuleChips($("by-rule-ok"), ok, false);
-  renderRuleChips($("by-rule-ng"), ng, true);
+// 상태
+function setStatus(msg) {
+  const el = $('#status')
+  if (el) el.textContent = msg || ''
 }
-function renderRuleChips(container, list, isNG=false) {
-  const by = new Map();
-  (list || []).forEach(m => {
-    const k = m.rule || "unknown";
-    const arr = by.get(k) || [];
-    arr.push(m);
-    by.set(k, arr);
-  });
-  if (!list.length) {
-    container.innerHTML = `<div style="font-size:12px;color:#6b7280">없음</div>`;
-    return;
+
+// 스캔 버튼
+$('#btn-scan')?.addEventListener('click', async () => {
+  const f = $('#file')?.files?.[0]
+  if (!f) return alert('파일을 선택하세요.')
+
+  const ext = (f.name.split('.').pop() || '').toLowerCase()
+  __lastRedactedName = f.name
+    ? f.name.replace(/\.[^.]+$/, `_redacted.${ext}`)
+    : `redacted.${ext}`
+
+  setStatus('텍스트 추출 및 매칭 중...')
+  const fd = new FormData()
+  fd.append('file', f)
+
+  $('#match-result-block')?.classList.remove('hidden')
+  $('#ner-result-block')?.classList.remove('hidden')
+
+  try {
+    // 1) 텍스트 추출
+    const r1 = await fetch(`${API_BASE()}/text/extract`, {
+      method: 'POST',
+      body: fd,
+    })
+    if (!r1.ok)
+      throw new Error(`텍스트 추출 실패 (${r1.status})\n${await r1.text()}`)
+    const { full_text: text = '' } = await r1.json()
+
+    // 프리뷰
+    $('#text-preview-block')?.classList.remove('hidden')
+    const ta = $('#txt-out')
+    if (ta) ta.value = text || '(본문 텍스트가 비어 있습니다.)'
+
+    // 2) 정규식 매칭
+    const rules = selectedRuleNames()
+    const r2 = await fetch(`${API_BASE()}/text/match`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, rules, normalize: true }),
+    })
+    if (!r2.ok) throw new Error(`매칭 실패 (${r2.status})\n${await r2.text()}`)
+    renderRegexResults(await r2.json())
+    setOpen('match', true)
+
+    // 3) NER (스마트 호출)
+    const ner = await requestNerSmart(text)
+    renderNerTable(ner)
+    ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
+      $(sel)?.addEventListener('change', () => renderNerTable(ner))
+    )
+    setOpen('ner', true)
+
+    setStatus(`스캔 완료 (${ext.toUpperCase()} 처리)`)
+
+    // 4) 레닥션 파일 생성
+    setStatus('레닥션 파일 생성 중...')
+    const r4 = await fetch(`${API_BASE()}/redact/file`, {
+      method: 'POST',
+      body: fd,
+    })
+    if (!r4.ok) throw new Error(`레닥션 실패 (${r4.status})`)
+    const blob = await r4.blob()
+    const ctype = r4.headers.get('Content-Type') || 'application/octet-stream'
+    __lastRedactedBlob = new Blob([blob], { type: ctype })
+
+    if (ctype.includes('pdf')) {
+      setOpen('pdf', true)
+      await renderRedactedPdfPreview(__lastRedactedBlob)
+    } else {
+      setOpen('pdf', false)
+    }
+
+    const btn = $('#btn-save-redacted')
+    if (btn) {
+      btn.classList.remove('hidden')
+      btn.disabled = false
+    }
+    setStatus('레닥션 완료 — 다운로드 가능')
+  } catch (e) {
+    console.error(e)
+    setStatus(`오류: ${e.message || e}`)
   }
-  const sections = [];
-  by.forEach((arr, rule) => {
-    const seen = new Set();
-    const chips = [];
-    arr.forEach(m => {
-      const raw = (m.value || "").trim();
-      if (!raw) return;
-      const key = `${rule}:${raw}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      const extra = isNG ? "outline:1px solid #fca5a5;" : "";
-      chips.push(`<span style="display:inline-block;padding:2px 8px;border-radius:9999px;${toneStyle(rule)};${extra}margin:2px 6px 2px 0;font-size:12px;">${escapeHtml(raw)}</span>`);
-    });
-    sections.push(`
-      <div style="margin:4px 0 6px 0;line-height:1.15;">
-        <div style="font-size:12px;color:#6b7280;margin:0 0 2px 0;">${escapeHtml(rule)}</div>
-        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;">${chips.join("")}</div>
-      </div>
-    `);
-  });
-  container.innerHTML = sections.join("");
-}
+})
+
+// 다운로드
+$('#btn-save-redacted')?.addEventListener('click', () => {
+  if (!__lastRedactedBlob) return alert('레닥션된 파일이 없습니다.')
+  const url = URL.createObjectURL(__lastRedactedBlob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = __lastRedactedName || 'redacted_file'
+  a.click()
+  URL.revokeObjectURL(url)
+})
+
+// 초기화
+document.addEventListener('DOMContentLoaded', () => {
+  loadRules()
+  setupDropZone()
+})
