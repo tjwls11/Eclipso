@@ -109,7 +109,7 @@ class XLUCS:
 
     def decode_text(self, single_byte_codec: str = "cp949") -> str:
         raw = self._text_data
-        # 휴리스틱: fHigh=0인데 UTF-16 패턴이면 보정
+        # fHigh=0인데 UTF-16 패턴이면 보정
         if not self.fHigh and len(raw) >= 4 and raw[1] == 0x00 and raw[3] == 0x00:
             enc = "utf-16le"
         else:
@@ -154,6 +154,10 @@ def fallback_redact(wb: bytearray, off: int, length: int, single_byte_codec="cp9
 CHART_STRING_LIKE = {0x0004, 0x041E, 0x100D, 0x1025, 0x104B, 0x105C, 0x1024, 0x1026}
 
 def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single_byte_codec="cp949") -> int:
+    """
+    BIFF payload 내에서 문자열(XLUnicodeRichExtendedString) 단위로 스캔하고 레닥션 적용
+    CONTINUE(0x003C) 레코드가 있을 경우 자동 병합 처리
+    """
     end = payload_off + length
     payloads = [wb[payload_off:end]]
 
@@ -171,39 +175,50 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
 
     while pos < len(payloads[0]):
         x = XLUCS()
+        # 문자열 파싱 시도
         if not x.try_parse_at(payloads, 0, pos):
             pos += 1
             continue
 
+        # 문자열 복원 및 디버깅
         text = x.decode_text(single_byte_codec).strip()
+        print(f"[DEBUG] opcode text candidate: {repr(text)} (len={len(text)} fHigh={x.fHigh})")
+
+        # 민감정보 매칭
         if text and find_sensitive_spans(normalization_text(text)):
+            print(f"[DEBUG!!!] match found in: {repr(text)}")
+
             # 동일 길이 마스킹 생성
             masked = ("*" * len(text)).encode("utf-16le" if x.fHigh else single_byte_codec)
             masked = masked[:x.text_hi - x.text_lo].ljust(x.text_hi - x.text_lo, b'*')
 
-            # 각 payload에 나눠서 되돌려쓰기
-            remain = x.text_hi - x.text_lo
+            # 여러 payload에 걸쳐 나눠 쓰기
+            remain = len(masked)
             to_write = memoryview(masked)
-            i = 0
-            write_pos = x.text_lo
-            while remain > 0 and i < len(payloads):
-                seg = payloads[i]
-                if write_pos < len(seg):
-                    can = min(remain, len(seg) - write_pos)
-                    seg[write_pos:write_pos+can] = to_write[:can]
+            for i, seg in enumerate(payloads):
+                if remain <= 0:
+                    break
+                # 첫 payload는 text_lo부터, 이후 CONTINUE는 0부터 시작
+                write_pos = x.text_lo if i == 0 else 0
+                can = min(remain, max(0, len(seg) - write_pos))
+                if can > 0:
+                    seg[write_pos:write_pos + can] = to_write[:can]
                     to_write = to_write[can:]
-                    remain  -= can
-                    write_pos += can
-                    if write_pos >= len(seg):
-                        i += 1
-                        write_pos = 0
-                else:
-                    i += 1
-                    write_pos -= len(seg)
+                    remain -= can
 
+            print(f"[DEBUG] wrote {len(masked)} bytes across {len(payloads)} payloads (remain={remain})")
             red += 1
-        # 다음 후보 탐색: 현재 시작점에서 한 바이트 전진(보수적)
-        pos += 1
+
+        # 다음 문자열 시작 위치로 이동 
+        header_len = 3 + (2 if (x.flags & 0x08) else 0) + (4 if (x.flags & 0x04) else 0)
+        text_bytes = x.cch * (2 if x.fHigh else 1)
+        total_len = header_len + text_bytes + (x.cRun * 4 if hasattr(x, "cRun") else 0) + (x.cbExtRst if hasattr(x, "cbExtRst") else 0)
+        next_pos = pos + total_len
+
+        # 혹시라도 계산 상 전진이 없으면 1바이트 전진
+        if next_pos <= pos:
+            next_pos = pos + 1
+        pos = next_pos
 
     # 첫 payload를 실제 wb에 반영
     wb[payload_off:end] = payloads[0]
@@ -213,9 +228,11 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
         op, ln = struct.unpack_from("<HH", wb, cur)
         wb[cur+4:cur+4+ln] = payloads[k]
         cur += 4 + ln
+
+    # fallback: ASCII/UTF-16 패턴 기반 마스킹
     if red == 0:
-        # 마지막 수단: ASCII/UTF-16 패턴 기반 마스킹
         red += fallback_redact(wb, payload_off, end - payload_off, single_byte_codec)
+
     return red
 
 
