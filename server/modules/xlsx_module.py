@@ -1,48 +1,49 @@
-# server/xml/xlsx.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import zipfile
+import io, zipfile
 from typing import List, Tuple
-from .common import cleanup_text, compile_rules, sub_text_nodes, chart_sanitize, xlsx_text_from_zip
-from ..core.schemas import XmlMatch, XmlLocation
+from .common import (
+    cleanup_text, compile_rules, sub_text_nodes, chart_sanitize, xlsx_text_from_zip,
+    chart_rels_sanitize,
+)
+from server.core.schemas import XmlMatch, XmlLocation
 
 def xlsx_text(zipf: zipfile.ZipFile) -> str:
     return xlsx_text_from_zip(zipf)
+
+def extract_text(file_bytes: bytes) -> str:
+    """ZIP을 열어 텍스트만 추출."""
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+        return xlsx_text(zipf)
 
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = xlsx_text(zipf)
     comp = compile_rules()
     out: List[XmlMatch] = []
-    for rule_name, rx, need_valid, _prio in comp:
+    for rule_name, rx, _need_valid, _prio in comp:
         for m in rx.finditer(text):
             out.append(XmlMatch(
                 rule=rule_name, value=m.group(0), valid=True,
-                context=text[max(0,m.start()-20):min(len(text),m.end()+20)],
+                context=text[max(0, m.start()-20):min(len(text), m.end()+20)],
                 location=XmlLocation(kind="xlsx", part="*merged_text*", start=m.start(), end=m.end()),
             ))
     return out, "xlsx", text
 
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
+
+    # 1) 셀/공유문자열
     if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
         return sub_text_nodes(data, comp)[0]
+
+    # 2) 차트 본문(라벨만)
     if low.startswith("xl/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
-        return sub_text_nodes(b2, comp)[0]
+        return b2
+
+    # 3) 차트 관계(.rels) 정리(복구 팝업 방지)
+    if low.startswith("xl/charts/_rels/") and low.endswith(".rels"):
+        b3, _ = chart_rels_sanitize(data)
+        return b3
+
     return data
-
-def extract_text(file_bytes: bytes) -> dict:
-    """XLSX 파일에서 셀 텍스트 추출"""
-    import io, zipfile, re
-    from server.modules.common import cleanup_text
-
-    try:
-        with io.BytesIO(file_bytes) as bio, zipfile.ZipFile(bio, "r") as zipf:
-            all_txt = []
-            for name in sorted(n for n in zipf.namelist() if n.endswith(".xml")):
-                xml = zipf.read(name).decode("utf-8", "ignore")
-                matches = re.findall(r">([^<>]+)<", xml)
-                all_txt.extend(matches)
-            joined = "\n".join(all_txt)
-            return {"full_text": cleanup_text(joined)}
-    except Exception as e:
-        raise Exception(f"XLSX 텍스트 추출 실패: {e}")
