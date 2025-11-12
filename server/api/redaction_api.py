@@ -78,31 +78,6 @@ def _load_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
         raise HTTPException(status_code=400, detail=f"잘못된 PatternItem 형식: {e}")
 
 
-def _compile_dynamic_patterns(patterns: List[PatternItem]) -> List[types.SimpleNamespace]:
-    compiled: List[types.SimpleNamespace] = []
-    for it in patterns:
-        regex = getattr(it, "regex", None)
-        if not regex:
-            raise HTTPException(
-                status_code=400, detail="PatternItem에 'regex' 누락"
-            )
-
-        try:
-            rp = re.compile(regex)
-        except re.error as e:
-            name_for_msg = getattr(it, "name", getattr(it, "label", "UNKNOWN"))
-            raise HTTPException(
-                status_code=400,
-                detail=f"정규식 컴파일 실패({name_for_msg}): {e}",
-            )
-
-        # 네임스페이스로 래핑(+ compiled)
-        ns = types.SimpleNamespace(**it.dict())
-        setattr(ns, "compiled", rp)
-        compiled.append(ns)
-    return compiled
-
-
 @router.post(
     "/redactions/detect",
     response_model=DetectResponse,
