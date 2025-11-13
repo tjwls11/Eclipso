@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 OLE(CFBF) 스트림 동일 길이 마스킹 + FAT/MiniFAT 브루트포스 쓰기 + 상세 로그.
 중요: 차트 역노출 방지 위해 OlePres***, Contents, OOXMLChartContents 는 무조건 제로필.

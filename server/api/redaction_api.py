@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import time
 import re
-import tempfile
-import urllib.parse
-from typing import Any, Dict, List, Optional
+import types
+from typing import Dict, List, Optional, Literal, Tuple, Set, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 
@@ -27,14 +27,21 @@ def _ensure_pdf(file: UploadFile) -> None:
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
 
-def _read_all(file: UploadFile) -> bytes:
+
+def _read_pdf(file: UploadFile) -> bytes:
     data = file.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
     return data
 
+
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    """프론트 patterns_json -> PatternItem[] (없으면 PRESET 전체)."""
+    """
+    입력 허용
+    - None / "" / 공백 / "null" / "None" -> PRESET_PATTERNS
+    - 배열: [ { ... } ]
+    - 객체: { "patterns": [ { ... } ] }
+    """
     if patterns_json is None:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
@@ -71,7 +78,7 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
 
     try:
         return [PatternItem(**p) for p in arr]
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         raise HTTPException(status_code=400, detail=f"잘못된 patterns 항목: {e}")
 
 
@@ -107,8 +114,12 @@ def _compile_patterns(items: List[PatternItem]) -> List[Any]:
 @router.post(
     "/redactions/detect",
     response_model=DetectResponse,
-    summary="PDF 패턴 박스 검출",
-    description="PDF에서 정규식 패턴 위치를 박스로 탐지"
+    summary="PDF 패턴 박스 탐지",
+    description=(
+        "- 정규식 패턴 → 좌표 박스\n"
+        "- 입력: file(PDF), patterns_json(JSON 문자열 | 생략)\n"
+        "- 출력: total_matches, boxes"
+    ),
 )
 async def detect(
     file: UploadFile = File(..., description="PDF 파일"),
@@ -117,6 +128,7 @@ async def detect(
     _ensure_pdf(file)
     pdf = await file.read()
 
+    # 로깅(옵션)
     if patterns_json is None:
         log.debug("patterns_json: None")
     else:
@@ -126,6 +138,7 @@ async def detect(
     patterns = _compile_patterns(items)
     boxes = detect_boxes_from_patterns(pdf, patterns)
     return DetectResponse(total_matches=len(boxes), boxes=boxes)
+
 
 @router.post(
     "/redactions/apply",
@@ -137,15 +150,12 @@ async def apply(
     file: UploadFile = File(..., description="PDF 파일"),
 ):
     _ensure_pdf(file)
-    pdf = _read_all(file)
+    pdf = _read_pdf(file)
+    fill = "black"
 
-    patterns = _parse_patterns_json(patterns_json)
-    fill_color = (fill or "black").lower()
+    boxes = detect_boxes_from_patterns(pdf, [PatternItem(**p) for p in PRESET_PATTERNS])
+    out = apply_redaction(pdf, boxes, fill=fill)
 
-    boxes = detect_boxes_from_patterns(pdf, patterns)
-    out = apply_redaction(pdf, boxes, fill=fill_color)
-
-    disp = build_disposition("redacted.pdf")
     return Response(
         content=out,
         media_type="application/pdf",
