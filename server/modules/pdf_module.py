@@ -1,144 +1,248 @@
-import re
+# server/modules/pdf_module.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import io
+import re
+from typing import List, Optional, Set, Dict
+
 import fitz  # PyMuPDF
-import logging
-from typing import List, Tuple, Optional
+
 from server.core.schemas import Box, PatternItem
 from server.core.redaction_rules import PRESET_PATTERNS, RULES
+from server.modules.ner_module import run_ner  # 앞으로 쓸 수도 있으니 그대로 둠
+from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
+from server.core.regex_utils import match_text
 
-logger = logging.getLogger("pdf_redact")
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+# 공통 유틸: 텍스트 정리 + 규칙 컴파일(validator 포함)
+try:
+    from .common import cleanup_text, compile_rules
+except Exception:  # pragma: no cover
+    from server.modules.common import cleanup_text, compile_rules  # type: ignore
+
+
+log_prefix = "[PDF]"
+
+
+# ─────────────────────────────────────────────────────────────
+# /text/extract 용 텍스트 추출
+# ─────────────────────────────────────────────────────────────
+def extract_text(file_bytes: bytes) -> dict:
+    """
+    PDF에서 텍스트를 추출해 /text/extract 형식으로 반환.
+
+    {
+      "full_text": "...",
+      "pages": [
+        {"page": 1, "text": "..."},
+        ...
+      ]
+    }
+    """
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        pages = []
+        all_chunks: List[str] = []
+
+        for idx, page in enumerate(doc):
+            raw = page.get_text("text") or ""
+            cleaned = cleanup_text(raw)
+            pages.append({"page": idx + 1, "text": cleaned})
+            if cleaned:
+                all_chunks.append(cleaned)
+
+        full_text = cleanup_text("\n\n".join(all_chunks))
+
+        return {
+            "full_text": full_text,
+            "pages": pages,
+        }
+    finally:
+        doc.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# 헬퍼들
+# ─────────────────────────────────────────────────────────────
+def _normalize_pattern_names(
+    patterns: List[PatternItem] | None,
+) -> Optional[Set[str]]:
+    """
+    /redactions/pdf/scan 에서 넘어온 patterns 는 PRESET 기반이므로
+    이름만 추려서 서버쪽 compile_rules 결과를 필터링하는 데만 쓴다.
+    (regex 문자열은 서버 PRESET 과 동일하다고 가정하고 무시)
+    """
+    if not patterns:
+        return None
+
+    names: Set[str] = set()
+    for p in patterns:
+        nm = getattr(p, "name", None) or getattr(p, "rule", None)
+        if nm:
+            names.add(nm)
+    return names or None
+
+
+def _is_valid_value(need_valid: bool, validator, value: str) -> bool:
+    """
+    compile_rules() 가 넘겨준 need_valid / validator 를 그대로 사용.
+    - need_valid == False → validator 무시, 항상 OK
+    - need_valid == True  → validator 가 있으면 돌려서 True 일 때만 OK
+    """
+    if not need_valid or not callable(validator):
+        return True
+    try:
+        try:
+            return bool(validator(value))
+        except TypeError:
+            # validator(val, ctx) 형태일 수도 있음
+            return bool(validator(value, None))
+    except Exception:
+        # validator 내부 예외는 FAIL 처리
+        print(f"{log_prefix} VALIDATOR ERROR", repr(value))
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+# PDF 내 박스 탐지
+#  - compile_rules() 기반 + validator 결과를 그대로 사용
+#  - FAIL(validator False) 인 값은 **절대로 박스 만들지 않음**
+# ─────────────────────────────────────────────────────────────
+def detect_boxes_from_patterns(
+    pdf_bytes: bytes,
+    patterns: List[PatternItem] | None,
+) -> List[Box]:
+    """
+    patterns:
+      - None        → 서버 PRESET 전체 사용
+      - PatternItem → name 만 사용해서 subset 필터링
+    """
+    # 1) 서버 기준 규칙(validator 포함) 가져오기
+    comp = compile_rules()  # [(name, rx, need_valid, prio, validator), ...]
+    allowed_names = _normalize_pattern_names(patterns)
+
+    print(
+        f"{log_prefix} detect_boxes_from_patterns: rules 준비 완료",
+        "allowed_names=",
+        sorted(allowed_names) if allowed_names else "ALL",
     )
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
 
+    # 룰별 OK/FAIL 카운터 (디버깅용)
+    stats_ok: Dict[str, int] = {}
+    stats_fail: Dict[str, int] = {}
 
-# ---------------------------------------------------------
-# 내부 유틸: 정규식 기반 탐지
-# ---------------------------------------------------------
-def _compile_pattern(p: PatternItem) -> re.Pattern:
-    flags = 0 if p.case_sensitive else re.IGNORECASE
-    pattern = p.regex
-    if p.whole_word:
-        pattern = rf"\b(?:{pattern})\b"
-    return re.compile(pattern, flags)
-
-
-def _word_spans_to_rect(words: List[tuple], spans: List[Tuple[int, int]]) -> List[fitz.Rect]:
-    rects: List[fitz.Rect] = []
-    for s, e in spans:
-        chunk = words[s:e]
-        if not chunk:
-            continue
-        x0 = min(w[0] for w in chunk)
-        y0 = min(w[1] for w in chunk)
-        x1 = max(w[2] for w in chunk)
-        y1 = max(w[3] for w in chunk)
-        rects.append(fitz.Rect(x0, y0, x1, y1))
-    return rects
-
-
-# ---------------------------------------------------------
-# 1) PDF 내부 패턴 탐지 (텍스트 영역별 Box 추출)
-# ---------------------------------------------------------
-def detect_boxes_from_patterns(pdf_bytes: bytes, patterns: List[PatternItem]) -> List[Box]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     boxes: List[Box] = []
-    compiled = [(_compile_pattern(p), p.name) for p in patterns]
 
-    for pno in range(len(doc)):
-        page = doc.load_page(pno)
-        words = page.get_text("words")
-        tokens = [w[4] for w in words]
-        text_joined = " ".join(tokens)
-        acc = 0
+    try:
+        for pno, page in enumerate(doc):
+            text = page.get_text("text") or ""
+            if not text:
+                continue
 
-        for comp, pname in compiled:
-            for m in comp.finditer(text_joined):
-                matched = m.group(0)
-                start_char, end_char = m.span()
-                start_idx = end_idx = None
-                acc = 0
-                for i, t in enumerate(tokens):
-                    if i > 0:
-                        acc += 1
-                    token_start, token_end = acc, acc + len(t)
-                    if token_end > start_char and token_start < end_char:
-                        if start_idx is None:
-                            start_idx = i
-                        end_idx = i + 1
-                    acc += len(t)
-                if start_idx is None or end_idx is None:
+            for (rule_name, rx, need_valid, _prio, validator) in comp:
+                if allowed_names and rule_name not in allowed_names:
                     continue
-                rects = _word_spans_to_rect(words, [(start_idx, end_idx)])
-                for r in rects:
-                    boxes.append(
-                        Box(
-                            page=pno,
-                            x0=float(r.x0),
-                            y0=float(r.y0),
-                            x1=float(r.x1),
-                            y1=float(r.y1),
-                            matched_text=matched,
-                            pattern_name=pname,
-                        )
+
+                try:
+                    it = rx.finditer(text)
+                except Exception:
+                    continue
+
+                for m in it:
+                    val = m.group(0)
+                    if not val:
+                        continue
+
+                    ok = _is_valid_value(need_valid, validator, val)
+
+                    # 통계
+                    if ok:
+                        stats_ok[rule_name] = stats_ok.get(rule_name, 0) + 1
+                    else:
+                        stats_fail[rule_name] = stats_fail.get(rule_name, 0) + 1
+
+                    print(
+                        f"{log_prefix} MATCH",
+                        "page=", pno + 1,
+                        "rule=", rule_name,
+                        "need_valid=", need_valid,
+                        "ok=", ok,
+                        "value=", repr(val),
                     )
-    doc.close()
+
+                    # FAIL 이면 박스 만들지 않음
+                    if not ok:
+                        continue
+
+                    # 실제 박스 찾기
+                    rects = page.search_for(val)
+                    for r in rects:
+                        print(
+                            f"{log_prefix} BOX",
+                            "page=", pno + 1,
+                            "rule=", rule_name,
+                            "rect=", (r.x0, r.y0, r.x1, r.y1),
+                        )
+                        boxes.append(
+                            Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
+                        )
+    finally:
+        doc.close()
+
+    print(
+        f"{log_prefix} detect summary",
+        "OK=", {k: v for k, v in sorted(stats_ok.items())},
+        "FAIL=", {k: v for k, v in sorted(stats_fail.items())},
+        "boxes=", len(boxes),
+    )
+
     return boxes
 
 
-# ---------------------------------------------------------
-# 2) 실제 시각적 마스킹(블랙박스) 적용
-# ---------------------------------------------------------
-def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill="black") -> bytes:
+# ─────────────────────────────────────────────────────────────
+# 레닥션 적용
+# ─────────────────────────────────────────────────────────────
+def _fill_color(fill: str):
+    f = (fill or "black").strip().lower()
+    return (0, 0, 0) if f == "black" else (1, 1, 1)
+
+
+def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> bytes:
+    print(f"{log_prefix} apply_redaction: boxes=", len(boxes), "fill=", fill)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    color = (0, 0, 0) if fill == "black" else (1, 1, 1)
-    by_page = {}
-    for b in boxes:
-        by_page.setdefault(b.page, []).append(b)
-
-    for pno, page_boxes in by_page.items():
-        page = doc.load_page(pno)
-        for b in page_boxes:
-            rect = fitz.Rect(b.x0, b.y0, b.x1, b.y1)
+    try:
+        color = _fill_color(fill)
+        for b in boxes:
+            page = doc.load_page(int(b.page))
+            rect = fitz.Rect(float(b.x0), float(b.y0), float(b.x1), float(b.y1))
             page.add_redact_annot(rect, fill=color)
-        page.apply_redactions()
 
-    out = io.BytesIO()
-    doc.save(out)
-    doc.close()
-    return out.getvalue()
+        # 페이지 단위로 실제 레닥션 적용
+        for page in doc:
+            page.apply_redactions()
+
+        out = io.BytesIO()
+        doc.save(out)
+        return out.getvalue()
+    finally:
+        doc.close()
 
 
-# ---------------------------------------------------------
-# 3) 외부에서 호출할 메인 함수
-# ---------------------------------------------------------
-def apply_text_redaction(file_bytes: bytes) -> bytes:
+def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> bytes:
     """
-    전체 PDF에 대해 민감정보를 탐지하고 실제 검정 박스 마스킹 적용.
+    PRESET_PATTERNS 기반 텍스트 레닥션.
+
+    ※ 중요:
+      - 여기서는 **regex + validator 기반 박스만 사용**한다.
+      - extra_spans(NER / 기타 매칭 결과)는 PDF 레닥션에서는
+        FAIL/OK 구분이 확실하지 않아서 현재는 *레닥션에 사용하지 않는다*.
+        (필요하면 나중에 valid=True 인 것만 별도 하이라이트 용도로 쓸 수 있음)
     """
+    # PRESET 전체를 PatternItem 형태로 만들어서 이름만 넘김
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
-    boxes = detect_boxes_from_patterns(file_bytes, patterns)
-    logger.info(f"PDF redaction: {len(boxes)} boxes found")
-    return apply_redaction(file_bytes, boxes, fill="black")
+    boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
 
-
-# ---------------------------------------------------------
-# 4) 텍스트 추출용 (프리뷰용)
-# ---------------------------------------------------------
-def extract_text(file_bytes: bytes):
-    text = ""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc):
-        page_text = page.get_text("text")
-        text += page_text or ""
-        pages.append({"page": i + 1, "text": page_text})
-    doc.close()
-    return {"full_text": text, "pages": pages}
+    # extra_spans 는 지금 단계에서는 완전히 무시
+    # (FAIL 이라도 강제로 들어오는 걸 막기 위해)
+    return apply_redaction(pdf_bytes, boxes)

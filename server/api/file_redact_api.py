@@ -1,35 +1,89 @@
-from fastapi import APIRouter, UploadFile, File, Response, HTTPException, Form
+from fastapi import APIRouter, UploadFile, File, Response, HTTPException
 from pathlib import Path
+
 from server.modules import doc_module, hwp_module, ppt_module, xls_module, pdf_module
 from server.modules.xml_redaction import xml_redact_to_file
+
+from server.core.regex_utils import match_text
+from server.modules.ner_module import run_ner
+from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
+
 import tempfile
 import os
+import traceback
 
 router = APIRouter(prefix="/redact", tags=["redact"])
 
-@router.post("/file", response_class=Response)
+@router.post(
+    "/file",
+    response_class=Response,
+    summary="파일 레닥션",
+    description=(
+        "지원 포맷: .doc, .hwp, .ppt, .xls, .pdf, .docx, .pptx, .xlsx, .hwpx\n"
+    ),
+)
 async def redact_file(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
     file_bytes = await file.read()
-    out, mime, fname = None, "application/octet-stream", file.filename  # 원본 파일명 유지
-    encoded_fileName = file.filename.encode("utf-8", "ignore").decode("latin-1", "ignore") #한국어 인코딩처리
+
+    out = None
+    mime = "application/octet-stream"
+    encoded_fileName = file.filename.encode("utf-8", "ignore").decode("latin-1", "ignore")
 
     try:
         if ext == ".doc":
             out = doc_module.redact(file_bytes)
             mime = "application/msword"
+
         elif ext == ".hwp":
             out = hwp_module.redact(file_bytes)
             mime = "application/x-hwp"
+
         elif ext == ".ppt":
             out = ppt_module.redact(file_bytes)
             mime = "application/vnd.ms-powerpoint"
+
         elif ext == ".xls":
             out = xls_module.redact(file_bytes)
             mime = "application/vnd.ms-excel"
+
         elif ext == ".pdf":
-            out = pdf_module.apply_text_redaction(file_bytes)
+            import fitz  # PyMuPDF
+
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                text = "\n".join([p.get_text("text") or "" for p in doc])
+                doc.close()
+            except Exception:
+                raise HTTPException(400, "PDF 텍스트 추출 실패")
+
+            if not text.strip():
+                raise HTTPException(400, "PDF 본문이 비어 있습니다.")
+
+            # 정규식 결과 수집
+            regex_res = match_text(text)
+            regex_spans = []
+            for it in (regex_res.get("items", []) or []):
+                s, e = it.get("start"), it.get("end")
+                if s is not None and e is not None and e > s:
+                    regex_spans.append({
+                        "start": int(s),
+                        "end": int(e),
+                        "label": it.get("rule"),
+                        "source": "regex",
+                    })
+
+            # NER 실행 + 정책 병합
+            policy = dict(DEFAULT_POLICY)
+            ner_spans = run_ner(text=text, policy=policy)
+
+            merger = MergePolicy(policy)
+            final_spans, report = merger.merge(text, regex_spans, ner_spans)
+
+            # 병합된 스팬으로 PDF 텍스트 레닥션
+            out = pdf_module.apply_text_redaction(file_bytes, extra_spans=final_spans)
             mime = "application/pdf"
+
         elif ext in (".docx", ".pptx", ".xlsx", ".hwpx"):
             with tempfile.TemporaryDirectory() as tmpdir:
                 src_path = os.path.join(tmpdir, f"src{ext}")
@@ -40,12 +94,14 @@ async def redact_file(file: UploadFile = File(...)):
                 with open(dst_path, "rb") as f:
                     out = f.read()
             mime = "application/zip"
+
         else:
             raise HTTPException(400, f"지원하지 않는 포맷: {ext}")
-    
+
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-        print("🔥 [레닥션 오류 발생]")
+        print(" [레닥션 오류 발생]")
         traceback.print_exc()
         raise HTTPException(500, f"{ext} 처리 중 오류: {e}")
 
@@ -57,4 +113,3 @@ async def redact_file(file: UploadFile = File(...)):
         media_type=mime,
         headers={"Content-Disposition": f'attachment; filename="{encoded_fileName}"'}
     )
-
