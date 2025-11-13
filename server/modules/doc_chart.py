@@ -430,7 +430,12 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
             header_len += 4
 
         text_bytes = x.cch * (2 if x.fHigh else 1)
-        pos += max(1, header_len + text_bytes)
+
+        advance = header_len + text_bytes
+        if advance <= 0:
+            advance = 1
+
+        pos += advance
 
     wb[payload_off:end] = payloads[0]
 
