@@ -6,14 +6,12 @@ import tempfile
 import olefile
 from typing import List, Dict, Any, Tuple, Optional
 
-from server.core.redaction_rules import apply_redaction_rules
 from server.core.normalize import normalization_text, normalization_index
 from server.core.matching import find_sensitive_spans
-from server.modules.doc_chart import redact_workbooks
+from server.modules.doc_chart import redact_workbooks, extract_chart_texts
 
-# ─────────────────────────────
-# 유틸: 리틀엔디언 헬퍼
-# ─────────────────────────────
+
+# 리틀엔디언 헬퍼
 def le16(b: bytes, off: int) -> int:
     return struct.unpack_from("<H", b, off)[0]
 
@@ -108,15 +106,15 @@ def decode_piece(chunk: bytes, fCompressed: bool) -> str:
         return ""
 
 
-# ─────────────────────────────
+
 # Word 텍스트 추출
-# ─────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
     try:
         word_data, table_data = read_streams(file_bytes)
         if not word_data or not table_data:
             return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
 
+        # Word 본문
         clx = get_clx_data(word_data, table_data)
         plcpcd = extract_plcpcd(clx or b"")
         pieces = parse_plcpcd(plcpcd)
@@ -128,17 +126,33 @@ def extract_text(file_bytes: bytes) -> dict:
                 continue
             texts.append(decode_piece(word_data[start:end], p["fCompressed"]))
 
-        raw_text = "".join(texts)
+        raw_word_text = "".join(texts)
+
+
+        # Chart 텍스트 합치기
+        chart_texts = extract_chart_texts(file_bytes)
+        if chart_texts:
+            print(f"[INFO] extracted {len(chart_texts)} chart texts")
+            raw_text = raw_word_text + "\n" + "\n".join(chart_texts)
+        else:
+            raw_text = raw_word_text
+
         normalized = normalization_text(raw_text)
-        return {"full_text": normalized, "raw_text": raw_text, "pages": [{"page": 1, "text": normalized}]}
+
+        return {
+            "full_text": normalized,
+            "raw_text": raw_text,
+            "pages": [{"page": 1, "text": normalized}]
+        }
+
     except Exception as e:
         print(f"[ERR] DOC 추출 중 예외: {e}")
         return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
-# ─────────────────────────────
+
+
 # 탐지 span 보정(분리)
-# ─────────────────────────────
 def split_matches(matches, text):
     new_matches = []
     for s, e, val, meta in matches:
@@ -157,9 +171,8 @@ def split_matches(matches, text):
     return new_matches
 
 
-# ─────────────────────────────
+
 # Word 본문 레닥션
-# ─────────────────────────────
 def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replacement_char: str = "*") -> bytes:
     try:
         word_data, table_data = read_streams(file_bytes)
@@ -196,9 +209,8 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
         return file_bytes
 
 
-# ─────────────────────────────
+
 # OLE 파일 교체
-# ─────────────────────────────
 def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
@@ -222,9 +234,7 @@ def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> byt
         return original_file_bytes
 
 
-# ─────────────────────────────
 # 전체 레닥션 프로세스
-# ─────────────────────────────
 def redact_word_document(file_bytes: bytes) -> bytes:
     try:
         data = extract_text(file_bytes)
