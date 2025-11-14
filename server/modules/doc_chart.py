@@ -8,13 +8,13 @@ def le32(b, off): return struct.unpack_from("<I", b, off)[0]
 
 
 def iter_biff_records(data: bytes):
-    off, n = 0, len(data); idx = 0
+    off, n = 0, len(data)
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
         off += 4
         payload = data[off:off + length]
         yield off - 4, opcode, length, payload
-        off += length; idx += 1
+        off += length
 
 
 def coalesce_with_continue(biff_bytes: bytes, off: int) -> Tuple[bytes, List[Tuple[int, int]], int]:
@@ -430,7 +430,12 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
             header_len += 4
 
         text_bytes = x.cch * (2 if x.fHigh else 1)
-        pos += max(1, header_len + text_bytes)
+
+        advance = header_len + text_bytes
+        if advance <= 0:
+            advance = 1
+
+        pos += advance
 
     wb[payload_off:end] = payloads[0]
 
