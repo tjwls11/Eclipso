@@ -85,7 +85,7 @@ RULES = {
     },
     "driver_license": {
         "regex": DRIVER_RE,
-        "validator": lambda v, _opts=None: True,
+        "validator": is_valid_driver_license
     },
 }
 
