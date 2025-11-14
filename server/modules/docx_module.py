@@ -21,21 +21,25 @@ from server.core.schemas import XmlMatch, XmlLocation
 # ─────────────────────
 # 차트/임베디드 XLSX 텍스트 수집(후처리 정규화는 cleanup_text 일원화)
 # ─────────────────────
-def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
+def _collect_chart_texts(zipf: zipfile.ZipFile, main_seen: set[str]) -> str:
     parts: List[str] = []
 
     for name in sorted(
         n for n in zipf.namelist()
         if n.startswith("word/charts/") and n.endswith(".xml")
     ):
-        s = zipf.read(name).decode("utf-8", "ignore")
+        try:
+            s = zipf.read(name).decode("utf-8", "ignore")
+        except KeyError:
+            continue
+
         for m in re.finditer(
             r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>",
             s,
             re.I | re.DOTALL,
         ):
             text_part = m.group(1)
-            num_part = m.group(2)
+            num_part  = m.group(2)
             v = (text_part or num_part or "").strip()
             if not v:
                 continue
@@ -50,14 +54,39 @@ def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
     ):
         try:
             xlsx_bytes = zipf.read(name)
+        except KeyError:
+            continue
+
+        try:
             with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as xzf:
                 parts.append(xlsx_text_from_zip(xzf))
-        except KeyError:
-            pass
         except zipfile.BadZipFile:
             continue
 
-    return cleanup_text("\n".join(p for p in parts if p))
+    # 라인 단위 정리 + 차트 전용 필터 + 본문과의 중복 제거 + 차트 내부 중복 제거
+    filtered: List[str] = []
+    seen_chart: set[str] = set()
+
+    for line in cleanup_text("\n".join(parts)).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "<c:" in s:  # 차트 태그 조각 제거
+            continue
+        if re.fullmatch(r"항목\s*\d+", s):  # 라벨 제거
+            continue
+        if re.fullmatch(r"계열\s*\d+", s):  # 라벨 제거
+            continue
+        # 본문(document.xml)에서 이미 나온 줄과 중복이면 스킵 (본문 유지, 차트만 제거)
+        if s in main_seen:
+            continue
+        # 차트 내부에서도 같은 줄 중복되면 한 번만
+        if s in seen_chart:
+            continue
+        seen_chart.add(s)
+        filtered.append(s)
+
+    return "\n".join(filtered)
 
 
 # ─────────────────────
@@ -77,7 +106,7 @@ def docx_text(zipf: zipfile.ZipFile) -> str:
         )
         text_in_p = cleanup_text(text_in_p)
         if text_in_p:
-            lines.append(text_in_p)
+            main_lines.append(text_in_p)
 
     text_main = "\n".join(lines)
     text_charts = _collect_chart_texts(zipf)
