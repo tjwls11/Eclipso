@@ -71,16 +71,14 @@ def _collect_chart_texts(zipf: zipfile.ZipFile, main_seen: set[str]) -> str:
         s = line.strip()
         if not s:
             continue
-        if "<c:" in s:  # 차트 태그 조각 제거
+        if "<c:" in s:
             continue
-        if re.fullmatch(r"항목\s*\d+", s):  # 라벨 제거
+        if re.fullmatch(r"항목\s*\d+", s):
             continue
-        if re.fullmatch(r"계열\s*\d+", s):  # 라벨 제거
+        if re.fullmatch(r"계열\s*\d+", s):
             continue
-        # 본문(document.xml)에서 이미 나온 줄과 중복이면 스킵 (본문 유지, 차트만 제거)
         if s in main_seen:
             continue
-        # 차트 내부에서도 같은 줄 중복되면 한 번만
         if s in seen_chart:
             continue
         seen_chart.add(s)
@@ -98,7 +96,7 @@ def docx_text(zipf: zipfile.ZipFile) -> str:
     except KeyError:
         xml = ""
 
-    lines: List[str] = []
+    main_lines: List[str] = []
     for p_xml in re.finditer(r"<w:p[^>]*>(.*?)</w:p>", xml, re.DOTALL):
         body = p_xml.group(1)
         text_in_p = "".join(
@@ -108,20 +106,15 @@ def docx_text(zipf: zipfile.ZipFile) -> str:
         if text_in_p:
             main_lines.append(text_in_p)
 
-    text_main = "\n".join(lines)
-    text_charts = _collect_chart_texts(zipf)
-    merged = cleanup_text("\n".join(x for x in [text_main, text_charts] if x))
+    main_text = "\n".join(main_lines)
+    main_seen = {ln.strip() for ln in main_lines if ln.strip()}
 
-    filtered_lines: List[str] = []
-    for line in merged.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if "<c:" in s:  # 잔여 차트 태그 라인 방지
-            continue
-        filtered_lines.append(line)
+    chart_text = _collect_chart_texts(zipf, main_seen)
 
-    return "\n".join(filtered_lines)
+    merged = "\n".join([main_text, chart_text] if chart_text else [main_text])
+    merged = cleanup_text(merged)
+
+    return merged
 
 
 # ─────────────────────
