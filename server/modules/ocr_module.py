@@ -111,10 +111,6 @@ def _merge_card_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
 # 이미지/OCR 헬퍼
 # ─────────────────────────────────────────────────────────────
 def _page_to_image_rgb(page: fitz.Page, zoom: float = 2.0) -> tuple[np.ndarray, float, float]:
-    """
-    PDF 페이지를 RGB 이미지로 렌더링.
-    return: (이미지 배열, width, height)
-    """
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img_w, img_h = pix.width, pix.height
@@ -128,11 +124,6 @@ def ocr_boxes_for_page(
     patterns: List[PatternItem] | None = None,
     min_score: float = 0.5,
 ) -> List[Box]:
-    """
-    단일 페이지를 OCR 돌려서 Box 리스트로 반환.
-    아직 detect_boxes_from_patterns에는 연결 안 했고,
-    필요 시 별도로 호출해서 테스트할 수 있는 헬퍼.
-    """
     page = doc.load_page(page_index)
     page_rect = page.rect
     page_w, page_h = page_rect.width, page_rect.height
@@ -194,6 +185,7 @@ def ocr_boxes_for_page(
 def detect_boxes_from_patterns(
     pdf_bytes: bytes,
     patterns: List[PatternItem] | None,
+    use_ocr: bool = True,
 ) -> List[Box]:
     comp = compile_rules()
     allowed_names = _normalize_pattern_names(patterns)
@@ -210,7 +202,9 @@ def detect_boxes_from_patterns(
     boxes: List[Box] = []
 
     try:
-        for pno, page in enumerate(doc):
+        page_count = len(doc)
+        for pno in range(page_count):
+            page = doc.load_page(pno)
             raw_text = page.get_text("text") or ""
             text = cleanup_text(raw_text)
             if not text:
@@ -232,7 +226,6 @@ def detect_boxes_from_patterns(
 
                     ok = _is_valid_value(need_valid, validator, val)
 
-                    # 통계
                     if ok:
                         stats_ok[rule_name] = stats_ok.get(rule_name, 0) + 1
                     else:
@@ -252,7 +245,6 @@ def detect_boxes_from_patterns(
                     if not rects:
                         continue
 
-                    # 카드번호(특히 하이픈 없는 형태) → 줄 단위로만 합치기
                     if rule_name == "card" and "-" not in val and len(rects) > 1:
                         rects = _merge_card_rects(rects)
 
@@ -266,6 +258,19 @@ def detect_boxes_from_patterns(
                         boxes.append(
                             Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
                         )
+
+        # --- 2) OCR 기반 탐지 추가 ---
+        if use_ocr:
+            for pno in range(page_count):
+                ocr_bs = ocr_boxes_for_page(doc, pno, patterns)
+                for b in ocr_bs:
+                    print(
+                        f"{log_prefix}[OCR] BOX",
+                        "page=", pno + 1,
+                        "rect=", (b.x0, b.y0, b.x1, b.y1),
+                    )
+                boxes.extend(ocr_bs)
+
     finally:
         doc.close()
 

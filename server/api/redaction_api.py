@@ -154,7 +154,6 @@ def match_text(text: str):
                 value = m.group(0)
 
                 # --- validator로 OK / FAIL 판단 -------------------
-                # need_valid가 True이고 validator가 붙어 있으면 유효성 검사 실행
                 is_valid = True
                 if need_valid:
                     is_valid = _run_validator(value, validator)
@@ -164,7 +163,7 @@ def match_text(text: str):
                 ctx_start = max(0, start - 20)
                 ctx_end = min(len(text), end + 20)
 
-                # ⚠️ 유효/무효와 상관없이 "정규식에 한 번 걸렸으면" 전부 기록
+                #유효/무효와 상관없이 "정규식에 한 번 걸렸으면" 전부 기록
                 matches.append(
                     {
                         "rule": rule_name,
