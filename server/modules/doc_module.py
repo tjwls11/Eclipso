@@ -131,6 +131,8 @@ def extract_text(file_bytes: bytes) -> dict:
 
         # Chart 텍스트 합치기
         chart_texts = extract_chart_texts(file_bytes)
+        print("=== [DEBUG] chart_texts ===", chart_texts)  #디버깅용
+
         if chart_texts:
             print(f"[INFO] extracted {len(chart_texts)} chart texts")
             raw_text = raw_word_text + "\n" + "\n".join(chart_texts)
@@ -261,7 +263,6 @@ def redact_word_document(file_bytes: bytes) -> bytes:
 
 
 def redact(file_bytes: bytes) -> bytes:
-    """1) Word 본문 레닥션 → 2) ObjectPool Workbook(BIFF) 레닥션"""
     redacted_doc = redact_word_document(file_bytes)
     redacted_doc = redact_workbooks(redacted_doc)
     return redacted_doc

@@ -140,8 +140,78 @@ def fallback_redact(wb: bytearray, off: int, length: int, single_byte_codec="cp9
     return red
 
 
+# 차트 텍스트 추출 
+def extract_chart_texts(file_bytes: bytes, single_byte_codec="cp949") -> List[str]:
+    texts = []
 
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+
+            for entry in ole.listdir():
+                if len(entry) < 2:
+                    continue
+
+                top = entry[0]
+                name = entry[-1]
+
+                # Workbook(BIFF)
+                if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
+                    wb_data = ole.openstream(entry).read()
+                    wb = bytearray(wb_data)
+
+                    for rec_off, opcode, length, payload in iter_biff_records(wb):
+                        if opcode not in CHART_STRING_LIKE:
+                            continue
+
+                        payload_end = rec_off + 4 + length
+                        payload_bytes = [wb[rec_off+4:payload_end]]
+
+                        # CONTINUE record도 포함
+                        next_off = payload_end
+                        while next_off + 4 <= len(wb):
+                            op, ln = struct.unpack_from("<HH", wb, next_off)
+                            if op != 0x003C:
+                                break
+                            payload_bytes.append(wb[next_off+4:next_off+4+ln])
+                            next_off += 4 + ln
+
+                        # 실제 텍스트 디코드
+                        pos = 0
+                        while pos < len(payload_bytes[0]):
+                            x = XLUCS()
+                            if not x.try_parse_at(payload_bytes, 0, pos):
+                                pos += 1
+                                continue
+
+                            txt = x.decode_text(single_byte_codec).strip()
+                            if txt:
+                                texts.append(txt)
+
+                            # 다음 위치로 이동
+                            header_len = 3
+                            if x.flags & 0x08:
+                                header_len += 2
+                            if x.flags & 0x04:
+                                header_len += 4
+                            advance = header_len + x.cch * (2 if x.fHigh else 1)
+                            if advance <= 0:
+                                advance = 1
+                            pos += advance
+
+                #  EPRINT는 스킵
+                if top == "ObjectPool" and name == "\x03EPRINT":
+                    pass
+
+    except Exception as e:
+        print(f"[ERR] extract_chart_texts: {e}")
+
+    return texts
+
+
+
+# ─────────────────────────────
 # EPRINT 레닥션 부분
+# ─────────────────────────────
 EMR_EXTTEXTOUTA  = 0x53
 EMR_EXTTEXTOUTW  = 0x54
 EMR_POLYTEXTOUTA = 0x60
@@ -373,7 +443,7 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
 # ─────────────────────────────
 # 메인 스캔 함수
 # ─────────────────────────────
-CHART_STRING_LIKE = {0x0004, 0x041E, 0x100D, 0x1025, 0x104B, 0x105C, 0x1024, 0x1026}
+CHART_STRING_LIKE = {0x100D, 0x1025, 0x0004}
 
 def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single_byte_codec="cp949") -> int:
     end = payload_off + length
@@ -398,7 +468,7 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
             continue
 
         text = x.decode_text(single_byte_codec).strip()
-        print(f"[DEBUG] opcode text candidate: {repr(text)} (len={len(text)} fHigh={x.fHigh})")
+        print(f"-----[DEBUG] opcode text candidate: {repr(text)} (len={len(text)} fHigh={x.fHigh})---- (아래부분 확인)")
 
         if text and find_sensitive_spans(normalization_text(text)):
             print(f"[DEBUG!!!] match found in: {repr(text)}")
@@ -532,72 +602,3 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
         print(f"[ERR] redact_workbooks exception: {e}")
         return file_bytes
 
-
-# ─────────────────────────────
-# 차트 텍스트 추출 전용 함수 (UI 표시용)
-# ─────────────────────────────
-def extract_chart_texts(file_bytes: bytes, single_byte_codec="cp949") -> List[str]:
-    texts = []
-
-    try:
-        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-
-            for entry in ole.listdir():
-                if len(entry) < 2:
-                    continue
-
-                top = entry[0]
-                name = entry[-1]
-
-                # ───────── Workbook(BIFF) ────────
-                if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
-                    wb_data = ole.openstream(entry).read()
-                    wb = bytearray(wb_data)
-
-                    for rec_off, opcode, length, payload in iter_biff_records(wb):
-                        if opcode not in CHART_STRING_LIKE:
-                            continue
-
-                        payload_end = rec_off + 4 + length
-                        payload_bytes = [wb[rec_off+4:payload_end]]
-
-                        # CONTINUE record도 포함
-                        next_off = payload_end
-                        while next_off + 4 <= len(wb):
-                            op, ln = struct.unpack_from("<HH", wb, next_off)
-                            if op != 0x003C:
-                                break
-                            payload_bytes.append(wb[next_off+4:next_off+4+ln])
-                            next_off += 4 + ln
-
-                        # 실제 텍스트 디코드
-                        pos = 0
-                        while pos < len(payload_bytes[0]):
-                            x = XLUCS()
-                            if not x.try_parse_at(payload_bytes, 0, pos):
-                                pos += 1
-                                continue
-
-                            txt = x.decode_text(single_byte_codec).strip()
-                            if txt:
-                                texts.append(txt)
-
-                            # 다음 위치로 이동
-                            header_len = 3
-                            if x.flags & 0x08:
-                                header_len += 2
-                            if x.flags & 0x04:
-                                header_len += 4
-                            advance = header_len + x.cch * (2 if x.fHigh else 1)
-                            if advance <= 0:
-                                advance = 1
-                            pos += advance
-
-                # ───────── EPRINT 스킵 ────────
-                if top == "ObjectPool" and name == "\x03EPRINT":
-                    pass
-
-    except Exception as e:
-        print(f"[ERR] extract_chart_texts: {e}")
-
-    return texts
