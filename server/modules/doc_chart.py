@@ -64,112 +64,145 @@ def coalesce_continue(biff_bytes: bytes, off: int) -> Tuple[bytes, List[Tuple[in
     return merged, segs, cur_off
 
 
+# XLUCS 가 청크 단위로 넘나들기 위한 함수
+def collect_continue_chuncks(biff: bytes, off: int):
+    chunks = []
+    segs = []
+
+    cur_off = off
+    n = len(biff)
+
+    # first TEXT_LIKE payload 
+    op, ln = struct.unpack_from("<HH", biff, cur_off)
+    if op == 0x003C:
+        return [], []
+    
+    payload_off = cur_off + 4
+    payload_end = payload_off + ln
+    chunks.append(biff[payload_off:payload_end])
+    segs.append((payload_off, payload_end))
+
+    cur_off = payload_end
+    
+    # continue 탐색
+    while cur_off + 4 <= n:
+        op, ln = struct.unpack_from("<HH", biff, cur_off)
+        if op != 0x003C:
+            break
+
+        payload_off = cur_off + 4
+        payload_end = payload_off + ln
+
+        chunks.append(biff[payload_off:payload_end])
+        segs.append((payload_off, payload_end))
+
+        cur_off = payload_end
+    
+    return chunks, segs
+
+
+# 청크 전체를 하나의 연속된 버퍼처럼 봐 pos 부터 need 바이트 모아서 반환
+def read_bytes_fChunks(chunks: List[bytes], pos: int, need: int) -> Optional[bytes]:
+    out = bytearray()
+    ch_idx = 0    # 현재 청크 인덱스
+    local = pos   # 해당 청크 내부 offset
+
+    while ch_idx < len(chunks):
+        if local < len(chunks[ch_idx]):
+            break
+        local -= len(chunks[ch_idx])
+        ch_idx += 1
+
+    if ch_idx >= len(chunks):
+        return None
+    
+    # need 바이트 채울때까지 여러 청크에서 이어 붙이기
+    while ch_idx < len(chunks) and len(out) < need:
+        remain_chunk = len(chunks[ch_idx]) - local
+        take = min(need - len(out), remain_chunk)
+        out.extend(chunks[ch_idx][local:local+take])
+        ch_idx += 1
+        local = 0 #다음 청크부터는 0부터 시작
+
+    if len(out) < need:
+        return None
+    
+    return bytes(out)
+
+
+
 class XLUCS:
-    __slots__ = ("cch", "flags", "fHigh", "fExt", "fRich", "cRun", "cbExtRst", "text_lo", "text_hi", "buf")
+    __slots__ = ("cch", "flags", "fHigh", "fExt", "fRich", "cRun", "cbExtRst", "text_lo", "text_hi", "buf", "chunks")
 
-    def try_parse_at(self, payloads: list[bytes], start_idx: int, start_off: int) -> bool:
-        data = payloads[start_idx]
-        n = len(data)
-        pos = start_off
-
-        # 최소 3바이트는 있어야 문자열 헤더라고 판단 (cch(2) + flags(1))
-        if pos + 3 > n:
-            return False
+    def try_parse_chunks(self, chunks: List[bytes], pos: int) -> bool:
+        n_header = read_bytes_fChunks(chunks, pos, 3)
+        if n_header is None:
+            return False 
         
-        cch = le16(data, pos)
-        pos += 2
+        cch = le16(n_header, 0)
+        flags = n_header[2]
 
-        flags = data[pos]
-        pos += 1
+        fHigh = flags & 0x01        # 인코딩 플래그
+        fExt = (flags >> 2) & 0x01  # ExtRst
+        fRich = (flags >> 3) & 0x01 # Rich Text Run
 
-        fHigh = flags & 0x01        # 1이면 utf-16, 0이면 cp949
-        fExt = (flags >> 2) & 0x01  # 확장 정보 포함 여부
-        fRich = (flags >> 3) & 0x01 # 서식 정보 포함 여부
+        pos_cur = pos + 3
 
-        # Rich text run 개수, ExtRst 길이 읽기
+        #Rich Text Run 개수
         cRun = 0
-        cbExtRst = 0
-
-        if fRich:
-            if pos + 2 > n:
+        if fRich: 
+            raw = read_bytes_fChunks(chunks, pos_cur, 2)
+            if raw is None:
                 return False
-            cRun = le16(data, pos)
-            pos += 2
+            cRun = le16(raw, 0)
+            pos_cur += 2
 
+        #ExtRst 길이
+        cbExtRst = 0 
         if fExt:
-            if pos + 4 > n:
-                return False 
-            cbExtRst = le32(data, pos)
-            pos += 4
+            raw = read_bytes_fChunks(chunks, pos_cur, 4)
+            if raw is None:
+                return False
+            cbExtRst = le32(raw, 0)
+            pos_cur += 4
 
+
+        # 본문
         bpc = 2 if fHigh else 1
-        need_bytes = cch * bpc
-        
-        # 텍스트 범위가 페이로드 내부에 존재해야 정상구조
-        if pos + need_bytes > n:
-            return False
-        
-        text_lo = pos
-        text_hi = pos + need_bytes
+        text_bytes = cch * bpc
 
-        self.cch = cch
-        self.flags = flags
-        self.fHigh = fHigh
-        self.fExt = fExt
-        self.fRich = fRich 
-        self.cRun = cRun 
+        raw_text = read_bytes_fChunks(chunks, pos_cur, text_bytes)
+        if raw_text is None:
+            return False
+
+        # 필드 셋팅
+        self.cch      = cch
+        self.flags    = flags
+        self.fHigh    = fHigh
+        self.fExt     = fExt
+        self.fRich    = fRich
+        self.cRun     = cRun
         self.cbExtRst = cbExtRst
-        self.text_lo = text_lo 
-        self.text_hi = text_hi 
-        self.buf = data
+
+        # offset 기준으로 텍스트 위치와 길이 기록
+        self.text_lo = pos_cur    # 시작 오프셋
+        self.text_hi = pos_cur + text_bytes # 길이
+
+        # 디코딩을 위해 raw는 buf에 저장
+        self.buf = bytearray(raw_text)
+        self.chunks = chunks
 
         return True
 
-    def decode_text(self, single_byte_enc: str = "cp949") -> str:
-        raw = self.buf[self.text_lo:self.text_hi]
+    def decode_text(self, single_bytes_enc: str = "cp949") -> str:
+        raw = bytes(self.buf)
 
         if not self.fHigh and len(raw) >= 4 and raw[1] == 0x00 and raw[3] == 0x00:
             enc = "utf-16le"
         else:
-            enc = "utf-16le" if self.fHigh else single_byte_enc
-
+            enc = "utf-16le" if self.fHigh else single_bytes_enc
+        
         return raw.decode(enc, errors="ignore")
-
-
-def fallback_redact(buf: bytearray, single_byte_enc="cp949") -> int:
-    seg = buf[:]  # 전체 buf에서 찾기
-
-    patterns = [
-        (re.compile(rb"[ -~]{5,}"), single_byte_enc),
-        (re.compile(rb"(?:[\x20-\x7E]\x00){5,}"), "utf-16le"),
-    ]
-
-    red = 0
-
-    for pat, enc in patterns:
-        for m in pat.finditer(seg):
-            seq = m.group(0)
-
-            try:
-                text = seq.decode(enc, errors="ignore")
-
-                if not text.strip():
-                    continue
-
-                if find_sensitive_spans(normalization_text(text)):
-                    if enc == "utf-16le":
-                        repl = ("*" * len(text)).encode("utf-16le")
-                        repl = repl[:len(seq)]
-                    else:
-                        repl = b"*" * len(seq)
-
-                    s, e = m.start(), m.end()
-                    buf[s:e] = repl
-                    red += 1
-            except:
-                pass
-    
-    return red
 
 
 
@@ -247,102 +280,168 @@ def extract_chart_text(file_bytes:bytes, single_byte_enc="cp949") -> List[str]:
     return texts
 
 
+def write_chunk_mask(chunks, lo, masked):
+    remain = len(masked)
+    ch_idx = 0
+    local = lo
 
-CHART_STRING_LIKE = {0x100D, 0x1025, 0x0004}
-def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single_byte_codec="cp949") -> int:
-    rec_off = payload_off - 4
-    merged, segs, next_rec_off = coalesce_continue(wb, rec_off)
+    # local offset 계산
+    while ch_idx < len(chunks) and local >= len(chunks[ch_idx]):
+        local -= len(chunks[ch_idx])
+        ch_idx += 1
 
-    if not segs:
-        return 0
-    
-    buf = bytearray(merged)
-    n = len(buf)
-    pos = 0
+    while ch_idx < len(chunks) and remain > 0:
+        take = min(remain, len(chunks[ch_idx]) - local)
+        chunks[ch_idx][local:local+take] = masked[:take]
+        masked = masked[take:]
+        remain -= take
+        ch_idx += 1
+        local = 0
+
+
+def fallback_redact(buf: bytearray, single_byte_enc="cp949") -> int:
+    seg = buf[:]  # 전체 buf에서 찾기
+
+    patterns = [
+        (re.compile(rb"[ -~]{5,}"), single_byte_enc),
+        (re.compile(rb"(?:[\x20-\x7E]\x00){5,}"), "utf-16le"),
+    ]
+
     red = 0
 
-    # 병합된 buf에서만 XLUCS 파싱/마스킹 수행
-    while pos < n:
-        x = XLUCS()
+    for pat, enc in patterns:
+        for m in pat.finditer(seg):
+            seq = m.group(0)
 
-        # 현재 pos 위치에서 XLUCS 시도
-        if not x.try_parse_at([buf], 0, pos):
-            # 파싱 실패 시 한 바이트 옮겨서 재시도
-            pos += 1
-            continue
+            try:
+                text = seq.decode(enc, errors="ignore")
 
-        # 문자열 디코드
-        text = x.decode_text(single_byte_codec).strip()
-        print(f"[DEBUG-MERGED] candidate={repr(text)} (len={len(text)} fHigh={x.fHigh})")
+                if not text.strip():
+                    continue
 
-        # 민감정보 검출
-        if text and find_sensitive_spans(normalization_text(text)):
-            print(f"[DEBUG!!!] MATCHED in merged: {repr(text)}")
+                if find_sensitive_spans(normalization_text(text)):
+                    if enc == "utf-16le":
+                        repl = ("*" * len(text)).encode("utf-16le")
+                        repl = repl[:len(seq)]
+                    else:
+                        repl = b"*" * len(seq)
 
-            raw_len = x.text_hi - x.text_lo  # 실제 텍스트 영역의 raw 바이트 길이
-
-            masked = ("*" * len(text)).encode("utf-16le" if x.fHigh else single_byte_codec)
-
-            masked = masked[:raw_len].ljust(raw_len, b'*')
-
-            buf[x.text_lo:x.text_hi] = masked
-            red += 1
-
-        header_len = 3      
-        if x.flags & 0x08:  # fRich
-            header_len += 2
-        if x.flags & 0x04:  # fExt
-            header_len += 4
-
-        text_bytes = x.cch * (2 if x.fHigh else 1)
-        advance = header_len + text_bytes
-
-        # Rich text run 데이터 (run당 4바이트)
-        if x.fRich:
-            advance += x.cRun * 4
-
-        # ExtRst 데이터
-        if x.fExt:
-            advance += x.cbExtRst
-
-        pos += advance
-
-
-    if red == 0:
-        red += fallback_redact(buf, single_byte_codec)
-
-    # 병합 버퍼(buf)에서 수정된 내용을 원본 BIFF(wb)에 다시 반영
-    write_pos = 0
-    for payload_lo, payload_hi in segs:
-        segment_len = payload_hi - payload_lo
-        wb[payload_lo:payload_hi] = buf[write_pos:write_pos + segment_len]
-        write_pos += segment_len
-
+                    s, e = m.start(), m.end()
+                    buf[s:e] = repl
+                    red += 1
+            except:
+                pass
+    
     return red
 
 
 
-# BIFF 전체 처리 (Workbook 스트림 수준)
+def write_back_fallback(chunks, fb_buf):
+    p = 0
+    for i, c in enumerate(chunks):
+        ln = len(c)
+        chunks[i] = bytearray(fb_buf[p:p+ln])
+        p += ln
+
+
+def write_chunks_back_to_wb(wb, chunks, segs):
+    merged = b"".join(chunks)
+    p = 0
+    for lo, hi in segs:
+        ln = hi - lo
+        wb[lo:hi] = merged[p:p+ln]
+        p += ln
+
+
+
+CHART_STRING_LIKE = {0x100D, 0x1025, 0x0004}
+def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single_byte_codec="cp949") -> int:
+    rec_off = payload_off - 4
+
+    # TEXT + CONTINUE 레코드 조각 모으기
+    chunks, segs = collect_continue_chuncks(wb, rec_off)
+    if not chunks:
+        return 0
+
+    # 전체길이 = 모든 chunks 길이 합
+    total_len = sum(len(c) for c in chunks)
+
+    pos = 0
+    red = 0
+
+    while pos < total_len:
+        x = XLUCS()
+
+        if not x.try_parse_chunks(chunks, pos):
+            pos += 1
+            continue
+
+
+        text = x.decode_text(single_byte_codec).strip()
+
+        if text and find_sensitive_spans(normalization_text(text)):
+            print(f"[MERGED-CHUNK] matched: {repr(text)} at pos={pos}")
+
+            enc = "utf-16le" if x.fHigh else single_byte_codec
+            masked = ("*" * len(text)).encode(enc)
+            raw_len = x.text_hi - x.text_lo
+            masked = masked[:raw_len].ljust(raw_len, b'*')
+
+            write_chunk_mask(chunks, x.text_lo, masked)
+
+            red += 1
+
+        header_len = 3
+        if x.fRich:
+            header_len += 2
+            header_len += x.cRun * 4
+
+        if x.fExt:
+            header_len += 4
+            header_len += x.cbExtRst
+
+        text_bytes = x.cch * (2 if x.fHigh else 1)
+        advance = header_len + text_bytes
+
+        pos += advance
+
+    # XLUCS에서 아무 것도 없었으면 fallback 실행
+    if red == 0:
+        # 청크 전체를 단일 버퍼처럼 보고 fallback
+        fb_buf = bytearray(b"".join(chunks))
+        fb = fallback_redact(fb_buf, single_byte_codec)
+        red += fb
+
+        if fb > 0:
+            # fallback 마스킹을 chunks에 다시 분배
+            write_back_fallback(chunks, fb_buf)
+
+    write_chunks_back_to_wb(wb, chunks, segs)
+
+    return red
+
+
 def redact_biff_stream(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
     wb = bytearray(biff_bytes)
     total = 0
 
     # BIFF 전체 레코드 순회
     for rec_off, opcode, length, payload in iter_biff_records(wb):
+        # 차트 관련 문자열 레코드만 처리
         if opcode in CHART_STRING_LIKE and length > 0:
-            print(f" ------ [REC] opcode=0x{opcode:04X} len={length} ------")
+            print(f"[REC] opcode=0x{opcode:04X} len={length}")
             try:
-                # 이 레코드 + CONTINUE 병합 후 레닥션
+                # 이 레코드(payload) + CONTINUE 병합 → 문자열 레닥션
                 cnt = scan_and_redact_payload(wb, rec_off+4, length, single_byte_codec)
                 total += cnt
-                print(f"[CHART OK] opcode=0x{opcode:04X} → {cnt} texts redacted")
+                print(f"[CHART] opcode=0x{opcode:04X} → {cnt} texts redacted")
             except Exception as e:
                 print(f"[WARN] opcode=0x{opcode:04X} exception: {e}")
 
     if total:
         print(f"[CHART] total {total} strings redacted")
     else:
-        print("[CHART ERR] 레닥션 없음")
+        print("[CHART] no redactions")
 
     return bytes(wb)
 
