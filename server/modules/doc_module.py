@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Tuple, Optional
 
 from server.core.normalize import normalization_text, normalization_index
 from server.core.matching import find_sensitive_spans
-from server.modules.doc_chart import redact_workbooks, extract_chart_texts
+from server.modules.doc_chart import redact_workbooks, extract_chart_text
 
 
 # 리틀엔디언 헬퍼
@@ -130,7 +130,7 @@ def extract_text(file_bytes: bytes) -> dict:
 
 
         # Chart 텍스트 합치기
-        chart_texts = extract_chart_texts(file_bytes)
+        chart_texts = extract_chart_text(file_bytes)
         print("=== [DEBUG] chart_texts ===", chart_texts)  #디버깅용
 
         if chart_texts:
