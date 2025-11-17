@@ -206,76 +206,66 @@ class XLUCS:
 
 
 
-def extract_chart_text(file_bytes:bytes, single_byte_enc="cp949") -> List[str]:
-    texts: List[str] = []
+def extract_chart_text(file_bytes: bytes, single_byte_enc="cp949") -> List[str]:
+    texts = []
 
     try:
-        # OLE Compound File 열기 (읽기 전용)
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
 
-            # 모든 OLE 엔트리 순회
             for entry in ole.listdir():
-                # 최소 2단계 이상의 경로(ObjectPool/Workbook 형태)가 아니면 스킵
                 if len(entry) < 2:
                     continue
 
-                top = entry[0] 
+                top = entry[0]
                 name = entry[-1]
 
+                # Workbook(BIFF)
                 if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
-                    # Workbook 스트림을 읽어서 BIFF 바이트 취득
                     wb_data = ole.openstream(entry).read()
                     wb = bytearray(wb_data)
 
-                    # BIFF 레코드 순회
-                    for rec_off, opcode, length, _payload in iter_biff_records(wb):
+                    # BIFF 순회
+                    for rec_off, opcode, length, payload in iter_biff_records(wb):
                         if opcode not in CHART_STRING_LIKE:
                             continue
 
-                        # 해당 레코드 + CONTINUE 레코드까지 병합
-                        merged, segs, _ = coalesce_continue(wb, rec_off)
-                        if not segs:
+                        # CONTINUE 포함 전체 청크 수집
+                        chunks, segs = collect_continue_chuncks(wb, rec_off)
+                        if not chunks:
                             continue
-                        
-                        buf = merged
 
+                        total_len = sum(len(c) for c in chunks)
                         pos = 0
-                        n = len(buf)
 
-                        while pos < n:
+                        while pos < total_len:
                             x = XLUCS()
 
-                            if not x.try_parse_at([buf], 0, pos):
+                            # CHUNKS 기반 파서
+                            if not x.try_parse_chunks(chunks, pos):
                                 pos += 1
                                 continue
 
-                            txt = x.decode_text(single_byte_enc).strip()
-                            if txt:
-                                texts.append(txt)
+                            text = x.decode_text(single_byte_enc).strip()
+                            if text:
+                                texts.append(text)
 
-                            # 다음 문자열 후보 위치로 이동하기 위해 현재 문자열 구조의 전체 길이를 계산
+                            # advance 계산 로직
                             header_len = 3
-                            if x.flags & 0x08: # fRich(0x08) 이면 cRun(2바이트) 존재
-                                header_len += 2
-                            if x.flags & 0x04: # fExt(0x04) 이면 cbExtRst(4바이트) 존재
-                                header_len += 4
+                            if x.fRich:
+                                header_len += 2 + x.cRun * 4
+                            if x.fExt:
+                                header_len += 4 + x.cbExtRst
 
                             text_bytes = x.cch * (2 if x.fHigh else 1)
                             advance = header_len + text_bytes
 
-                            if x.fRich:
-                                advance += x.cRun * 4
-
-                            if x.fExt:
-                                advance += x.cbExtRst 
-                            
                             pos += advance
 
                 if top == "ObjectPool" and name == "\x03EPRINT":
                     pass
 
     except Exception as e:
-            print(f"[ERR] extract_chart_text: {e}") # 예외 상황은 로그만 찍고 지금까지 수집분을 반환
+        print(f"[ERR] extract_chart_text: {e}")
 
     return texts
 
