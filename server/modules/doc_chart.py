@@ -131,11 +131,16 @@ def redact_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
         masked_text = "*" * len(text)
         new_st = build_short_xlucs(masked_text, cch, fHigh, single_byte_codec)
 
-        # 동일 payload 길이 유지
-        if st_off + len(new_st) > len(wb):
+        record_payload_start = rec_off + 4
+        record_payload_end = record_payload_start + length
+
+        # ShortXLUnicodeString은 reserved 뒤에 붙는 부분
+        if st_off + len(new_st) > record_payload_end:
+            # masked string이 record payload를 초과하면 BIFF 구조 깨짐
             continue
 
-        wb[st_off: st_off + len(new_st)] = new_st
+        # record payload 내에서만 덮어쓰기
+        wb[st_off : st_off + len(new_st)] = new_st
         red_total += 1
 
     if red_total:
@@ -402,59 +407,78 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
 def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
     try:
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-            modified = file_bytes
+            entries = ole.listdir()
+    except Exception as e:
+        print(f"[ERR] cannot scan OLE: {e}")
+        return file_bytes
 
-            for entry in ole.listdir():
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
+        tmp.write(file_bytes)
+        temp_path = tmp.name
+
+    # 실패 시 반드시 temp 삭제
+    def cleanup():
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    try:
+        # temp 파일을 write_mode 로 열어 모든 스트림 수정 시도
+        with olefile.OleFileIO(temp_path, write_mode=True) as olew:
+
+            for entry in entries:
                 if len(entry) < 2:
                     continue
 
                 top = entry[0]
                 name = entry[-1]
+                path_str = "/".join(entry)
 
-                # 1) Workbook(BIFF) 레닥션
+                # Workbook 스트림 수정
                 if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
-                    path_str = "/".join(entry)
-                    print(f"[INFO] found Workbook stream: {path_str}")
+                    print(f"[INFO] redact Workbook: {path_str}")
 
-                    wb_data = ole.openstream(entry).read()
-                    new_biff = redact_seriesTexts(wb_data, single_byte_codec)
+                    try:
+                        with olefile.OleFileIO(temp_path) as ole_r:
+                            wb_data = ole_r.openstream(entry).read()
 
-                    if new_biff != wb_data:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
-                            tmp.write(modified)
-                            temp_path = tmp.name
+                        new_biff = redact_seriesTexts(wb_data, single_byte_codec)
 
-                        with olefile.OleFileIO(temp_path, write_mode=True) as olew:
+                        if new_biff != wb_data:
                             olew.write_stream(path_str, new_biff)
-                            print(f"  [WRITE] replaced Workbook: {path_str}")
+                            print(f"  [WRITE] Workbook updated: {path_str}")
 
-                        with open(temp_path, "rb") as f:
-                            modified = f.read()
-                        os.remove(temp_path)
+                    except Exception as e:
+                        print(f"[ERR] Workbook redact failed: {e}")
+                        cleanup()
+                        return file_bytes  # 실패시 전체 원본 반환
 
-                # 2) EPRINT(EMF) 레닥션
+                # EPRINT 스트림 수정
                 if top == "ObjectPool" and name == "\x03EPRINT":
-                    path_str = "/".join(entry)
-                    print(f"[INFO] found EPRINT stream: {path_str}")
+                    print(f"[INFO] redact EPRINT: {path_str}")
 
-                    emf_data = ole.openstream(entry).read()
-                    new_emf = redact_emf_stream(emf_data)
+                    try:
+                        with olefile.OleFileIO(temp_path) as ole_r:
+                            emf_data = ole_r.openstream(entry).read()
 
-                    if new_emf != emf_data:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
-                            tmp.write(modified)
-                            temp_path = tmp.name
+                        new_emf = redact_emf_stream(emf_data)
 
-                        with olefile.OleFileIO(temp_path, write_mode=True) as olew:
+                        if new_emf != emf_data:
                             olew.write_stream(path_str, new_emf)
-                            print(f"  [WRITE] replaced EPRINT: {path_str}")
+                            print(f"  [WRITE] EPRINT updated: {path_str}")
 
-                        with open(temp_path, "rb") as f:
-                            modified = f.read()
-                        os.remove(temp_path)
+                    except Exception as e:
+                        print(f"[ERR] EPRINT redact failed: {e}")
+                        cleanup()
+                        return file_bytes   # 실패시 전체 원본 반환
 
-            return modified
+        # 전체 수정 성공
+        with open(temp_path, "rb") as f:
+            result = f.read()
+
+        cleanup()
+        return result
 
     except Exception as e:
-        print(f"[ERR] redact_workbooks exception: {e}")
+        print(f"[ERR] redact_workbooks unexpected: {e}")
+        cleanup()
         return file_bytes
