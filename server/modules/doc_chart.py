@@ -1,8 +1,7 @@
-import io, os, re, struct, tempfile, olefile
+import io, os, struct, tempfile, olefile
 from typing import Optional, List, Tuple
 from server.core.normalize import normalization_text
 from server.core.matching import find_sensitive_spans
-
 
 def le16(b, off):
     return struct.unpack_from("<H", b, off)[0]
@@ -10,11 +9,9 @@ def le16(b, off):
 def le32(b, off):
     return struct.unpack_from("<I", b, off)[0]
 
-
 # BIFF 레코드 반복자
 def iter_biff_records(data: bytes):
     off, n = 0, len(data)
-
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
         off += 4
@@ -23,160 +20,133 @@ def iter_biff_records(data: bytes):
         off += length
 
 
-# TEXT 계열 레코드 + CONTINUE 조각 모으기
-def collect_continue_chuncks(biff: bytes, off: int):
-    chunks: List[bytes] = []
-    segs: List[Tuple[int, int]] = []
 
-    cur_off = off
-    n = len(biff)
+# ShortXLUnicodeString
+def parse_short_xlucs(buf: bytes, off: int, single_byte_codec: str):
+    if off + 2 > len(buf):
+        raise ValueError("ShortXLUnicodeString header가 잘렸습니다.")
 
-    # first TEXT_LIKE payload
-    op, ln = struct.unpack_from("<HH", biff, cur_off)
-    # 첫 레코드가 CONTINUE면 비정상
-    if op == 0x003C:
-        return [], []
+    cch = buf[off]
+    flags = buf[off + 1]
+    fHigh = flags & 0x01
 
-    payload_off = cur_off + 4
-    payload_end = payload_off + ln
-    chunks.append(biff[payload_off:payload_end])
-    segs.append((payload_off, payload_end))
+    if fHigh:
+        byte_len = cch * 2
+        start = off + 2
+        end = start + byte_len
+        if end > len(buf):
+            raise ValueError("ShortXLUnicodeString UTF-16 payload가 잘렸습니다.")
+        raw = buf[start:end]
+        text = raw.decode("utf-16le", errors="ignore")
+    else:
+        byte_len = cch
+        start = off + 2
+        end = start + byte_len
+        if end > len(buf):
+            raise ValueError("ShortXLUnicodeString single-byte payload가 잘렸습니다.")
+        raw = buf[start:end]
+        text = raw.decode(single_byte_codec, errors="ignore")
 
-    cur_off = payload_end
-
-    # CONTINUE 레코드들 이어서 수집
-    while cur_off + 4 <= n:
-        op, ln = struct.unpack_from("<HH", biff, cur_off)
-        if op != 0x003C:  # CONTINUE 아님 → 종료
-            break
-
-        payload_off = cur_off + 4
-        payload_end = payload_off + ln
-
-        chunks.append(biff[payload_off:payload_end])
-        segs.append((payload_off, payload_end))
-
-        cur_off = payload_end
-
-    return chunks, segs
+    return text, cch, fHigh, 2 + byte_len
 
 
-# 여러 청크를 하나의 연속 버퍼처럼 읽기
-def read_bytes_fChunks(chunks: List[bytes], pos: int, need: int) -> Optional[bytes]:
-    out = bytearray()
-    ch_idx = 0
-    local = pos  # 논리 오프셋
+def build_short_xlucs(text: str, cch: int, fHigh: int, single_byte_codec: str) -> bytes:
+    assert len(text) == cch
 
-    # pos 가 속한 청크 찾기
-    while ch_idx < len(chunks):
-        if local < len(chunks[ch_idx]):
-            break
-        local -= len(chunks[ch_idx])
-        ch_idx += 1
+    flags = fHigh & 0x01
+    if fHigh:
+        rgb = text.encode("utf-16le")
+    else:
+        rgb = text.encode(single_byte_codec, errors="ignore")
 
-    if ch_idx >= len(chunks):
-        return None
-
-    # need 바이트 채울 때까지 이어 붙이기
-    while ch_idx < len(chunks) and len(out) < need:
-        remain_chunk = len(chunks[ch_idx]) - local
-        take = min(need - len(out), remain_chunk)
-        out.extend(chunks[ch_idx][local:local+take])
-        ch_idx += 1
-        local = 0
-
-    if len(out) < need:
-        return None
-
-    return bytes(out)
-
-
-class XLUCS:
-    __slots__ = (
-        "cch", "flags", "fHigh", "fExt", "fRich",
-        "cRun", "cbExtRst",
-        "text_lo", "text_hi",  # 시작 offset, 끝 offset
-        "buf", "chunks"
-    )
-
-    def try_parse_chunks(self, chunks: List[bytes], pos: int) -> bool:
-        # 최소 3바이트( cch(2) + flags(1) )
-        n_header = read_bytes_fChunks(chunks, pos, 3)
-        if n_header is None:
-            return False
-
-        cch = le16(n_header, 0)
-        flags = n_header[2]
-
-        fHigh = flags & 0x01        # 0: 1바이트 코드페이지, 1: UTF-16LE
-        fExt  = (flags >> 2) & 0x01 # ExtRst 존재 여부
-        fRich = (flags >> 3) & 0x01 # Rich Text Run 존재 여부
-
-        pos_cur = pos + 3
-
-        # Rich Text Run 개수
-        cRun = 0
-        if fRich:
-            raw = read_bytes_fChunks(chunks, pos_cur, 2)
-            if raw is None:
-                return False
-            cRun = le16(raw, 0)
-            pos_cur += 2
-
-        # ExtRst 길이
-        cbExtRst = 0
-        if fExt:
-            raw = read_bytes_fChunks(chunks, pos_cur, 4)
-            if raw is None:
-                return False
-            cbExtRst = le32(raw, 0)
-            pos_cur += 4
-
-        # 본문 텍스트
-        bpc = 2 if fHigh else 1
-        text_bytes = cch * bpc
-
-        raw_text = read_bytes_fChunks(chunks, pos_cur, text_bytes)
-        if raw_text is None:
-            return False
-
-        # 필드 세팅
-        self.cch      = cch
-        self.flags    = flags
-        self.fHigh    = fHigh
-        self.fExt     = fExt
-        self.fRich    = fRich
-        self.cRun     = cRun
-        self.cbExtRst = cbExtRst
-
-        # 텍스트의 논리 오프셋(시작/끝)
-        self.text_lo = pos_cur
-        self.text_hi = pos_cur + text_bytes  # 끝 offset
-
-        self.buf    = bytearray(raw_text)
-        self.chunks = chunks
-
-        return True
-
-    def decode_text(self, single_bytes_enc: str = "cp949") -> str:
-        raw = bytes(self.buf)
-
-        # fHigh=0 인데도 사실상 UTF-16 패턴인 경우 방어
-        if not self.fHigh and len(raw) >= 4 and raw[1] == 0x00 and raw[3] == 0x00:
-            enc = "utf-16le"
-        else:
-            enc = "utf-16le" if self.fHigh else single_bytes_enc
-
-        return raw.decode(enc, errors="ignore")
+    return bytes([cch, flags]) + rgb
 
 
 # ─────────────────────────────
-# 차트 텍스트 추출 (UI용)
+# SeriesText 추출 / 레닥션
 # ─────────────────────────────
+SERIESTEXT_OPCODE = 0x100D    # SeriesText
+FRTWRAPPER_RT     = 0x0851    # FrtWrapper.frtHeaderOld.rt 값
 
-CHART_STRING_LIKE = {0x100D, 0x1025, 0x0004}
+
+def extract_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> List[str]:
+    wb = biff_bytes
+    texts: List[str] = []
+
+    for rec_off, opcode, length, payload in iter_biff_records(wb):
+
+        # SeriesText(0x100D) 단독 레코드만 처리
+        if opcode != SERIESTEXT_OPCODE:
+            continue
+        if length < 4:  # reserved(2) + 최소 payload
+            continue
+
+        series_payload_off = rec_off + 4   # reserved가 시작하는 곳
+        reserved_off = series_payload_off
+
+        # reserved = 2 bytes
+        st_off = reserved_off + 2  # stText 시작 오프셋
+
+        try:
+            text, cch, fHigh, used = parse_short_xlucs(wb, st_off, single_byte_codec)
+        except Exception:
+            continue
+
+        if text and text.strip():
+            texts.append(text.strip())
+
+    return texts
 
 
+
+def redact_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
+    wb = bytearray(biff_bytes)
+    red_total = 0
+
+    for rec_off, opcode, length, payload in iter_biff_records(wb):
+
+        # SeriesText 단독 레코드만 처리
+        if opcode != SERIESTEXT_OPCODE:
+            continue
+        if length < 4:
+            continue
+
+        payload_off = rec_off + 4   # reserved(2 bytes) 시작
+        st_off = payload_off + 2    # stText 시작
+
+        try:
+            text, cch, fHigh, used = parse_short_xlucs(wb, st_off, single_byte_codec)
+        except Exception:
+            continue
+
+        if not text:
+            continue
+
+        norm = normalization_text(text)
+        if not find_sensitive_spans(norm):
+            continue
+
+        print(f"[CHART - SERIES] SeriesText 매칭됨: {repr(text)} at 0x{st_off:08X}")
+
+        masked_text = "*" * len(text)
+        new_st = build_short_xlucs(masked_text, cch, fHigh, single_byte_codec)
+
+        # 동일 payload 길이 유지
+        if st_off + len(new_st) > len(wb):
+            continue
+
+        wb[st_off: st_off + len(new_st)] = new_st
+        red_total += 1
+
+    if red_total:
+        print(f"[CHART - SERIES] 총 {red_total} SeriesText string이 레닥션 됨.")
+    else:
+        print("[CHART - SERIES] SeriesText 레닥션 안된다.")
+
+    return bytes(wb)
+
+
+# 차트 텍스트 추출
 def extract_chart_text(file_bytes: bytes, single_byte_enc: str = "cp949") -> List[str]:
     texts: List[str] = []
 
@@ -191,208 +161,14 @@ def extract_chart_text(file_bytes: bytes, single_byte_enc: str = "cp949") -> Lis
 
                 if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
                     wb_data = ole.openstream(entry).read()
-                    wb = bytearray(wb_data)
+                    texts.extend(extract_seriesTexts(wb_data, single_byte_enc))
 
-                    for rec_off, opcode, length, _payload in iter_biff_records(wb):
-                        if opcode not in CHART_STRING_LIKE or length <= 0:
-                            continue
-
-                        # TEXT + CONTINUE 조각을 모아서 하나의 논리 스트림처럼 다룸
-                        chunks, _segs = collect_continue_chuncks(wb, rec_off)
-                        if not chunks:
-                            continue
-
-                        total_len = sum(len(c) for c in chunks)
-                        pos = 0
-
-                        while pos < total_len:
-                            x = XLUCS()
-                            if not x.try_parse_chunks(chunks, pos):
-                                pos += 1
-                                continue
-
-                            txt = x.decode_text(single_byte_enc).strip()
-                            if txt:
-                                texts.append(txt)
-
-                            # 다음 문자열까지 건너뛰기
-                            header_len = 3
-                            if x.fRich:
-                                header_len += 2
-                                header_len += x.cRun * 4
-                            if x.fExt:
-                                header_len += 4
-                                header_len += x.cbExtRst
-
-                            text_bytes = x.cch * (2 if x.fHigh else 1)
-                            advance = header_len + text_bytes
-                            pos += advance
-
-                # EPRINT는 여기서는 추출 안 함 (별도 EMF 파서 사용)
-                if top == "ObjectPool" and name == "\x03EPRINT":
-                    pass
-
+                # EPRINT는 여기서는 추출 안 함
     except Exception as e:
         print(f"[ERR] extract_chart_text: {e}")
 
     return texts
 
-
-# ─────────────────────────────
-# 차트 XLUCS 레닥션 관련 유틸
-# ─────────────────────────────
-
-def write_chunk_mask(chunks: List[bytearray], lo: int, masked: bytes):
-    remain = len(masked)
-    ch_idx = 0
-    local = lo
-
-    # lo가 속한 청크 찾기
-    while ch_idx < len(chunks) and local >= len(chunks[ch_idx]):
-        local -= len(chunks[ch_idx])
-        ch_idx += 1
-
-    while ch_idx < len(chunks) and remain > 0:
-        take = min(remain, len(chunks[ch_idx]) - local)
-        chunks[ch_idx][local:local+take] = masked[:take]
-        masked = masked[take:]
-        remain -= take
-        ch_idx += 1
-        local = 0
-
-
-def fallback_redact(buf: bytearray, single_byte_enc="cp949") -> int:
-    seg = buf[:]  # 검색용 복사본
-
-    patterns = [
-        (re.compile(rb"[ -~]{5,}"), single_byte_enc),           # ASCII 5자 이상
-        (re.compile(rb"(?:[\x20-\x7E]\x00){5,}"), "utf-16le"),  # UTF-16LE 5자 이상
-    ]
-
-    red = 0
-
-    for pat, enc in patterns:
-        for m in pat.finditer(seg):
-            seq = m.group(0)
-            try:
-                text = seq.decode(enc, errors="ignore")
-                if not text.strip():
-                    continue
-
-                if find_sensitive_spans(normalization_text(text)):
-                    if enc == "utf-16le":
-                        repl = ("*" * len(text)).encode("utf-16le")
-                        repl = repl[:len(seq)]
-                    else:
-                        repl = b"*" * len(seq)
-
-                    s, e = m.start(), m.end()
-                    buf[s:e] = repl
-                    red += 1
-            except Exception:
-                pass
-
-    return red
-
-
-def write_back_fallback(chunks: List[bytearray], fb_buf: bytearray):
-    p = 0
-    for i, c in enumerate(chunks):
-        ln = len(c)
-        chunks[i] = bytearray(fb_buf[p:p+ln])
-        p += ln
-
-
-def write_chunks_back_to_wb(wb: bytearray, chunks: List[bytearray], segs: List[Tuple[int, int]]):
-    merged = b"".join(chunks)
-    p = 0
-    for lo, hi in segs:
-        ln = hi - lo
-        wb[lo:hi] = merged[p:p+ln]
-        p += ln
-
-
-def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single_byte_codec="cp949") -> int:
-    rec_off = payload_off - 4
-
-    # TEXT + CONTINUE 레코드 조각 모으기
-    chunks_bytes, segs = collect_continue_chuncks(wb, rec_off)
-    if not chunks_bytes:
-        return 0
-
-    # bytearray 로 변환
-    chunks: List[bytearray] = [bytearray(c) for c in chunks_bytes]
-
-    total_len = sum(len(c) for c in chunks)
-    pos = 0
-    red = 0
-
-    while pos < total_len:
-        x = XLUCS()
-        if not x.try_parse_chunks(chunks, pos):
-            pos += 1
-            continue
-
-        text = x.decode_text(single_byte_codec).strip()
-
-        if text and find_sensitive_spans(normalization_text(text)):
-            print(f"[MERGED-CHUNK] matched: {repr(text)} at pos={pos}")
-
-            enc = "utf-16le" if x.fHigh else single_byte_codec
-            masked = ("*" * len(text)).encode(enc)
-            raw_len = x.text_hi - x.text_lo  # 실제 텍스트 바이트 길이
-            masked = masked[:raw_len].ljust(raw_len, b'*')
-
-            write_chunk_mask(chunks, x.text_lo, masked)
-            red += 1
-
-        header_len = 3
-        if x.fRich:
-            header_len += 2
-            header_len += x.cRun * 4
-        if x.fExt:
-            header_len += 4
-            header_len += x.cbExtRst
-
-        text_bytes = x.cch * (2 if x.fHigh else 1)
-        advance = header_len + text_bytes
-
-        pos += advance
-
-    # XLUCS 기반에서 아무 것도 못 찾았으면 fallback
-    if red == 0:
-        fb_buf = bytearray(b"".join(chunks))
-        fb = fallback_redact(fb_buf, single_byte_codec)
-        print("[FALLBACK ! ! !]")
-        red += fb
-        if fb > 0:
-            write_back_fallback(chunks, fb_buf)
-
-    write_chunks_back_to_wb(wb, chunks, segs)
-
-    return red
-
-
-def redact_biff_stream(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
-    wb = bytearray(biff_bytes)
-    total = 0
-
-    for rec_off, opcode, length, payload in iter_biff_records(wb):
-        if opcode in CHART_STRING_LIKE and length > 0:
-            print(f"[REC] opcode=0x{opcode:04X} len={length}")
-            try:
-                cnt = scan_and_redact_payload(wb, rec_off + 4, length, single_byte_codec)
-                total += cnt
-                print(f"[CHART] opcode=0x{opcode:04X} → {cnt} texts redacted")
-            except Exception as e:
-                print(f"[WARN] opcode=0x{opcode:04X} exception: {e}")
-
-    if total:
-        print(f"[CHART] total {total} strings redacted")
-    else:
-        print("[CHART] no redactions")
-
-    return bytes(wb)
 
 
 # ───────────────────────────────────────────────
@@ -641,7 +417,7 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
                     print(f"[INFO] found Workbook stream: {path_str}")
 
                     wb_data = ole.openstream(entry).read()
-                    new_biff = redact_biff_stream(wb_data, single_byte_codec)
+                    new_biff = redact_seriesTexts(wb_data, single_byte_codec)
 
                     if new_biff != wb_data:
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
