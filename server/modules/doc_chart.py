@@ -178,11 +178,6 @@ CHART_STRING_LIKE = {0x100D, 0x1025, 0x0004}
 
 
 def extract_chart_text(file_bytes: bytes, single_byte_enc: str = "cp949") -> List[str]:
-    """
-    ObjectPool/Workbook 내부 차트 문자열(XLUCS)들을 모두 추출하여
-    UI에 보여주기 위한 함수.
-    실제 레닥션은 아래 scan_and_redact_payload / redact_biff_stream에서 수행.
-    """
     texts: List[str] = []
 
     try:
@@ -267,9 +262,6 @@ def write_chunk_mask(chunks: List[bytearray], lo: int, masked: bytes):
 
 
 def fallback_redact(buf: bytearray, single_byte_enc="cp949") -> int:
-    """
-    XLUCS 파싱이 실패했을 때 대비용: 일반적인 ASCII/UTF-16 패턴을 정규식으로 스캔해서 레닥션.
-    """
     seg = buf[:]  # 검색용 복사본
 
     patterns = [
@@ -371,6 +363,7 @@ def scan_and_redact_payload(wb: bytearray, payload_off: int, length: int, single
     if red == 0:
         fb_buf = bytearray(b"".join(chunks))
         fb = fallback_redact(fb_buf, single_byte_codec)
+        print("[FALLBACK ! ! !]")
         red += fb
         if fb > 0:
             write_back_fallback(chunks, fb_buf)
