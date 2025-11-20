@@ -1,3 +1,4 @@
+# server/modules/pdf_module.py
 from __future__ import annotations
 
 import io
@@ -5,10 +6,12 @@ import re
 from typing import List, Optional, Set, Dict
 
 import fitz
+import numpy as np
 
 from server.core.schemas import Box, PatternItem
 from server.core.redaction_rules import PRESET_PATTERNS
 from .common import cleanup_text, compile_rules
+from .ocr_module import run_paddle_ocr, OcrItem
 
 log_prefix = "[PDF]"
 
@@ -105,11 +108,94 @@ def _merge_card_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
 
 
 # ─────────────────────────────────────────────────────────────
+# 이미지/OCR 헬퍼
+# ─────────────────────────────────────────────────────────────
+def _page_to_image_rgb(page: fitz.Page, zoom: float = 2.0) -> tuple[np.ndarray, float, float]:
+    """
+    PDF 페이지를 RGB 이미지로 렌더링.
+    """
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img_w, img_h = pix.width, pix.height
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(img_h, img_w, 3)
+    return img, float(img_w), float(img_h)
+
+
+def ocr_boxes_for_page(
+    doc: fitz.Document,
+    page_index: int,
+    patterns: List[PatternItem] | None = None,
+    min_score: float = 0.5,
+) -> List[Box]:
+    """
+    단일 페이지를 OCR 돌려서 Box 리스트로 반환.
+    """
+    page = doc.load_page(page_index)
+    page_rect = page.rect
+    page_w, page_h = page_rect.width, page_rect.height
+
+    img, img_w, img_h = _page_to_image_rgb(page)
+    print(f"{log_prefix} [OCR] page={page_index + 1} image={img_w}x{img_h}")
+    ocr_items: List[OcrItem] = run_paddle_ocr(img, min_score=min_score)
+    print(f"{log_prefix} [OCR] page={page_index + 1} ocr_items={len(ocr_items)}")
+
+    comp = compile_rules()
+    allowed_names = _normalize_pattern_names(patterns)
+
+    boxes: List[Box] = []
+
+    for item in ocr_items:
+        print(f"{log_prefix} [OCR RAW] page={page_index + 1} text={repr(item.text)} score={item.score}")
+        text = cleanup_text(item.text)
+        if not text:
+            continue
+
+        for (rule_name, rx, need_valid, _prio, validator) in comp:
+            if allowed_names and rule_name not in allowed_names:
+                continue
+
+            try:
+                it = rx.finditer(text)
+            except Exception:
+                continue
+
+            for m in it:
+                val = m.group(0)
+                if not val:
+                    continue
+
+                ok = _is_valid_value(need_valid, validator, val)
+                if not ok:
+                    continue
+
+                x0_img, y0_img, x1_img, y1_img = item.bbox
+
+                x0_pdf = x0_img / img_w * page_w
+                x1_pdf = x1_img / img_w * page_w
+                y0_pdf = y0_img / img_h * page_h
+                y1_pdf = y1_img / img_h * page_h
+
+                boxes.append(
+                    Box(
+                        page=page_index,
+                        x0=float(x0_pdf),
+                        y0=float(y0_pdf),
+                        x1=float(x1_pdf),
+                        y1=float(y1_pdf),
+                    )
+                )
+
+    print(f"{log_prefix} [OCR] page={page_index + 1} boxes_from_ocr={len(boxes)}")
+    return boxes
+
+
+# ─────────────────────────────────────────────────────────────
 # PDF 내 박스 탐지
 # ─────────────────────────────────────────────────────────────
 def detect_boxes_from_patterns(
     pdf_bytes: bytes,
     patterns: List[PatternItem] | None,
+    use_ocr: bool = True,
 ) -> List[Box]:
     comp = compile_rules()
     allowed_names = _normalize_pattern_names(patterns)
@@ -126,7 +212,10 @@ def detect_boxes_from_patterns(
     boxes: List[Box] = []
 
     try:
-        for pno, page in enumerate(doc):
+        page_count = len(doc)
+        # --- 1) 기존 텍스트 기반 탐지 ---
+        for pno in range(page_count):
+            page = doc.load_page(pno)
             raw_text = page.get_text("text") or ""
             text = cleanup_text(raw_text)
             if not text:
@@ -148,7 +237,6 @@ def detect_boxes_from_patterns(
 
                     ok = _is_valid_value(need_valid, validator, val)
 
-                    # 통계
                     if ok:
                         stats_ok[rule_name] = stats_ok.get(rule_name, 0) + 1
                     else:
@@ -168,7 +256,6 @@ def detect_boxes_from_patterns(
                     if not rects:
                         continue
 
-                    # 카드번호(특히 하이픈 없는 형태) → 줄 단위로만 합치기
                     if rule_name == "card" and "-" not in val and len(rects) > 1:
                         rects = _merge_card_rects(rects)
 
@@ -182,6 +269,19 @@ def detect_boxes_from_patterns(
                         boxes.append(
                             Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
                         )
+
+        # --- 2) OCR 기반 탐지 추가 ---
+        if use_ocr:
+            for pno in range(page_count):
+                ocr_bs = ocr_boxes_for_page(doc, pno, patterns)
+                for b in ocr_bs:
+                    print(
+                        f"{log_prefix}[OCR] BOX",
+                        "page=", pno + 1,
+                        "rect=", (b.x0, b.y0, b.x1, b.y1),
+                    )
+                boxes.extend(ocr_bs)
+
     finally:
         doc.close()
 
