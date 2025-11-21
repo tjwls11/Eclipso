@@ -4,21 +4,20 @@ const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
 const $ = (sel) => document.querySelector(sel)
 const $$ = (sel) => Array.from(document.querySelectorAll(sel))
 
-// 마지막 생성 산출물(파일 저장용)
 let __lastRedactedBlob = null
 let __lastRedactedName = 'redacted.bin'
 
-// HTML 이스케이프
+// html escape
 const esc = (s) =>
   (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-// 배지 숫자 업데이트
+// 배지
 const badge = (sel, n) => {
   const el = $(sel)
   if (el) el.textContent = String(n ?? 0)
 }
 
-// 아코디언 열고 닫기
+// 아코디언
 const setOpen = (name, open) => {
   const cont =
     name === 'pdf' ? $('#pdf-preview-block') : $(`#${name}-result-block`)
@@ -28,8 +27,6 @@ const setOpen = (name, open) => {
   body && body.classList.toggle('hidden', !open)
   chev && chev.classList.toggle('rotate-180', !open)
 }
-
-// 전역 클릭으로 아코디언 토글
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-toggle]')
   if (!btn) return
@@ -38,7 +35,7 @@ document.addEventListener('click', (e) => {
   setOpen(name, body ? body.classList.contains('hidden') : true)
 })
 
-// ===== 규칙(정규식) 목록 로드 =====
+// 규칙 로드
 async function loadRules() {
   try {
     const r = await fetch(`${API_BASE()}/text/rules`)
@@ -59,13 +56,11 @@ async function loadRules() {
     console.warn('규칙 불러오기 실패')
   }
 }
-
-// 현재 체크된 규칙 이름 배열
 function selectedRuleNames() {
   return $$('input[name="rule"]:checked').map((el) => el.value)
 }
 
-// ===== 드롭존 =====
+// 드롭존
 function setupDropZone() {
   const dz = $('#dropzone'),
     input = $('#file'),
@@ -86,7 +81,6 @@ function setupDropZone() {
   ;['dragover', 'drop'].forEach((ev) =>
     window.addEventListener(ev, (e) => e.preventDefault())
   )
-
   dz.addEventListener('dragenter', (e) => {
     e.preventDefault()
     depth++
@@ -104,7 +98,6 @@ function setupDropZone() {
       if (!depth) setActive(false)
     })
   )
-
   dz.addEventListener('drop', (e) => {
     e.preventDefault()
     depth = 0
@@ -134,11 +127,10 @@ function setupDropZone() {
     statusEl &&
       (statusEl.textContent = '파일 선택 완료 — 스캔 실행을 눌러주세요.')
   })
-
   input.addEventListener('change', (e) => showName(e.target.files?.[0] || null))
 }
 
-// ===== PDF 미리보기 (레닥션 결과 첫 페이지만) =====
+// PDF 프리뷰(1페이지)
 async function renderRedactedPdfPreview(blob) {
   const cv = $('#pdf-preview')
   if (!cv) return
@@ -153,9 +145,8 @@ async function renderRedactedPdfPreview(blob) {
   await page.render({ canvasContext: g, viewport: vp }).promise
 }
 
-// ===== 정규식 결과 렌더 =====
+// 텍스트 하이라이트
 const take = (s, n) => (s.length <= n ? s : s.slice(0, n) + '…')
-
 function highlightFrag(ctx, val, pad = 60) {
   const i = (ctx || '').indexOf(val || '')
   if (i < 0) return esc(take(ctx || '', 140))
@@ -167,6 +158,42 @@ function highlightFrag(ctx, val, pad = 60) {
   return pre + `<mark class="bg-yellow-200 rounded px-1">${mid}</mark>` + post
 }
 
+let __segFilter = 'all' // all | ok | fail
+function applySegmentFilter(root) {
+  root.querySelectorAll('[data-valid]').forEach((el) => {
+    const ok = el.getAttribute('data-valid') === '1'
+    let show = true
+    if (__segFilter === 'ok') show = ok
+    else if (__segFilter === 'fail') show = !ok
+    el.style.display = show ? '' : 'none'
+  })
+}
+function wireSegmentButtons(root) {
+  const setActive = (which) => {
+    __segFilter = which
+    ;['all', 'ok', 'fail'].forEach((k) => {
+      const btn = $(`#seg-${k}`)
+      if (!btn) return
+      btn.classList.remove(
+        'bg-gray-900',
+        'text-white',
+        'bg-emerald-600',
+        'bg-rose-600'
+      )
+      if (k === 'all' && which === 'all')
+        btn.classList.add('bg-gray-900', 'text-white')
+      if (k === 'ok' && which === 'ok')
+        btn.classList.add('bg-emerald-600', 'text-white')
+      if (k === 'fail' && which === 'fail')
+        btn.classList.add('bg-rose-600', 'text-white')
+    })
+    applySegmentFilter(root)
+  }
+  $('#seg-all')?.addEventListener('click', () => setActive('all'))
+  $('#seg-ok')?.addEventListener('click', () => setActive('ok'))
+  $('#seg-fail')?.addEventListener('click', () => setActive('fail'))
+  setActive(__segFilter)
+}
 function renderRegexResults(res) {
   const items = Array.isArray(res?.items) ? res.items : []
   badge('#match-badge', items.length)
@@ -189,6 +216,7 @@ function renderRegexResults(res) {
 
   const groups = {}
   for (const it of items) (groups[it.rule || 'UNKNOWN'] ??= []).push(it)
+
   for (const [rule, arr] of Object.entries(groups).sort(
     (a, b) => b[1].length - a[1].length
   )) {
@@ -196,9 +224,9 @@ function renderRegexResults(res) {
     const fail = arr.length - ok
 
     const container = document.createElement('div')
-    container.className = 'rounded-xl border border-gray-200 mb-3'
+    container.className = 'rounded-2xl border border-gray-200'
     container.innerHTML = `
-      <button class="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 rounded-lg">
+      <button class="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 rounded-t-2xl">
         <div class="flex items-center gap-2">
           <span class="text-sm font-semibold">${esc(rule)}</span>
           <span class="text-xs text-gray-500">총 ${arr.length}건</span>
@@ -209,30 +237,45 @@ function renderRegexResults(res) {
               : ''
           }
         </div>
-        <svg class="h-4 w-4 text-gray-500" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" clip-rule="evenodd"/></svg>
+        <svg class="h-4 w-4 text-gray-500 transition-transform" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" clip-rule="evenodd"/>
+        </svg>
       </button>
-      <div class="p-2"></div>
+      <div class="p-3 grid gap-2 rounded-b-2xl"></div>
     `
-    const body = container.querySelector('.p-2')
+    const body = container.querySelector('.p-3')
+
     for (const r of arr) {
+      const isOk = !!r.valid
+      const ctx = r.context || ''
+      const val = r.value || ''
       const card = document.createElement('div')
-      card.className = 'border rounded-lg p-3 mb-2'
-      card.dataset.valid = r.valid ? '1' : '0'
+      card.dataset.valid = isOk ? '1' : '0'
+      card.className =
+        'border rounded-xl p-3 bg-white hover:shadow-sm transition ' +
+        (isOk ? 'border-emerald-200' : 'border-rose-200')
+
+      // 값은 평문 모노스페이스, 불필요한 배경/박스 제거
       card.innerHTML = `
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
-            <div class="text-sm font-mono break-all">${esc(r.value || '')}</div>
-            <div class="text-[12px] text-gray-500 mt-1 leading-relaxed break-words">${highlightFrag(
-              r.context || '',
-              r.value || ''
-            )}</div>
+            <div class="text-sm font-mono break-all">${esc(val)}</div>
+            <div class="text-[12px] text-gray-600 mt-1 leading-relaxed break-words">
+              ${highlightFrag(ctx, val)}
+            </div>
           </div>
-          <div class="text-xs ${
-            r.valid ? 'text-emerald-700' : 'text-rose-700'
-          } shrink-0">${r.valid ? 'OK' : 'FAIL'}</div>
-        </div>`
+          <div class="shrink-0">
+            <span class="inline-block text-[11px] px-1.5 py-0.5 rounded border ${
+              isOk
+                ? 'border-emerald-300 text-emerald-700'
+                : 'border-rose-300 text-rose-700'
+            }">${isOk ? 'OK' : 'FAIL'}</span>
+          </div>
+        </div>
+      `
       body.appendChild(card)
     }
+
     let open = arr.length <= 10
     body.style.display = open ? '' : 'none'
     container.querySelector('button')?.addEventListener('click', () => {
@@ -240,27 +283,104 @@ function renderRegexResults(res) {
       body.style.display = open ? '' : 'none'
       container.querySelector('svg')?.classList.toggle('rotate-180', !open)
     })
+
     wrap.appendChild(container)
   }
 
-  $('#filter-valid-only')?.addEventListener('change', (e) => {
-    const on = e.target.checked
-    wrap.querySelectorAll('[data-valid]').forEach((el) => {
-      const ok = el.getAttribute('data-valid') === '1'
-      el.style.display = on && !ok ? 'none' : ''
-    })
-  })
+  wireSegmentButtons(wrap)
 
   $('#filter-search')?.addEventListener('input', (e) => {
     const q = (e.target.value || '').toLowerCase()
-    wrap.querySelectorAll('.border.rounded-lg.p-3').forEach((el) => {
-      el.style.display =
-        q && !el.textContent.toLowerCase().includes(q) ? 'none' : ''
+    wrap.querySelectorAll('[data-valid]').forEach((el) => {
+      const txt = el.textContent.toLowerCase()
+      const match = !q || txt.includes(q)
+      el.style.display = match ? '' : 'none'
     })
+    applySegmentFilter(wrap)
   })
+
+  applySegmentFilter(wrap)
 }
 
-// ===== NER 테이블 렌더 =====
+function normalizeNerItems(raw, srcText = '') {
+  if (!raw) return { items: [] }
+  let arr = []
+  if (Array.isArray(raw.items)) arr = raw.items
+  else if (Array.isArray(raw.entities)) arr = raw.entities
+  else if (Array.isArray(raw.result?.entities)) arr = raw.result.entities
+  else if (Array.isArray(raw)) arr = raw
+
+  // /text/detect 폴백 형태: final_spans에서 source==='ner'
+  if (!arr.length && Array.isArray(raw.final_spans)) {
+    const spans = raw.final_spans.filter(
+      (s) => (s.source || '').toLowerCase() === 'ner'
+    )
+    arr = spans.map((s) => {
+      const start = Number(s.start ?? 0)
+      const end = Number(s.end ?? 0)
+      const text =
+        start >= 0 && end > start && srcText
+          ? srcText.slice(start, end)
+          : s.text || ''
+      return {
+        label: s.label || '',
+        text,
+        score: s.score ?? s.prob,
+        start,
+        end,
+      }
+    })
+  }
+
+  // 필드 스펙 표준화
+  const map = (e) => ({
+    label: e.label ?? e.entity ?? e.tag ?? '',
+    text: e.text ?? e.word ?? e.value ?? '',
+    score:
+      typeof e.score === 'number'
+        ? e.score
+        : typeof e.confidence === 'number'
+        ? e.confidence
+        : undefined,
+    start: typeof e.start === 'number' ? e.start : 0,
+    end:
+      typeof e.end === 'number'
+        ? e.end
+        : typeof e.length === 'number'
+        ? (e.start || 0) + e.length
+        : 0,
+  })
+  return { items: arr.map(map) }
+}
+async function requestNerSmart(text) {
+  // 1) /text/ner
+  try {
+    const r = await fetch(`${API_BASE()}/text/ner`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (r.ok) {
+      const j = await r.json()
+      const n = normalizeNerItems(j)
+      if (n.items.length) return n
+    }
+  } catch {}
+  // 2) /text/detect (run_ner)
+  const r2 = await fetch(`${API_BASE()}/text/detect`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text,
+      options: { run_regex: false, run_ner: true },
+    }),
+  })
+  if (!r2.ok) return { items: [] }
+  const j2 = await r2.json()
+  return normalizeNerItems(j2, j2.text || text || '')
+}
+
+// NER 테이블
 function renderNerTable(ner) {
   const rows = $('#ner-rows')
   const sum = $('#ner-summary')
@@ -299,18 +419,17 @@ function renderNerTable(ner) {
   }
 }
 
-// ===== 상태 표시 =====
+// 상태
 function setStatus(msg) {
   const el = $('#status')
   if (el) el.textContent = msg || ''
 }
 
-// ===== 스캔 버튼 핸들러 =====
+// 스캔 버튼
 $('#btn-scan')?.addEventListener('click', async () => {
   const f = $('#file')?.files?.[0]
   if (!f) return alert('파일을 선택하세요.')
 
-  // 출력 파일명 기본값 구성
   const ext = (f.name.split('.').pop() || '').toLowerCase()
   __lastRedactedName = f.name
     ? f.name.replace(/\.[^.]+$/, `_redacted.${ext}`)
@@ -320,7 +439,6 @@ $('#btn-scan')?.addEventListener('click', async () => {
   const fd = new FormData()
   fd.append('file', f)
 
-  // 결과 패널 보이기
   $('#match-result-block')?.classList.remove('hidden')
   $('#ner-result-block')?.classList.remove('hidden')
 
@@ -334,7 +452,7 @@ $('#btn-scan')?.addEventListener('click', async () => {
       throw new Error(`텍스트 추출 실패 (${r1.status})\n${await r1.text()}`)
     const { full_text: text = '' } = await r1.json()
 
-    // 본문 프리뷰
+    // 프리뷰
     $('#text-preview-block')?.classList.remove('hidden')
     const ta = $('#txt-out')
     if (ta) ta.value = text || '(본문 텍스트가 비어 있습니다.)'
@@ -350,13 +468,8 @@ $('#btn-scan')?.addEventListener('click', async () => {
     renderRegexResults(await r2.json())
     setOpen('match', true)
 
-    // 3) NER
-    const r3 = await fetch(`${API_BASE()}/text/ner`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    })
-    const ner = r3.ok ? await r3.json() : { items: [], counts: {} }
+    // 3) NER (스마트 호출)
+    const ner = await requestNerSmart(text)
     renderNerTable(ner)
     ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
       $(sel)?.addEventListener('change', () => renderNerTable(ner))
@@ -376,7 +489,6 @@ $('#btn-scan')?.addEventListener('click', async () => {
     const ctype = r4.headers.get('Content-Type') || 'application/octet-stream'
     __lastRedactedBlob = new Blob([blob], { type: ctype })
 
-    // PDF면 미리보기
     if (ctype.includes('pdf')) {
       setOpen('pdf', true)
       await renderRedactedPdfPreview(__lastRedactedBlob)
@@ -384,13 +496,11 @@ $('#btn-scan')?.addEventListener('click', async () => {
       setOpen('pdf', false)
     }
 
-    // 저장 버튼 노출
     const btn = $('#btn-save-redacted')
     if (btn) {
       btn.classList.remove('hidden')
       btn.disabled = false
     }
-
     setStatus('레닥션 완료 — 다운로드 가능')
   } catch (e) {
     console.error(e)
@@ -398,7 +508,7 @@ $('#btn-scan')?.addEventListener('click', async () => {
   }
 })
 
-// ===== 다운로드 버튼 =====
+// 다운로드
 $('#btn-save-redacted')?.addEventListener('click', () => {
   if (!__lastRedactedBlob) return alert('레닥션된 파일이 없습니다.')
   const url = URL.createObjectURL(__lastRedactedBlob)
@@ -409,7 +519,7 @@ $('#btn-save-redacted')?.addEventListener('click', () => {
   URL.revokeObjectURL(url)
 })
 
-// ===== 초기화 =====
+// 초기화
 document.addEventListener('DOMContentLoaded', () => {
   loadRules()
   setupDropZone()

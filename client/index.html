@@ -17,10 +17,10 @@
           ? 'http://127.0.0.1:8000'
           : origin.replace(/\/$/, '')
 
-      // HWPX 뷰어 URL 사용 시 여기에 지정(선택)
+      // (선택) HWPX 뷰어 URL
       window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
 
-      // pdf.js 워커 경로 설정
+      // pdf.js 워커 경로
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
@@ -58,8 +58,16 @@
                 tabindex="0"
               >
                 <div class="text-sm text-gray-500">
-                  여기로 드래그하거나 클릭해서 선택
+                  <img
+                    class="w-10 h-10 mx-auto mb-2"
+                    src="https://images.icon-icons.com/1875/PNG/512/fileupload_120150.png"
+                    alt="파일 선택"
+                  />
+                  <p class="text-sm font-medium ml-2 mt-2">
+                    파일을 선택하거나<br />이 영역에 드래그해 주세요
+                  </p>
                 </div>
+
                 <div id="file-name" class="mt-2 text-xs text-gray-400"></div>
               </label>
               <input
@@ -74,7 +82,7 @@
             <fieldset class="rounded-xl border border-gray-200 p-4">
               <legend class="px-1 text-sm font-medium">규칙 선택</legend>
               <div id="rules-container" class="mt-2 space-y-2 text-sm">
-                <!-- 서버에서 /text/rules 로드. 실패 시 기본 샘플 -->
+                <!-- /text/rules 실패 시 기본값 -->
                 <label class="flex items-center gap-2">
                   <input type="checkbox" name="rule" value="rrn" checked />
                   <span>주민등록번호</span>
@@ -214,17 +222,37 @@
               </div>
             </button>
             <div id="match-body" class="p-5 border-t">
-              <div class="flex flex-wrap items-center gap-2 mb-4">
+              <div class="flex flex-wrap items-center gap-3 mb-4">
                 <div id="summary" class="text-sm text-gray-500"></div>
                 <span class="mx-2 text-gray-300">|</span>
-                <label class="text-sm flex items-center gap-1">
-                  <input
-                    id="filter-valid-only"
-                    type="checkbox"
-                    class="rounded border-gray-300"
-                  />
-                  Valid=OK만
-                </label>
+
+                <!-- 세그먼트 필터: All / OK / FAIL -->
+                <div
+                  class="inline-flex rounded-lg border border-gray-200 overflow-hidden"
+                >
+                  <button
+                    id="seg-all"
+                    data-seg="all"
+                    class="px-3 py-1.5 text-xs bg-gray-900 text-white"
+                  >
+                    All
+                  </button>
+                  <button
+                    id="seg-ok"
+                    data-seg="ok"
+                    class="px-3 py-1.5 text-xs text-emerald-700 hover:bg-emerald-50"
+                  >
+                    OK
+                  </button>
+                  <button
+                    id="seg-fail"
+                    data-seg="fail"
+                    class="px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50"
+                  >
+                    FAIL
+                  </button>
+                </div>
+
                 <input
                   id="filter-search"
                   type="text"
