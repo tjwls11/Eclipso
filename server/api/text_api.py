@@ -7,8 +7,33 @@ from typing import List, Dict, Optional
 
 from fastapi import APIRouter, UploadFile, HTTPException
 from pydantic import BaseModel
+from pydantic import BaseModel
 
 from server.utils.file_reader import extract_from_file
+from server.core.redaction_rules import PRESET_PATTERNS, RULES
+
+# --- 정규화 함수 호환 래퍼 (normalize_text 없는 브랜치 대비) ---
+try:
+    # 신형: normalize_text 존재
+    from server.core.normalize import normalize_text  # type: ignore
+except Exception:
+    # 구형: normalize()만 있는 경우
+    try:
+        from server.core.normalize import normalize as _normalize  # type: ignore
+
+        def normalize_text(s: str) -> str:
+            r = _normalize(s)
+            # (정규화문자열, 인덱스맵) 형태일 수 있음 → 문자열만 사용
+            if isinstance(r, (list, tuple)):
+                return r[0]
+            return r if isinstance(r, str) else str(r)
+    except Exception:
+        # 최후 안전장치: 정규화 모듈이 전혀 없으면 원문 반환
+        def normalize_text(s: str) -> str:
+            return s
+
+# 정규식 매칭 유틸과 병합 정책
+from server.api.redaction_api import match_text as regex_match_text
 from server.core.redaction_rules import PRESET_PATTERNS, RULES
 
 # --- 정규화 함수 호환 래퍼 (normalize_text 없는 브랜치 대비) ---
@@ -105,6 +130,7 @@ def _ctx(s: str, i: int, j: int, pad: int = 30) -> str:
 @router.post(
     "/extract",
     response_model=ExtractResponse,
+    response_model=ExtractResponse,
     summary="파일에서 텍스트 추출",
     description="업로드한 문서에서 본문 텍스트를 추출하여 반환"
 )
@@ -120,6 +146,7 @@ async def extract_text(file: UploadFile):
     except HTTPException:
         raise
     except Exception as e:
+        traceback.print_exc()
         traceback.print_exc()
         raise HTTPException(500, detail=f"서버 내부 오류: {e}")
 
@@ -168,6 +195,7 @@ async def match(req: MatchRequest):
     "/policy",
     summary="기본 병합 정책 조회",
     description="정규식·NER 탐지 결과 병합에 사용하는 기본 정책을 반환"
+    description="정규식·NER 탐지 결과 병합에 사용하는 기본 정책을 반환"
 )
 async def get_policy():
     return DEFAULT_POLICY
@@ -176,6 +204,7 @@ async def get_policy():
     "/policy",
     summary="병합 정책 설정",
     description="허용 라벨·우선순위 등 병합 정책을 갱신(전달값을 그대로 반환)"
+    description="허용 라벨·우선순위 등 병합 정책을 갱신(전달값을 그대로 반환)"
 )
 async def set_policy(policy: dict):
     return {"ok": True, "policy": policy}
@@ -183,6 +212,7 @@ async def set_policy(policy: dict):
 @router.post(
     "/detect",
     summary="정규식+NER 통합 탐지",
+    description="정규식과 NER을 선택 실행하고 정책에 따라 병합된 결과를 반환"
     description="정규식과 NER을 선택 실행하고 정책에 따라 병합된 결과를 반환"
 )
 async def detect(req: dict):
@@ -201,11 +231,20 @@ async def detect(req: dict):
         except Exception as e:
             regex_result = {"items": [], "error": f"regex_failed: {e}"}
 
+    # 1) 정규식 결과(유틸 재사용)
+    regex_result = {"items": []}
+    if run_regex_opt:
+        try:
+            regex_result = regex_match_text(text)  # {items:[{start,end,rule,...}], counts:{...}}
+        except Exception as e:
+            regex_result = {"items": [], "error": f"regex_failed: {e}"}
+
     regex_spans: List[Dict[str, Any]] = []
     for it in regex_result.get("items", []):
         s, e = it.get("start"), it.get("end")
         if s is None or e is None or e <= s:
             continue
+        label = it.get("rule") or it.get("label") or it.get("name") or "REGEX"
         label = it.get("rule") or it.get("label") or it.get("name") or "REGEX"
         regex_spans.append({
             "start": int(s),
@@ -215,6 +254,7 @@ async def detect(req: dict):
             "score": None
         })
 
+    # 2) NER 결과
     # 2) NER 결과
     ner_spans: List[Dict[str, Any]] = []
     ner_raw_preview: Any = None
@@ -230,6 +270,9 @@ async def detect(req: dict):
 
     # 3) 병합
     merger = MergePolicy(policy)
+    final_spans, report = merger.merge(
+        text, regex_spans, ner_spans, degrade=(run_ner_opt is False)
+    )
     final_spans, report = merger.merge(
         text, regex_spans, ner_spans, degrade=(run_ner_opt is False)
     )

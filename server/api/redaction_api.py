@@ -36,13 +36,14 @@ def _ensure_pdf(file: UploadFile) -> None:
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
 
 def _read_all(file: UploadFile) -> bytes:
+def _read_all(file: UploadFile) -> bytes:
     data = file.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
     return data
 
-
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
+    """프론트 patterns_json -> PatternItem[] (없으면 PRESET 전체)."""
     """프론트 patterns_json -> PatternItem[] (없으면 PRESET 전체)."""
     if patterns_json is None:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
@@ -73,7 +74,7 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
 
     try:
         return [PatternItem(**p) for p in arr]
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         raise HTTPException(status_code=400, detail=f"잘못된 patterns 항목: {e}")
 
 def _as_jsonable(obj: Any) -> Any:
@@ -149,8 +150,8 @@ async def apply(file: UploadFile = File(...)):
     # 기본 채움색
     fill = "black"
 
-    boxes = detect_boxes_from_patterns(pdf, [PatternItem(**p) for p in PRESET_PATTERNS])
-    out = apply_redaction(pdf, boxes, fill=fill)
+    boxes = detect_boxes_from_patterns(pdf, patterns)
+    out = apply_redaction(pdf, boxes, fill=fill_color)
 
     disp = build_disposition("redacted.pdf")
     return Response(content=out, media_type="application/pdf",
