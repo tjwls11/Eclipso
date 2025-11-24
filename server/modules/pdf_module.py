@@ -9,7 +9,6 @@ import fitz
 from server.core.schemas import Box, PatternItem
 from server.core.redaction_rules import PRESET_PATTERNS, RULES
 from server.modules.ner_module import run_ner 
-from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 from server.core.regex_utils import match_text
 
 
@@ -193,5 +192,70 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> 
 def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> bytes:
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
+
+    # extra_spans (NER 결과 등) 처리
+    if extra_spans:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            # file_redact_api.py와 동일한 방식으로 텍스트 추출
+            # "\n".join([p.get_text("text") or "" for p in doc])
+            page_texts = []
+            page_offsets = []  # 각 페이지의 전체 텍스트에서의 시작 위치
+            current_offset = 0
+            
+            for page in doc:
+                text = page.get_text("text") or ""
+                page_texts.append(text)
+                page_offsets.append(current_offset)
+                # 페이지 구분자: \n (file_redact_api.py와 동일)
+                current_offset += len(text) + 1  # +1 for \n
+            
+            # 전체 텍스트 (file_redact_api.py와 동일한 형식)
+            full_text = "\n".join(page_texts)
+            
+            # 각 span을 PDF 좌표로 변환
+            for span in extra_spans:
+                start = span.get("start", 0)
+                end = span.get("end", 0)
+                if end <= start or start >= len(full_text):
+                    continue
+                
+                # span의 텍스트 추출
+                span_text = full_text[start:min(end, len(full_text))]
+                if not span_text or not span_text.strip():
+                    continue
+                
+                # span이 속한 페이지 찾기
+                for page_idx, page_offset in enumerate(page_offsets):
+                    next_offset = page_offsets[page_idx + 1] if page_idx + 1 < len(page_offsets) else len(full_text)
+                    
+                    # span이 이 페이지 범위에 있는지 확인
+                    if start >= page_offset and start < next_offset:
+                        # 페이지 텍스트에서 span 텍스트 찾기
+                        search_text = span_text.strip()
+                        if not search_text:
+                            continue
+                        
+                        # 페이지에서 텍스트 검색
+                        page = doc[page_idx]
+                        rects = page.search_for(search_text)
+                        
+                        if rects:
+                            # 모든 매칭 위치에 박스 추가
+                            for r in rects:
+                                boxes.append(
+                                    Box(page=page_idx, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
+                                )
+                            
+                            print(
+                                f"{log_prefix} NER BOX",
+                                "page=", page_idx + 1,
+                                "label=", span.get("label", "unknown"),
+                                "text=", repr(search_text[:50]),
+                                "matches=", len(rects),
+                            )
+                        break
+        finally:
+            doc.close()
 
     return apply_redaction(pdf_bytes, boxes)

@@ -5,7 +5,6 @@ from typing import Dict, Any, List
 from server.utils.file_reader import extract_from_file
 from server.core.redaction_rules import PRESET_PATTERNS
 from server.api.redaction_api import match_text
-from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 
 router = APIRouter(prefix="/text", tags=["text"])
 
@@ -43,26 +42,6 @@ async def match(req: dict):
     return match_text(text)
 
 # ──────────────────────────────────────────────────────────────────────────────
-@router.get(
-    "/policy",
-    summary="기본 병합 정책 조회",
-    description="정규식·NER 탐지 결과를 병합할 때 사용하는 서버의 기본 정책을 반환"
-)
-async def get_policy():
-    return DEFAULT_POLICY
-
-@router.put(
-    "/policy",
-    summary="병합 정책 설정",
-    description=(
-    "허용 라벨/우선순위 등 병합 정책을 갱신.\n"
-    "전달된 정책 객체를 그대로 반환"
-    )
-)
-async def set_policy(policy: dict):
-    return {"ok": True, "policy": policy}
-
-# ──────────────────────────────────────────────────────────────────────────────
 @router.post(
     "/detect",
     summary="정규식+NER 통합 탐지",
@@ -76,7 +55,7 @@ async def set_policy(policy: dict):
 async def detect(req: dict):
     text = (req or {}).get("text", "") or ""
     options = (req or {}).get("options", {}) or {}
-    policy = (req or {}).get("policy") or DEFAULT_POLICY
+    policy = (req or {}).get("policy") or {}
 
     run_regex_opt = bool(options.get("run_regex", True))
     run_ner_opt = bool(options.get("run_ner", True))
@@ -110,13 +89,34 @@ async def detect(req: dict):
         from server.modules.ner_module import run_ner
         ner_spans = run_ner(text=text, policy=policy)
 
-    # 3) 병합
-    merger = MergePolicy(policy)
-    final_spans, report = merger.merge(text, regex_spans, ner_spans, degrade=(run_ner_opt is False))
+    # 3) 단순 병합 
+    final_spans = regex_spans + ner_spans
+    # 겹치는 스팬 제거 
+    final_spans.sort(key=lambda x: (x.get("start", 0), x.get("end", 0)))
+    filtered_spans = []
+    used_ranges = []
+    for span in final_spans:    
+        start = span.get("start", 0)
+        end = span.get("end", 0)
+        if end <= start:
+            continue
+        # 겹치는지 확인
+        overlaps = any(min(end, used_end) > max(start, used_start) 
+                      for used_start, used_end in used_ranges)
+        if not overlaps:
+            filtered_spans.append(span)
+            used_ranges.append((start, end))
+
+    report = {
+        "regex_input": len(regex_spans),
+        "ner_input": len(ner_spans),
+        "final_count": len(filtered_spans),
+        "degrade": not run_ner_opt,
+    }
 
     return {
         "text": text,
-        "final_spans": final_spans,
+        "final_spans": filtered_spans,
         "report": report,
         "debug": {
             "run_regex": run_regex_opt,

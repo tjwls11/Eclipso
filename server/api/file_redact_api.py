@@ -6,7 +6,6 @@ from server.modules.xml_redaction import xml_redact_to_file
 
 from server.core.regex_utils import match_text
 from server.modules.ner_module import run_ner
-from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 
 import tempfile
 import os
@@ -48,8 +47,7 @@ async def redact_file(file: UploadFile = File(...)):
             mime = "application/vnd.ms-excel"
 
         elif ext == ".pdf":
-            import fitz  # PyMuPDF
-
+            import fitz 
             try:
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 text = "\n".join([p.get_text("text") or "" for p in doc])
@@ -73,12 +71,26 @@ async def redact_file(file: UploadFile = File(...)):
                         "source": "regex",
                     })
 
-            # NER 실행 + 정책 병합
-            policy = dict(DEFAULT_POLICY)
+            # NER 실행
+            policy = {"chunk_size": 1500, "chunk_overlap": 50, "allowed_labels": None}
             ner_spans = run_ner(text=text, policy=policy)
 
-            merger = MergePolicy(policy)
-            final_spans, report = merger.merge(text, regex_spans, ner_spans)
+            # 단순 병합 (겹치는 것 제거)
+            all_spans = regex_spans + ner_spans
+            all_spans.sort(key=lambda x: (x.get("start", 0), x.get("end", 0)))
+            final_spans = []
+            used_ranges = []
+            for span in all_spans:
+                start = span.get("start", 0)
+                end = span.get("end", 0)
+                if end <= start:
+                    continue
+                # 겹치는지 확인
+                overlaps = any(min(end, used_end) > max(start, used_start) 
+                            for used_start, used_end in used_ranges)
+                if not overlaps:
+                    final_spans.append(span)
+                    used_ranges.append((start, end))
 
             # 병합된 스팬으로 PDF 텍스트 레닥션
             out = pdf_module.apply_text_redaction(file_bytes, extra_spans=final_spans)
