@@ -8,7 +8,6 @@
     <!-- Tailwind & PDF.js -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-
     <script>
       // API_BASE 자동 설정 (로컬/배포 공용)
       const origin = window.location.origin
@@ -22,7 +21,20 @@
 
       // pdf.js 워커 경로
       pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+      /* 백엔드 주소 (개발 기본값) */
+      (function () {
+        const origin = window.location.origin || "";
+        if (origin.includes("127.0.0.1") || origin.includes("localhost")) {
+          window.API_BASE = "http://127.0.0.1:8000";
+        } else {
+          window.API_BASE = origin.replace(/\/$/, "");
+        }
+      })();
+
+      /* HWPX 웹뷰어 URL(선택) */
+      window.HWPX_VIEWER_URL = "";
     </script>
   </head>
 

@@ -75,4 +75,3 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
 
     text = "".join(out_chars)
     return text, index_map
-

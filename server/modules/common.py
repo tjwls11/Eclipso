@@ -1,16 +1,9 @@
-# server/modules/common.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io
 import re
 import zipfile
 from typing import List, Tuple, Optional, Callable
-
-# 올바른 경로: server/core/redaction_rules.py
-try:
-    from ..core.redaction_rules import PRESET_PATTERNS, RULES
-except Exception:  # pragma: no cover
-    from server.core.redaction_rules import PRESET_PATTERNS, RULES  # type: ignore
+from server.core.redaction_rules import PRESET_PATTERNS, RULES
 
 __all__ = [
     # 공개 유틸
@@ -52,13 +45,7 @@ _RULE_PRIORITY = {
 
 def compile_rules() -> List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]]:
     """
-    PRESET_PATTERNS + RULES 기반으로 레닥션용 규칙을 컴파일한다.
-
-    반환 형식:
-        [
-          (name, compiled_regex, need_valid, priority, validator),
-          ...
-        ]
+    PRESET_PATTERNS + RULES 기반으로 레닥션용 규칙을 컴파일하는 함수
 
     - need_valid:
         * PRESET_PATTERNS에 ensure_valid가 명시되어 있으면 그 값을 사용
@@ -205,13 +192,14 @@ def _apply_spans(src: str, allowed) -> tuple[str, int]:
         hits += 1
     return "".join(out), hits
 
-# ---------- 핵심: 텍스트 노드만 마스킹하는 2-패스 ----------
 
+
+# ---------- 텍스트 노드만 마스킹하는 2-패스 ----------
 _TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.DOTALL)
 
 def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     """
-    XML(UTF-8 가정)에서 **태그 밖 텍스트 노드만** 토큰 단위로 2-패스 마스킹.
+    XML(UTF-8 가정)에서 태그 밖 텍스트 노드만 토큰 단위로 2-패스 마스킹.
 
     - 태그/속성(예: <c r="A1">, <row r="3">, 관계 ID 등)은 절대 건드리지 않음
     - 엑셀 구조 깨짐 / 복구 팝업 방지용
@@ -241,8 +229,10 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     masked, hits = _apply_spans(s, all_allowed)
     return masked.encode("utf-8", "ignore"), hits
 
-# ---------- 차트 관련 ----------
 
+# ------------------------------
+# 차트 관련
+# ------------------------------
 def chart_rels_sanitize(rels_bytes: bytes) -> Tuple[bytes, int]:
     # 현재는 noop. 향후 dangling 관계 정리 로직을 넣을 수 있음.
     return rels_bytes, 0
@@ -298,14 +288,14 @@ def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
 # ---------- OOXML 내장 XLSX 레닥션 ----------
 def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
     """
-    OOXML(예: docx/pptx) 안에 포함된 .xlsx를 레닥션.
+    OOXML 안에 포함된 .xlsx를 레닥션.
     구조(relationship, 주소 등)를 건드리지 않고 텍스트 노드만 마스킹한다.
     """
     comp = compile_rules()
     bio_in = io.BytesIO(xlsx_bytes)
     bio_out = io.BytesIO()
     with zipfile.ZipFile(bio_in, "r") as zin, \
-         zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
+        zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
             name = it.filename
             data = zin.read(name)
