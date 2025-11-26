@@ -209,15 +209,40 @@ def redact_xlucs(text: str) -> str:
     return "".join(chars)
 
 
+#OLE 파일 교체
+def overlay_workbook_stream(file_bytes: bytes, orig_wb: bytes, new_wb: bytes) -> bytes:
+    full = bytearray(file_bytes)
+
+    # workbook 스트림의 위치를 전체 OLE 파일에서 찾음
+    pos = full.find(orig_wb)
+    if pos == -1:
+        print("[WARN] workbook 스트림을 전체 파일에서 찾기 실패")
+        return file_bytes
+    
+    # 길이 바뀌면 Error
+    if len(orig_wb) != len(new_wb):
+        raise ValueError(
+            "[ERROR ! !] 동일길이 치환 실패"
+            f"original = {len(orig_wb)}, new = {len(new_wb)}"
+        )
+    
+    # 전체 파일 내 workbook 영역 교체
+    full[pos : pos + len(orig_wb)] = new_wb
+
+    return bytes(full)
+
+
 def redact(file_bytes: bytes) -> bytes:
     print("[INFO] XLS Redaction 시작")
 
+    # 원본 파일에서 Workbook 스트림 가져오기
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):
             print("[ERROR] Workbook 없음")
             return file_bytes
+        orig_wb = ole.openstream("Workbook").read()
 
-        wb = bytearray(ole.openstream("Workbook").read())
+    wb = bytearray(orig_wb)
 
     # SST 문자열 + offset 추출
     sst_payload, payload_off = get_sst_payload(wb)
@@ -229,21 +254,8 @@ def redact(file_bytes: bytes) -> bytes:
     # 텍스트 치환
     for x in xlucs_list:
         red = redact_xlucs(x.text)
-
-
         orig_bytes = wb[x.text_start:x.text_end]
         raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
-
-        print("\n---- DEBUG SST STRING ----")
-        print("TEXT:", repr(x.text))
-        print("RED :", repr(red))
-        print("orig byte length:", len(orig_bytes))
-        print("new  byte length :", len(raw))
-        print("cch:", x.cch)
-        print("char_size:", 2 if x.fHigh else 1)
-        print("expected byte len:", x.cch * (2 if x.fHigh else 1))
-        print("x.text_start:", x.text_start, "x.text_end:", x.text_end)
-        print("--------------------------------")
 
         if len(red) != len(x.text):
             raise ValueError("동일길이 레닥션 실패")
@@ -254,6 +266,5 @@ def redact(file_bytes: bytes) -> bytes:
 
         wb[x.text_start:x.text_end] = raw
 
-
     print("[OK] SST 텍스트 patch 완료")
-    return bytes(wb)
+    return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
