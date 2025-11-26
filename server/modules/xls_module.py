@@ -1,7 +1,6 @@
 import io, os, struct, tempfile, olefile
 from typing import List, Dict, Any, Tuple, Optional
 
-from server.core.redaction_rules import apply_redaction_rules
 from server.core.normalize import normalization_text, normalization_index
 from server.core.matching import find_sensitive_spans
 
@@ -163,6 +162,26 @@ def extract_text(file_bytes: bytes):
 
 
 
+def redact_xlucs(text: str) -> str:
+    if not text:
+        return text
+    
+    spans = find_sensitive_spans(text)
+    if not spans:
+        return text
+    
+    chars = list(text)
+
+    #겹침 방지 - start 기준 역순 적용
+    spans = sorted(spans, key=lambda x: x[0], reverse=True)
+
+    for start, end, value, rule_name in spans:
+        length = end - start
+        mask = "*" * length
+        chars[start: end] = mask
+    
+    return "".join(chars)
+
 
 def redact(file_bytes: bytes) -> bytes:
     print("[INFO] XLS Redaction 시작")
@@ -183,15 +202,13 @@ def redact(file_bytes: bytes) -> bytes:
 
     # 텍스트 치환
     for x in xlucs_list:
-        red = apply_redaction_rules(x.text)
+        red = redact_xlucs(x.text)
 
-        # 동일 길이 검증
         if len(red) != len(x.text):
-            raise ValueError(f"동일길이 레닥션 실패: '{x.text}' → '{red}'")
+            raise ValueError("동일길이 레닥션 실패")
 
         raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
 
-        # 구간 길이 정확한지 검증
         expected = x.text_end - x.text_start
         if len(raw) != expected:
             raise ValueError("raw 길이 mismatch")
