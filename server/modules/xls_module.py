@@ -1,7 +1,7 @@
 import io, os, struct, tempfile, olefile
 from typing import List, Dict, Any, Tuple, Optional
 
-from server.core.normalize import normalization_text, normalization_index
+from server.core.normalize import normalization_index
 from server.core.matching import find_sensitive_spans
 
 
@@ -102,6 +102,7 @@ class SSTParser:
         # Rich text run skip
         if x.fRichSt:
             self.read_n(4 * x.cRun)
+            print("서식런이 존재합니다.")
 
         # ExtRst skip
         if x.fExtSt and x.cbExt > 0:
@@ -229,16 +230,30 @@ def redact(file_bytes: bytes) -> bytes:
     for x in xlucs_list:
         red = redact_xlucs(x.text)
 
+
+        orig_bytes = wb[x.text_start:x.text_end]
+        raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
+
+        print("\n---- DEBUG SST STRING ----")
+        print("TEXT:", repr(x.text))
+        print("RED :", repr(red))
+        print("orig byte length:", len(orig_bytes))
+        print("new  byte length :", len(raw))
+        print("cch:", x.cch)
+        print("char_size:", 2 if x.fHigh else 1)
+        print("expected byte len:", x.cch * (2 if x.fHigh else 1))
+        print("x.text_start:", x.text_start, "x.text_end:", x.text_end)
+        print("--------------------------------")
+
         if len(red) != len(x.text):
             raise ValueError("동일길이 레닥션 실패")
-
-        raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
 
         expected = x.text_end - x.text_start
         if len(raw) != expected:
             raise ValueError("raw 길이 mismatch")
 
         wb[x.text_start:x.text_end] = raw
+
 
     print("[OK] SST 텍스트 patch 완료")
     return bytes(wb)
