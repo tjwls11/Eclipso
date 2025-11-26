@@ -160,6 +160,15 @@ def extract_text(file_bytes: bytes):
         return {"full_text": "", "pages":[{"page":1,"text":""}]}
 
 
+def mask_except_asterisk(original_segment: str) -> str:
+    out = []
+    for ch in original_segment:
+        if ch in "-":
+            out.append(ch)
+        else:
+            out.append("*")
+    return "".join(out)
+
 
 
 def redact_xlucs(text: str) -> str:
@@ -189,9 +198,12 @@ def redact_xlucs(text: str) -> str:
 
         e = e + 1   # inclusive → exclusive
 
-        length = e - s
-        mask = "*" * length
-        chars[s:e] = mask
+        original_seg = text[s:e]
+        masked = mask_except_asterisk(original_seg)
+
+        # apply
+        for i in range(len(original_seg)):
+            chars[s+i] = masked[i]
 
     return "".join(chars)
 
