@@ -165,21 +165,34 @@ def extract_text(file_bytes: bytes):
 def redact_xlucs(text: str) -> str:
     if not text:
         return text
-    
-    spans = find_sensitive_spans(text)
+
+    # 정규화 + 인덱스 매핑
+    norm_text, index_map = normalization_index(text)
+
+    # 정규화된 텍스트 기준 매칭
+    spans = find_sensitive_spans(norm_text)
     if not spans:
         return text
-    
+
     chars = list(text)
 
-    #겹침 방지 - start 기준 역순 적용
+    # 겹침 방지 - 정상 적용 루틴은 역순 매핑
     spans = sorted(spans, key=lambda x: x[0], reverse=True)
 
-    for start, end, value, rule_name in spans:
-        length = end - start
+    for s_norm, e_norm, value, rule in spans:
+        # 정규화된 인덱스를 원본 인덱스로 역매핑
+        s = index_map.get(s_norm)
+        e = index_map.get(e_norm - 1)
+
+        if s is None or e is None:
+            continue
+
+        e = e + 1   # inclusive → exclusive
+
+        length = e - s
         mask = "*" * length
-        chars[start: end] = mask
-    
+        chars[s:e] = mask
+
     return "".join(chars)
 
 
