@@ -8,7 +8,7 @@ from server.core.matching import find_sensitive_spans
 SST = 0x00FC
 CONTINUE = 0x003C
 LABELSST = 0x00FD
-LABEL = 0x0204
+LABEL = 0x0204 #chart
 
 
 def le16(b, off=0): return struct.unpack_from("<H", b, off)[0]
@@ -25,13 +25,20 @@ def iter_biff_records(data: bytes):
         off += length
         yield opcode, length, payload, header_off
 
-# SST payload + payload 오프셋 반환
-def get_sst_payload(wb: bytes):
+
+def get_sst_blocks(wb: bytes) -> Optional[List[Tuple[bytes, int]]]:
+    blocks: List[Tuple[bytes, int]] = []
+    found = False
     for opcode, length, payload, hdr in iter_biff_records(wb):
         if opcode == SST:
-            payload_off = hdr + 4
-            return payload, payload_off
-    return None, None
+            blocks.append((payload, hdr + 4))
+            found = True
+        elif found:
+            if opcode == CONTINUE:
+                blocks.append((payload, hdr + 4))
+            else:
+                break
+    return blocks if blocks else None
 
 
 
@@ -47,33 +54,84 @@ class XLUCSString:
 
         self.text = ""
 
-        # 텍스트가 SST payload에서 차지하는 정확한 오프셋 범위
-        self.text_start = 0
-        self.text_end = 0
-
+        self.byte_positions: list[int] = []
 
 
 class SSTParser:
-    def __init__(self, payload: bytes, base_payload_offset: int):
-        self.payload = payload
+    def __init__(self, blocks: List[Tuple[bytes, int]]):
+        self.blocks = blocks
+        self.idx = 0      # 현재 어느 페이로드 블록인지
+        self.pos = 0      # 해당 블록 내 현재 오프셋
+        self.cur_abs = blocks[0][1]     #Workbook 절대 오프셋 기준 현재 오프셋
+
+    def cur_block(self):
+        if self.idx >= len(self.blocks):
+            raise EOFError("SST 블록이 소진됨")
+        return self.blocks[self.idx]
+    
+    def next_block(self):
+        self.idx += 1
+        if self.idx >= len(self.blocks):
+            raise EOFError("SST 블록이 소진됨")
+        
+        payload, abs_off = self.blocks[self.idx]
         self.pos = 0
-        self.n = len(payload)
+        self.cur_abs = abs_off
+        if len(payload) > 0:
+            # CONTINUE 첫 바이트(fHighByte 플래그) consume
+            self.pos = 1
+            self.cur_abs += 1
 
-        self.base_off = base_payload_offset   # Workbook 내 절대 오프셋
+    def read_n(self, n: int) -> bytes:
+        out = bytearray()
+        remain = n
 
-        self.cstTotal = 0
-        self.cstUnique = 0
+        while remain > 0:
+            payload, abs_off = self.cur_block()
+            avail = len(payload) - self.pos
 
-    def read_n(self, n):
-        if self.pos + n > self.n:
-            raise EOFError("SST payload EOF")
-        b = self.payload[self.pos:self.pos + n]
-        self.pos += n
-        return b
+            if avail <= 0:
+                self.next_block()
+                continue
 
-    def read_sst_header(self):
-        self.cstTotal = le32(self.read_n(4))
-        self.cstUnique = le32(self.read_n(4))
+            take = min(avail, remain)
+            chunk = payload[self.pos:self.pos + take]
+            out.extend(chunk)
+
+            self.pos += take
+            self.cur_abs += take
+            remain -= take
+
+        return bytes(out)
+
+    def read_str_bytes(self, cch: int, char_size: int):
+        total = cch * char_size
+        out = bytearray()
+        pos_list: List[int] = []
+
+        while len(out) < total:
+            payload, abs_off = self.cur_block()
+            avail = len(payload) - self.pos
+
+            if avail <= 0:
+                self.next_block()
+                continue
+
+            remain = total - len(out)
+            take = min(remain, avail)
+
+            start_abs = self.cur_abs
+            chunk = payload[self.pos:self.pos + take]
+            out.extend(chunk)
+
+            for i in range(take):
+                pos_list.append(start_abs + i)
+
+            self.pos += take
+            self.cur_abs += take
+
+        return bytes(out), pos_list
+
 
     def read_XLUCS(self) -> XLUCSString:
         x = XLUCSString()
@@ -92,28 +150,27 @@ class SSTParser:
 
         char_size = 2 if x.fHigh else 1
 
-        # 텍스트 영역 오프셋 기록
-        x.text_start = self.base_off + self.pos
-        raw = self.read_n(x.cch * char_size)
-        x.text_end = self.base_off + self.pos
+        text_bytes, positions = self.read_str_bytes(x.cch, char_size)
+        x.byte_positions = positions
 
-        x.text = raw.decode("utf-16le" if x.fHigh else "latin1", errors="ignore")
+        if x.fHigh:
+            x.text = text_bytes.decode("utf-16le", errors="ignore")
+        else:
+            x.text = text_bytes.decode("latin1", errors="ignore")
 
-        # Rich text run skip
-        if x.fRichSt:
+        if x.fRichSt and x.cRun > 0:
             self.read_n(4 * x.cRun)
-            print("서식런이 존재합니다.")
 
-        # ExtRst skip
         if x.fExtSt and x.cbExt > 0:
             self.read_n(x.cbExt)
 
         return x
 
+
     def parse(self) -> List[XLUCSString]:
-        self.read_sst_header()
+        self.read_n(8)   # SST 헤더 스킵 (cstTotal, cstUnique)
         out = []
-        for _ in range(self.cstUnique):
+        while True:
             try:
                 out.append(self.read_XLUCS())
             except EOFError:
@@ -130,12 +187,13 @@ def extract_text(file_bytes: bytes):
                 return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
             wb = ole.openstream("Workbook").read()
 
-        sst_payload, off = get_sst_payload(wb)
-        if sst_payload:
-            xlucs_list = SSTParser(sst_payload, off).parse()
+        blocks = get_sst_blocks(wb)
+        if blocks:
+            xlucs_list = SSTParser(blocks).parse()
             strings = [x.text for x in xlucs_list]
         else:
             strings = []
+
 
         # LABELSST/LABEL -> 셀 텍스트 추출
         texts = []
@@ -235,7 +293,6 @@ def overlay_workbook_stream(file_bytes: bytes, orig_wb: bytes, new_wb: bytes) ->
 def redact(file_bytes: bytes) -> bytes:
     print("[INFO] XLS Redaction 시작")
 
-    # 원본 파일에서 Workbook 스트림 가져오기
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):
             print("[ERROR] Workbook 없음")
@@ -244,27 +301,25 @@ def redact(file_bytes: bytes) -> bytes:
 
     wb = bytearray(orig_wb)
 
-    # SST 문자열 + offset 추출
-    sst_payload, payload_off = get_sst_payload(wb)
-    if not sst_payload:
+    blocks = get_sst_blocks(wb)
+    if not blocks:
         return file_bytes
 
-    xlucs_list = SSTParser(sst_payload, payload_off).parse()
+    xlucs_list = SSTParser(blocks).parse()
 
-    # 텍스트 치환
     for x in xlucs_list:
         red = redact_xlucs(x.text)
-        orig_bytes = wb[x.text_start:x.text_end]
-        raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
-
         if len(red) != len(x.text):
             raise ValueError("동일길이 레닥션 실패")
 
-        expected = x.text_end - x.text_start
-        if len(raw) != expected:
+        raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
+
+        if len(raw) != len(x.byte_positions):
             raise ValueError("raw 길이 mismatch")
 
-        wb[x.text_start:x.text_end] = raw
+        for i, pos in enumerate(x.byte_positions):
+            wb[pos] = raw[i]
 
     print("[OK] SST 텍스트 patch 완료")
     return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
+
