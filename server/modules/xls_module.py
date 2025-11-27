@@ -62,7 +62,8 @@ class SSTParser:
         self.blocks = blocks
         self.idx = 0      # 현재 어느 페이로드 블록인지
         self.pos = 0      # 해당 블록 내 현재 오프셋
-        self.cur_abs = blocks[0][1]     #Workbook 절대 오프셋 기준 현재 오프셋
+        self.cur_abs = blocks[0][1]     # Workbook 절대 오프셋 기준 현재 오프셋
+        self.reading_text = False       # 문자열 읽는 중인지 여부
 
     def cur_block(self):
         if self.idx >= len(self.blocks):
@@ -77,8 +78,9 @@ class SSTParser:
         payload, abs_off = self.blocks[self.idx]
         self.pos = 0
         self.cur_abs = abs_off
-        if len(payload) > 0:
-            # CONTINUE 첫 바이트(fHighByte 플래그) consume
+
+        # 문자열이 CONTINUE로 이어질때만 인코딩 바이트 소비
+        if self.reading_text and len(payload) > 0:
             self.pos = 1
             self.cur_abs += 1
 
@@ -105,6 +107,7 @@ class SSTParser:
         return bytes(out)
 
     def read_str_bytes(self, cch: int, char_size: int):
+        self.reading_text = True 
         total = cch * char_size
         out = bytearray()
         pos_list: List[int] = []
@@ -130,6 +133,7 @@ class SSTParser:
             self.pos += take
             self.cur_abs += take
 
+        self.reading_text = False
         return bytes(out), pos_list
 
 
