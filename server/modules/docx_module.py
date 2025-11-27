@@ -1,219 +1,193 @@
+# server/modules/docx_module.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import io, zlib, struct
+
+import io
+import re
+import zipfile
 from typing import List, Tuple
-import olefile
 
-from server.core.matching import find_sensitive_spans  
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
+try:
+    from .common import (
+        cleanup_text,
+        compile_rules,
+        sub_text_nodes,
+        chart_sanitize,
+        xlsx_text_from_zip,
+        redact_embedded_xlsx_bytes,
+        chart_rels_sanitize,
+        sanitize_docx_content_types,
+    )
+except Exception:  # pragma: no cover - 구조가 달라졌을 때 대비
+    from server.modules.common import (  # type: ignore
+        cleanup_text,
+        compile_rules,
+        sub_text_nodes,
+        chart_sanitize,
+        xlsx_text_from_zip,
+        redact_embedded_xlsx_bytes,
+        chart_rels_sanitize,
+        sanitize_docx_content_types,
+    )
 
-TAG_PARA_TEXT = 67
-
-def _decompress(raw: bytes) -> Tuple[bytes, int]:
-    for w in (-15, +15):
-        try:
-            return zlib.decompress(raw, w), w
-        except zlib.error:
-            pass
-    return raw, 0
-
-def _recompress(buf: bytes, mode: int) -> bytes:
-    if mode == 0:
-        return buf
-    c = zlib.compressobj(level=9, wbits=mode)
-    return c.compress(buf) + c.flush()
-
-def _direntry_for(ole: olefile.OleFileIO, path: Tuple[str, ...]):
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
+try:
+    from ..core.schemas import XmlMatch, XmlLocation  # 현재 리포 구조
+except Exception:
     try:
-        sid_or_entry = ole._find(path)
-        if isinstance(sid_or_entry, int):
-            i = sid_or_entry
-            return ole.direntries[i] if 0 <= i < len(ole.direntries) else None
-        return sid_or_entry
+        from ..schemas import XmlMatch, XmlLocation   # 옛 구조 호환
     except Exception:
-        return None
+        from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
 
-def _collect_ministream_offsets(ole: olefile.OleFileIO) -> List[int]:
-    root = getattr(ole, "root", None)
-    if root is None:
-        return []
-    sec_size = ole.sector_size
-    fat = ole.fat
-    s = root.isectStart
-    out: List[int] = []
-    while s not in (-1, olefile.ENDOFCHAIN) and 0 <= s < len(fat):
-        out.append((s + 1) * sec_size)
-        s = fat[s]
-        if len(out) > 65536:
-            break
-    return out
 
-def _overwrite_bigfat(ole: olefile.OleFileIO, container: bytearray, start_sector: int, new_raw: bytes) -> int:
-    sec_size = ole.sector_size
-    fat = ole.fat
-    s = start_sector
-    pos = wrote = 0
-    while s not in (-1, olefile.ENDOFCHAIN) and 0 <= s < len(fat) and pos < len(new_raw):
-        off = (s + 1) * sec_size
-        chunk = new_raw[pos : pos + sec_size]
-        container[off : off + len(chunk)] = chunk
-        pos += len(chunk)
-        wrote += len(chunk)
-        s = fat[s]
-    return wrote
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCX 텍스트 추출
+#   - word/document.xml 본문 텍스트
+#   - word/charts/*.xml 라벨/값
+#   - word/embeddings/*.xlsx 안의 셀/차트 텍스트
+# ─────────────────────────────────────────────────────────────────────────────
+def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
+    parts: List[str] = []
 
-def _overwrite_minifat_chain(ole: olefile.OleFileIO, container: bytearray, mini_start: int, new_raw: bytes) -> int:
-    ole.loadminifat()
-    mini_size = ole.mini_sector_size
-    minifat = getattr(ole, "minifat", [])
-    ministream_offsets = _collect_ministream_offsets(ole)
-    if not ministream_offsets or not minifat:
-        return 0
-    pos = wrote = 0
-    s = mini_start
-    while s not in (-1, olefile.ENDOFCHAIN) and 0 <= s < len(minifat) and pos < len(new_raw):
-        mini_off = s * mini_size
-        big_index = mini_off // ole.sector_size
-        within = mini_off % ole.sector_size
-        if big_index >= len(ministream_offsets):
-            break
-        file_off = ministream_offsets[big_index] + within
-        chunk = new_raw[pos : pos + mini_size]
-        container[file_off : file_off + len(chunk)] = chunk
-        pos += len(chunk)
-        wrote += len(chunk)
-        s = minifat[s]
-        if wrote > 64 * 1024 * 1024:
-            break
-    return wrote
+    # 1) 차트 XML 내부 라벨/캐시 텍스트
+    for name in sorted(
+        n for n in zipf.namelist()
+        if n.startswith("word/charts/") and n.endswith(".xml")
+    ):
+        s = zipf.read(name).decode("utf-8", "ignore")
+        for m in re.finditer(
+            r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>", s, re.I | re.DOTALL
+        ):
+            v = (m.group(1) or m.group(2) or "")
+            if v:
+                parts.append(v)
 
-def _iter_para_text_records(section_dec: bytes):
-    off, n = 0, len(section_dec)
-    while off + 4 <= n:
-        hdr = struct.unpack_from("<I", section_dec, off)[0]
-        tag = hdr & 0x3FF
-        size = (hdr >> 20) & 0xFFF
-        off += 4
-        if size < 0 or off + size > n:
-            break
-        payload = section_dec[off : off + size]
-        if tag == TAG_PARA_TEXT:
-            yield payload
-        off += size
-
-def extract_text(file_bytes: bytes) -> dict:
-    texts: List[str] = []
-    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-        for path in ole.listdir(streams=True, storages=False):
-            if not (len(path) >= 2 and path[0] == "BodyText" and path[1].startswith("Section")):
-                continue
-            raw = ole.openstream(path).read()
-            dec, _ = _decompress(raw)
-            for payload in _iter_para_text_records(dec):
-                try:
-                    texts.append(payload.decode("utf-16le", "ignore"))
-                except Exception:
-                    pass
-    full = "\n".join(texts)
-    return {"full_text": full, "pages": [{"page": 1, "text": full}]}
-
-def _collect_targets_by_regex(text: str) -> List[str]:
-    res = find_sensitive_spans(text) 
-    targets: List[str] = []
-    for s, e, _val, _rule in res:
-        if isinstance(s, int) and isinstance(e, int) and e > s:
-            frag = text[s:e]
-            if frag and len(frag.strip()) >= 1:
-                targets.append(frag)
-    targets = sorted(set(targets), key=lambda x: (-len(x), x))
-    return targets
-
-def _replace_utf16le_keep_len(buf: bytes, t: str) -> Tuple[bytes, int]:
-    if not t:
-        return buf, 0
-    pat = t.encode("utf-16le", "ignore")
-    rep = ("*" * len(t)).encode("utf-16le")
-    count = buf.count(pat)
-    if count:
-        buf = buf.replace(pat, rep)
-    return buf, count
-
-def _replace_in_bindata(raw: bytes, t: str) -> Tuple[bytes, int]:
-    total = 0
-    out = raw
-    for enc in ("utf-16le", "utf-8", "cp949"):
+    # 2) 임베디드 XLSX 내부의 문자열/시트/차트 텍스트
+    for name in sorted(
+        n for n in zipf.namelist()
+        if n.startswith("word/embeddings/") and n.lower().endswith(".xlsx")
+    ):
         try:
-            pat = t.encode(enc, "ignore")
-            if not pat:
-                continue
-            rep = (("*" * len(t)).encode("utf-16le") if enc == "utf-16le" else b"*" * len(pat))
-            hits = out.count(pat)
-            if hits:
-                out = out.replace(pat, rep)
-                total += hits
-        except Exception:
+            xlsx_bytes = zipf.read(name)
+            with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as xzf:
+                parts.append(xlsx_text_from_zip(xzf))
+        except KeyError:
             pass
-    return out, total
+        except zipfile.BadZipFile:
+            continue
 
-def redact(file_bytes: bytes) -> bytes:
-    container = bytearray(file_bytes)
-    full = extract_text(file_bytes)["full_text"]
-    targets = _collect_targets_by_regex(full) 
+    return cleanup_text("\n".join(p for p in parts if p))
 
-    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-        streams = ole.listdir(streams=True, storages=False)
-        cutoff = getattr(ole, "minisector_cutoff", 4096)
 
-        # BodyText/Section*
-        for path in streams:
-            if not (len(path) >= 2 and path[0] == "BodyText" and path[1].startswith("Section")):
-                continue
-            raw = ole.openstream(path).read()
-            dec, mode = _decompress(raw)
-            buf = bytearray(dec)
+def docx_text(zipf: zipfile.ZipFile) -> str:
+    # 본문(document.xml)
+    try:
+        xml = zipf.read("word/document.xml").decode("utf-8", "ignore")
+    except KeyError:
+        xml = ""
 
-            off, n = 0, len(buf)
-            while off + 4 <= n:
-                hdr = struct.unpack_from("<I", buf, off)[0]
-                tag = hdr & 0x3FF
-                size = (hdr >> 20) & 0xFFF
-                off += 4
-                if size < 0 or off + size > n:
-                    break
-                if tag == TAG_PARA_TEXT and size > 0 and targets:
-                    seg = bytes(buf[off:off+size])
-                    for t in targets:
-                        seg, _ = _replace_utf16le_keep_len(seg, t)
-                    buf[off:off+size] = seg
-                off += size
+    text_main = "".join(
+        m.group(1) for m in re.finditer(r"<w:t[^>]*>(.*?)</w:t>", xml, re.DOTALL)
+    )
+    text_main = cleanup_text(text_main)
 
-            new_raw = _recompress(bytes(buf), mode)
-            if len(new_raw) < len(raw):
-                new_raw = new_raw + b"\x00" * (len(raw) - len(new_raw))
-            elif len(new_raw) > len(raw):
-                new_raw = new_raw[:len(raw)]
+    # 차트 + 임베디드 XLSX
+    text_charts = _collect_chart_texts(zipf)
 
-            entry = _direntry_for(ole, tuple(path))
-            if not entry:
-                continue
-            if entry.size < cutoff:
-                _overwrite_minifat_chain(ole, container, entry.isectStart, new_raw)
+    return cleanup_text("\n".join(x for x in [text_main, text_charts] if x))
+
+
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+def extract_text(file_bytes: bytes) -> dict:
+    """
+    DOCX 바이트에서 텍스트만 추출.
+    full_text / pages 형식으로 반환 (HWPX extract_text와 동일 형식).
+    """
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+        txt = docx_text(zipf)
+
+    return {
+        "full_text": txt,
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보 추출
+#   - compile_rules()가 3/4/5튜플 또는 네임드 객체여도 동작하게 유연하게 처리
+# ─────────────────────────────────────────────────────────────────────────────
+def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
+    text = docx_text(zipf)
+    comp = compile_rules()
+    out: List[XmlMatch] = []
+
+    for ent in comp:
+        try:
+            # tuple/list 계열
+            if isinstance(ent, (list, tuple)):
+                if len(ent) >= 2:
+                    rule_name, rx = ent[0], ent[1]
+                else:
+                    continue
             else:
-                _overwrite_bigfat(ole, container, entry.isectStart, new_raw)
+                # 네임드 객체(SimpleNamespace 등)
+                rule_name = getattr(ent, "name", getattr(ent, "rule", "unknown"))
+                rx = getattr(ent, "rx", getattr(ent, "regex", None))
+            if rx is None:
+                continue
+        except Exception:
+            continue
 
-        # BinData/*.OLE
-        for path in streams:
-            if not (len(path) >= 2 and path[0] == "BinData" and path[1].endswith(".OLE")):
-                continue
-            raw = ole.openstream(path).read()
-            rep = raw
-            hit = 0
-            for t in targets:
-                rep, c = _replace_in_bindata(rep, t)
-                hit += c
-            if hit <= 0 or len(rep) != len(raw):
-                continue
-            entry = _direntry_for(ole, tuple(path))
-            if not entry:
-                continue
-            _overwrite_bigfat(ole, container, entry.isectStart, rep)
+        for m in rx.finditer(text):
+            val = m.group(0)
+            out.append(
+                XmlMatch(
+                    rule=rule_name,
+                    value=val,
+                    valid=True,  # DOCX 스캔은 일단 전부 valid로 표시 (레닥션 쪽에서 validator 사용)
+                    context=text[max(0, m.start() - 20): min(len(text), m.end() + 20)],
+                    location=XmlLocation(
+                        kind="docx",
+                        part="*merged_text*",
+                        start=m.start(),
+                        end=m.end(),
+                    ),
+                )
+            )
 
-    return bytes(container)
+    return out, "docx", text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 파일 단위 레닥션: 각 파트별로 처리
+# ─────────────────────────────────────────────────────────────────────────────
+def redact_item(filename: str, data: bytes, comp):
+    low = filename.lower()
+
+    # 0) DOCX 루트 컨텐츠 타입 정리
+    if low == "[content_types].xml":
+        return sanitize_docx_content_types(data)
+
+    # 1) 본문 XML: 텍스트 노드만 마스킹
+    if low == "word/document.xml":
+        return sub_text_nodes(data, comp)[0]
+
+    # 2) 차트 XML: 라벨/캐시 + 텍스트 노드 마스킹
+    if low.startswith("word/charts/") and low.endswith(".xml"):
+        b2, _ = chart_sanitize(data, comp)
+        return sub_text_nodes(b2, comp)[0]
+
+    # 3) 차트 RELS
+    if low.startswith("word/charts/_rels/") and low.endswith(".rels"):
+        b2, _ = chart_rels_sanitize(data)
+        return b2
+
+    # 4) 임베디드 XLSX
+    if low.startswith("word/embeddings/") and low.endswith(".xlsx"):
+        return redact_embedded_xlsx_bytes(data)
+
+    # 5) 기타 파트는 그대로
+    return data

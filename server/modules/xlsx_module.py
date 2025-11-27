@@ -1,23 +1,55 @@
+# server/modules/xlsx_module.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io, zipfile
 from typing import List, Tuple
-from server.core.schemas import XmlMatch, XmlLocation  
-from server.core.redaction_rules import RULES
-from .common import (
-    cleanup_text,
-    compile_rules,
-    sub_text_nodes,
-    chart_sanitize,
-    xlsx_text_from_zip,
-    chart_rels_sanitize,
+
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
+try:
+    from .common import (
+        cleanup_text,
+        compile_rules,
+        sub_text_nodes,
+        chart_sanitize,
+        xlsx_text_from_zip,
+        chart_rels_sanitize,
+    )
+except Exception:  # pragma: no cover - 패키지 구조 달라졌을 때 대비
+    from server.modules.common import (  # type: ignore
+        cleanup_text,
+        compile_rules,
+        sub_text_nodes,
+        chart_sanitize,
+        xlsx_text_from_zip,
+        chart_rels_sanitize,
     )
 
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
+try:
+    from ..core.schemas import XmlMatch, XmlLocation  # 일반적인 현재 리포 구조
+except Exception:
+    try:
+        from ..schemas import XmlMatch, XmlLocation   # 일부 브랜치/옛 구조
+    except Exception:
+        from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
+
+
+# ── RULES(validator) 접근 ─────────────────────────────────────────────────────
+try:
+    from ..core.redaction_rules import RULES
+except Exception:
+    try:
+        from ..redaction_rules import RULES  # type: ignore
+    except Exception:
+        from server.core.redaction_rules import RULES  # type: ignore
+
+
 def xlsx_text(zipf: zipfile.ZipFile) -> str:
-    """XLSX 에서 텍스트를 모아 하나의 문자열로 합침"""
+    """XLSX(zip)에서 텍스트를 모아 하나의 문자열로 합칩니다."""
     return xlsx_text_from_zip(zipf)
 
 
-# /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
 def extract_text(file_bytes: bytes) -> dict:
     """바이트로 들어온 XLSX에서 텍스트만 추출."""
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:

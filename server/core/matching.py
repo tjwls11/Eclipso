@@ -1,7 +1,16 @@
+# server/core/matching.py
 from __future__ import annotations
+
 import re
 from typing import List, Tuple
-from server.modules.common import compile_rules
+
+# ── 공통 룰/validator 컴파일 유틸 가져오기 ────────────────────────────────
+# modules.common.compile_rules() 는
+#   [(name, compiled_regex, need_valid, priority, validator), ...] 형태를 반환한다.
+try:
+    from ..modules.common import compile_rules
+except Exception:  # pragma: no cover
+    from server.modules.common import compile_rules  # type: ignore
 
 
 def _is_valid(value: str, validator) -> bool:
@@ -28,8 +37,11 @@ def find_sensitive_spans(text: str) -> List[Tuple[int, int, str, str]]:
     공용 정규식 + validator 기반 민감정보 매칭 엔진.
 
     - PRESET_PATTERNS + RULES 를 compile_rules() 로 컴파일해서 사용
-    - validator 가 걸려 있는 룰(주민번호, 카드, 전화번호 등)은 유효성 검증에 실패하면 결과에서 아예 제외
-    → 기존 match_text / doc_module 코드와 동일한 포맷 유지.
+    - validator 가 걸려 있는 룰(주민번호, 카드, 전화번호 등)은
+      **유효성 검증에 실패하면 결과에서 아예 제외**한다.
+    - 반환:
+        [(start, end, value, pattern_name), ...]
+      → 기존 match_text / doc_module 코드와 동일한 포맷 유지.
     """
     if not isinstance(text, str):
         text = str(text)
@@ -52,5 +64,5 @@ def find_sensitive_spans(text: str) -> List[Tuple[int, int, str, str]]:
 
             results.append((m.start(), m.end(), value, name))
 
-    print(f"[MATCHING] 총 {len(results)}개 매칭")
+    print(f"[core.matching] 총 {len(results)}개 매칭")
     return results
