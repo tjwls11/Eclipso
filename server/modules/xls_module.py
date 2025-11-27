@@ -219,14 +219,32 @@ def extract_text(file_bytes: bytes):
         return {"full_text": "", "pages":[{"page":1,"text":""}]}
 
 
-def mask_except_asterisk(original_segment: str) -> str:
-    out = []
-    for ch in original_segment:
-        if ch in "-":
-            out.append(ch)
+def encode_masked_text(text: str, fHigh: int) -> bytes:
+    char_size = 2 if fHigh else 1
+    out = bytearray()
+
+    for ch in text:
+        if fHigh:
+            encoded = ch.encode("utf-16le", errors="ignore")
         else:
-            out.append("*")
-    return "".join(out)
+            encoded = ch.encode("latin1", errors="ignore")
+
+        if len(encoded) != char_size:
+            raise ValueError("문자 인코딩 길이가 char_size와 일치하지 않음")
+
+        out.extend(encoded)
+
+    return bytes(out)
+
+
+def mask_except_hypen(orig_segment: str) -> str:
+    out_chars = []
+    for ch in orig_segment:
+        if ch == "-":
+            out_chars.append("-")
+        else:
+            out_chars.append("*")
+    return "".join(out_chars)
 
 
 
@@ -244,27 +262,30 @@ def redact_xlucs(text: str) -> str:
 
     chars = list(text)
 
-    # 겹침 방지 - 정상 적용 루틴은 역순 매핑
+    # 겹침 방지 - start 기준 역순
     spans = sorted(spans, key=lambda x: x[0], reverse=True)
 
     for s_norm, e_norm, value, rule in spans:
-        # 정규화된 인덱스를 원본 인덱스로 역매핑
+        # 정규화 인덱스를 원본 인덱스로 역매핑
         s = index_map.get(s_norm)
         e = index_map.get(e_norm - 1)
-
         if s is None or e is None:
             continue
-
-        e = e + 1   # inclusive → exclusive
+        e = e + 1  # inclusive → exclusive
 
         original_seg = text[s:e]
-        masked = mask_except_asterisk(original_seg)
+        masked_seg = mask_except_hypen(original_seg)
 
-        # apply
-        for i in range(len(original_seg)):
-            chars[s+i] = masked[i]
+        # 길이 동일 보장
+        if len(masked_seg) != len(original_seg):
+            raise ValueError("마스킹 후 길이 불일치")
+
+        # 적용
+        for i, ch in enumerate(masked_seg):
+            chars[s + i] = ch
 
     return "".join(chars)
+
 
 
 #OLE 파일 교체
@@ -308,18 +329,24 @@ def redact(file_bytes: bytes) -> bytes:
     xlucs_list = SSTParser(blocks).parse()
 
     for x in xlucs_list:
-        red = redact_xlucs(x.text)
-        if len(red) != len(x.text):
-            raise ValueError("동일길이 레닥션 실패")
+        red_text = redact_xlucs(x.text)
 
-        raw = red.encode("utf-16le" if x.fHigh else "latin1", errors="ignore")
+        # 문자 수 동일해야 함
+        if len(red_text) != len(x.text):
+            raise ValueError("동일길이 레닥션 실패 (문자 수 불일치)")
 
+        # fHigh 기반 인코딩
+        raw = encode_masked_text(red_text, x.fHigh)
+
+        # byte_positions와 길이 동일해야 함
         if len(raw) != len(x.byte_positions):
             raise ValueError("raw 길이 mismatch")
 
+        # CONTINUE-aware 바이트 패치
         for i, pos in enumerate(x.byte_positions):
             wb[pos] = raw[i]
 
     print("[OK] SST 텍스트 patch 완료")
     return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
+
 
