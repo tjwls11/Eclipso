@@ -140,7 +140,7 @@ class SSTParser:
         return bytes(out), pos_list
 
 
-    def read_XLUCS(self) -> XLUCSString:
+    def parse_exlus(self) -> XLUCSString:
         x = XLUCSString()
 
         x.cch = le16(self.read_n(2))
@@ -179,7 +179,7 @@ class SSTParser:
         out = []
         while True:
             try:
-                out.append(self.read_XLUCS())
+                out.append(self.parse_exlus())
             except EOFError:
                 break
         return out
@@ -218,31 +218,34 @@ def encode_masked_text(text: str, fHigh: int) -> bytes:
 
 
 
-def parse_simpleXLUS(payload: bytes) -> Tuple[str, int, int]:
-    if len(payload) < 3:
-        return "", 0, 0
+def parse_xlus(payload: bytes, off: int):
+    if off + 3 > len(payload):
+        return "", 0, 0, off  # text, cch, fHigh, next offset
     
-    cch = le16(payload, 0)
-    fHigh = payload[2] & 0x01
-    rgb_off = 3
+    cch = le16(payload, off)
+    fHigh = payload[off + 2] & 0x01
+    rgb_off = off + 3
 
     if fHigh:
         rgb_len = cch * 2
-        rgb = payload[rgb_off:rgb_off + rgb_len]
-        text = rgb.decode("utf-16le", errors="ignore")
+        raw = payload[rgb_off: rgb_off + rgb_len]
+        text = raw.decode("utf-16le", errors="ignore")
     else:
         rgb_len = cch
-        rgb = payload[rgb_off:rgb_off + rgb_len]
-        text = rgb.decode("latin1", errors="ignore")
+        raw = payload[rgb_off: rgb_off + rgb_len]
+        text = raw.decode("latin1", errors="ignore")
 
-    return text, cch, fHigh
+    next_off = rgb_off + rgb_len
+    return text, cch, fHigh, next_off
+
+
 
 def extract_hdr_fdr(wb: bytes) -> List[str]:
     texts = []
 
     for opcode, length, payload, hdr in iter_biff_records(wb):
         if opcode in (HEADER, FOOTER):
-            text, cch, fHigh = parse_simpleXLUS(payload)
+            text, cch, fHigh = parse_xlus(payload)
             if text:
                 texts.append(text)
 
@@ -297,25 +300,6 @@ def mask_except_hypen(orig_segment: str) -> str:
     return "".join(out_chars)
 
 
-def redact_hdr_fdr(wb: bytearray) -> None:
-    for opcode, length, payload, hdr in iter_biff_records(wb):
-        if opcode not in (HEADER, FOOTER):
-            continue
-
-        text, cch, fHigh = parse_simpleXLUS(payload)
-        if cch == 0:
-            continue
-
-        new_text = redact_xlucs(text)
-
-        if len(new_text) != len(text):
-            raise ValueError("Header/Footer 레닥션 길이 불일치")
-
-        raw = encode_masked_text(new_text, fHigh)
-
-        rgb_start = hdr + 4 + 3   # 4 bytes(record header) + 3 bytes(rgb offset)
-        wb[rgb_start:rgb_start + len(raw)] = raw
-
 
 def redact_xlucs(text: str) -> str:
     if not text:
@@ -354,6 +338,26 @@ def redact_xlucs(text: str) -> str:
             chars[s + i] = ch
 
     return "".join(chars)
+
+
+def redact_hdr_fdr(wb: bytearray) -> None:
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode not in (HEADER, FOOTER):
+            continue
+
+        text, cch, fHigh = parse_xlus(payload)
+        if cch == 0:
+            continue
+
+        new_text = redact_xlucs(text)
+
+        if len(new_text) != len(text):
+            raise ValueError("Header/Footer 레닥션 길이 불일치")
+
+        raw = encode_masked_text(new_text, fHigh)
+
+        rgb_start = hdr + 4 + 3   # 4 bytes(record header) + 3 bytes(rgb offset)
+        wb[rgb_start:rgb_start + len(raw)] = raw
 
 
 
