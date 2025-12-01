@@ -219,8 +219,10 @@ def encode_masked_text(text: str, fHigh: int) -> bytes:
 
 
 def parse_xlus(payload: bytes, off: int):
+    start = off
+
     if off + 3 > len(payload):
-        return "", 0, 0, off  # text, cch, fHigh, next offset
+        return "", 0, 0, off, 0  # text, cch, fHigh, next offset, raw_len
     
     cch = le16(payload, off)
     fHigh = payload[off + 2] & 0x01
@@ -236,30 +238,65 @@ def parse_xlus(payload: bytes, off: int):
         text = raw.decode("latin1", errors="ignore")
 
     next_off = rgb_off + rgb_len
-    return text, cch, fHigh, next_off
+    raw_len = next_off - start 
+
+    return text, cch, fHigh, next_off, raw_len
 
 
 
-def extract_hdr_fdr(wb: bytes) -> List[str]:
-    texts = []
+def extract_headerfooter(payload: bytes, count=6):
+    items = []
 
-    for opcode, length, payload, hdr in iter_biff_records(wb):
-        if opcode in (HEADER, FOOTER):
-            text, cch, fHigh = parse_xlus(payload)
-            if text:
-                texts.append(text)
+    off = 0
 
-    return texts
+    off += 28 # frtHeader, guidSView
+
+    # flags
+    flags = le16(payload, off)
+    off += 2
+    fDiffOddEven = flags & 0x0001
+    fDiffFirst   = (flags >> 1) & 0x0001
+    print(f"[DEBUG] fDiffOddEven={fDiffOddEven}, fDiffFirst={fDiffFirst}")
+
+    # cchHeaderEven / FooterEven / HeaderFirst / FooterFirst (4 * 2)
+    cchHeaderEven  = le16(payload, off); off += 2
+    cchFooterEven  = le16(payload, off); off += 2
+    cchHeaderFirst = le16(payload, off); off += 2
+    cchFooterFirst = le16(payload, off); off += 2
+
+    # str 부분
+    for _ in range(count):
+        if off >= len(payload):
+            break
+
+        text, cch, fHigh, next_off, raw_len = parse_xlus(payload, off)
+
+        items.append({
+            "text": text,
+            "cch": cch,
+            "fHigh": fHigh,
+            "off": off,
+            "raw_len": raw_len
+        })
+
+        off = next_off
+
+    return items
+
 
 
 def extract_text(file_bytes: bytes):
     try:
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
             if not ole.exists("Workbook"):
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+                return {
+                    "full_text": "",
+                    "pages": [{"page": 1, "text": ""}]
+                }
+
             wb = ole.openstream("Workbook").read()
 
-        # SST 기반 문자열 리스트 만들기
+        # SST 문자열 리스트 만들기
         blocks = get_sst_blocks(wb)
         if blocks:
             xlucs_list = SSTParser(blocks).parse()
@@ -267,26 +304,41 @@ def extract_text(file_bytes: bytes):
         else:
             strings = []
 
-        # 본문 텍스트 추출
+        # 본문 텍스트
         body = extract_sst(wb, strings)
 
-        # 헤더/푸터 텍스트 추출
-        hdr_fdr = extract_hdr_fdr(wb)
+        header_texts = []
+
+        for opcode, length, payload, hdr in iter_biff_records(wb):
+
+            # HEADER / FOOTER
+            if opcode in (HEADER, FOOTER):
+                text, cch, fHigh, next_off, raw_len = parse_xlus(payload, 0)
+                if text:
+                    header_texts.append(text)
+
+            # HEADERFOOTER
+            elif opcode == HEADERFOOTER:
+                items = extract_headerfooter(payload)
+                for item in items:
+                    if item["text"]:
+                        header_texts.append(item["text"])
 
         # 전체 합치기
-        combined = body + hdr_fdr
-        full_text = "\n".join(combined)
+        combined_texts = body + header_texts
+        full_text = "\n".join(combined_texts)
 
         return {
             "body": body,
-            "header_footer": hdr_fdr,
+            "header_footer": header_texts,
             "full_text": full_text,
-            "pages":[{"page":1,"text":full_text}]
+            "pages": [{"page": 1, "text": full_text}],
         }
 
     except Exception as e:
         print("[ERROR extract]:", e)
-        return {"full_text": "", "pages":[{"page":1,"text":""}]}
+        return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+
 
 
 
