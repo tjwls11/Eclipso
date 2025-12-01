@@ -181,7 +181,7 @@ def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
 def sanitize_docx_content_types(xml_bytes: bytes) -> bytes:
     return xml_bytes
 
-# XLSX 텍스트 수집(sharedStrings/worksheets/charts) 확인용
+# XLSX 텍스트 수집(sharedStrings/worksheets/charts)
 def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
     out: List[str] = []
     try:
