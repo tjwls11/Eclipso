@@ -8,6 +8,9 @@ from server.core.matching import find_sensitive_spans
 SST = 0x00FC
 CONTINUE = 0x003C
 LABELSST = 0x00FD
+HEADER = 0x0014
+FOOTER = 0x0015
+HEADERFOOTER = 0x089C
 LABEL = 0x0204 #chart
 
 
@@ -26,6 +29,9 @@ def iter_biff_records(data: bytes):
         yield opcode, length, payload, header_off
 
 
+# ───────────────────────────────────────────────
+# 본문 SST + CONTINUE 부분
+# ───────────────────────────────────────────────
 def get_sst_blocks(wb: bytes) -> Optional[List[Tuple[bytes, int]]]:
     blocks: List[Tuple[bytes, int]] = []
     found = False
@@ -40,8 +46,6 @@ def get_sst_blocks(wb: bytes) -> Optional[List[Tuple[bytes, int]]]:
                 break
     return blocks if blocks else None
 
-
-
 class XLUCSString:
     def __init__(self):
         self.cch = 0
@@ -55,7 +59,6 @@ class XLUCSString:
         self.text = ""
 
         self.byte_positions: list[int] = []
-
 
 class SSTParser:
     def __init__(self, blocks: List[Tuple[bytes, int]]):
@@ -184,43 +187,16 @@ class SSTParser:
 
 
 # 문자열 추출
-def extract_text(file_bytes: bytes):
-    try:
-        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-            if not ole.exists("Workbook"):
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
-            wb = ole.openstream("Workbook").read()
+def extract_sst(wb: bytes, strings: List[str]) -> List[str]:
+    texts = []
 
-        blocks = get_sst_blocks(wb)
-        if blocks:
-            xlucs_list = SSTParser(blocks).parse()
-            strings = [x.text for x in xlucs_list]
-        else:
-            strings = []
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode == LABELSST:
+            idx = le32(payload, 6)
+            if 0 <= idx < len(strings):
+                texts.append(strings[idx])
+    return texts
 
-
-        # LABELSST/LABEL -> 셀 텍스트 추출
-        texts = []
-        for opcode, length, payload, hdr in iter_biff_records(wb):
-            if opcode == LABELSST:
-                idx = le32(payload, 6)
-                if 0 <= idx < len(strings):
-                    texts.append(strings[idx])
-
-            elif opcode == LABEL and len(payload) > 8:
-                try:
-                    txt = payload[8:].decode("cp949", errors="ignore").strip()
-                    if txt:
-                        texts.append(txt)
-                except:
-                    pass
-
-        full_text = "\n".join(texts)
-        return {"full_text": full_text, "pages":[{"page":1,"text":full_text}]}
-
-    except Exception as e:
-        print("[ERROR extract]:", e)
-        return {"full_text": "", "pages":[{"page":1,"text":""}]}
 
 
 def encode_masked_text(text: str, fHigh: int) -> bytes:
@@ -241,6 +217,76 @@ def encode_masked_text(text: str, fHigh: int) -> bytes:
     return bytes(out)
 
 
+
+def parse_simpleXLUS(payload: bytes) -> Tuple[str, int, int]:
+    if len(payload) < 3:
+        return "", 0, 0
+    
+    cch = le16(payload, 0)
+    fHigh = payload[2] & 0x01
+    rgb_off = 3
+
+    if fHigh:
+        rgb_len = cch * 2
+        rgb = payload[rgb_off:rgb_off + rgb_len]
+        text = rgb.decode("utf-16le", errors="ignore")
+    else:
+        rgb_len = cch
+        rgb = payload[rgb_off:rgb_off + rgb_len]
+        text = rgb.decode("latin1", errors="ignore")
+
+    return text, cch, fHigh
+
+def extract_hdr_fdr(wb: bytes) -> List[str]:
+    texts = []
+
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode in (HEADER, FOOTER):
+            text, cch, fHigh = parse_simpleXLUS(payload)
+            if text:
+                texts.append(text)
+
+    return texts
+
+
+def extract_text(file_bytes: bytes):
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            if not ole.exists("Workbook"):
+                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+            wb = ole.openstream("Workbook").read()
+
+        # SST 기반 문자열 리스트 만들기
+        blocks = get_sst_blocks(wb)
+        if blocks:
+            xlucs_list = SSTParser(blocks).parse()
+            strings = [x.text for x in xlucs_list]
+        else:
+            strings = []
+
+        # 본문 텍스트 추출
+        body = extract_sst(wb, strings)
+
+        # 헤더/푸터 텍스트 추출
+        hdr_fdr = extract_hdr_fdr(wb)
+
+        # 전체 합치기
+        combined = body + hdr_fdr
+        full_text = "\n".join(combined)
+
+        return {
+            "body": body,
+            "header_footer": hdr_fdr,
+            "full_text": full_text,
+            "pages":[{"page":1,"text":full_text}]
+        }
+
+    except Exception as e:
+        print("[ERROR extract]:", e)
+        return {"full_text": "", "pages":[{"page":1,"text":""}]}
+
+
+
 def mask_except_hypen(orig_segment: str) -> str:
     out_chars = []
     for ch in orig_segment:
@@ -250,6 +296,25 @@ def mask_except_hypen(orig_segment: str) -> str:
             out_chars.append("*")
     return "".join(out_chars)
 
+
+def redact_hdr_fdr(wb: bytearray) -> None:
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode not in (HEADER, FOOTER):
+            continue
+
+        text, cch, fHigh = parse_simpleXLUS(payload)
+        if cch == 0:
+            continue
+
+        new_text = redact_xlucs(text)
+
+        if len(new_text) != len(text):
+            raise ValueError("Header/Footer 레닥션 길이 불일치")
+
+        raw = encode_masked_text(new_text, fHigh)
+
+        rgb_start = hdr + 4 + 3   # 4 bytes(record header) + 3 bytes(rgb offset)
+        wb[rgb_start:rgb_start + len(raw)] = raw
 
 
 def redact_xlucs(text: str) -> str:
@@ -326,6 +391,7 @@ def redact(file_bytes: bytes) -> bytes:
 
     wb = bytearray(orig_wb)
 
+    # SST 레닥션
     blocks = get_sst_blocks(wb)
     if not blocks:
         return file_bytes
@@ -349,8 +415,12 @@ def redact(file_bytes: bytes) -> bytes:
         # CONTINUE-aware 바이트 패치
         for i, pos in enumerate(x.byte_positions):
             wb[pos] = raw[i]
+    print("[OK] SST 텍스트 레닥션 완료")
+    
+    # 헤더/바닥글 레닥션
+    redact_hdr_fdr(wb)
+    print("[OK] 헤더/푸터 텍스트 레닥션 완료")
 
-    print("[OK] SST 텍스트 patch 완료")
     return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
 
 
