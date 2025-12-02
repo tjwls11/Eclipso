@@ -417,13 +417,11 @@ def redact_hdr_fdr(wb: bytearray) -> None:
         elif opcode == HEADERFOOTER:
             items = extract_headerfooter(payload)
 
-            # payload의 절대 위치 = hdr + 4(record header)
-            base = hdr + 4
+            base = hdr + 4  # payload 시작 위치 (opcode + length)
 
             for item in items:
                 text = item["text"]
-                off = item["off"]
-                raw_len = item["raw_len"]
+                off  = item["off"]      # XLUS 시작(cch 위치)
                 fHigh = item["fHigh"]
 
                 if not text:
@@ -434,9 +432,14 @@ def redact_hdr_fdr(wb: bytearray) -> None:
                 if len(new_text) != len(text):
                     raise ValueError("HEADERFOOTER 레닥션 길이 불일치")
 
-                raw = encode_masked_text(new_text, fHigh)
+                raw = encode_masked_text(new_text, fHigh)  # 텍스트 바이트만
 
-                wb[base + off : base + off + raw_len] = raw
+                # 텍스트 시작 위치: cch(2B) + flags(1B)
+                text_start = base + off + 3
+                text_end   = text_start + len(raw)
+
+                wb[text_start:text_end] = raw
+
 
 
 
