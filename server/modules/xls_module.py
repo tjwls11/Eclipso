@@ -11,7 +11,6 @@ LABELSST = 0x00FD
 HEADER = 0x0014
 FOOTER = 0x0015
 HEADERFOOTER = 0x089C
-LABEL = 0x0204 #chart
 
 
 def le16(b, off=0): return struct.unpack_from("<H", b, off)[0]
@@ -140,7 +139,7 @@ class SSTParser:
         return bytes(out), pos_list
 
 
-    def parse_exlus(self) -> XLUCSString:
+    def parse_exlucs(self) -> XLUCSString:
         x = XLUCSString()
 
         x.cch = le16(self.read_n(2))
@@ -179,7 +178,7 @@ class SSTParser:
         out = []
         while True:
             try:
-                out.append(self.parse_exlus())
+                out.append(self.parse_exlucs())
             except EOFError:
                 break
         return out
@@ -218,7 +217,7 @@ def encode_masked_text(text: str, fHigh: int) -> bytes:
 
 
 
-def parse_xlus(payload: bytes, off: int):
+def parse_xlucs(payload: bytes, off: int):
     start = off
 
     if off + 3 > len(payload):
@@ -269,7 +268,7 @@ def extract_headerfooter(payload: bytes, count=6):
         if off >= len(payload):
             break
 
-        text, cch, fHigh, next_off, raw_len = parse_xlus(payload, off)
+        text, cch, fHigh, next_off, raw_len = parse_xlucs(payload, off)
 
         items.append({
             "text": text,
@@ -313,7 +312,7 @@ def extract_text(file_bytes: bytes):
 
             # HEADER / FOOTER
             if opcode in (HEADER, FOOTER):
-                text, cch, fHigh, next_off, raw_len = parse_xlus(payload, 0)
+                text, cch, fHigh, next_off, raw_len = parse_xlucs(payload, 0)
                 if text:
                     header_texts.append(text)
 
@@ -396,7 +395,7 @@ def redact_hdr_fdr(wb: bytearray) -> None:
     for opcode, length, payload, hdr in iter_biff_records(wb):
         # HEADER / FOOTER
         if opcode in (HEADER, FOOTER):
-            text, cch, fHigh, next_off, raw_len = parse_xlus(payload, 0)
+            text, cch, fHigh, next_off, raw_len = parse_xlucs(payload, 0)
 
             if not text:
                 continue
@@ -408,7 +407,7 @@ def redact_hdr_fdr(wb: bytearray) -> None:
 
             raw = encode_masked_text(new_text, fHigh)
 
-            # XLUS 데이터 시작 offset = record header 4B + XLUS header 3B
+            # XLUCS 데이터 시작 offset = record header 4B + XLUCS header 3B
             rgb_start = hdr + 4 + 3
 
             wb[rgb_start : rgb_start + len(raw)] = raw
@@ -421,7 +420,7 @@ def redact_hdr_fdr(wb: bytearray) -> None:
 
             for item in items:
                 text = item["text"]
-                off  = item["off"]      # XLUS 시작(cch 위치)
+                off  = item["off"]      # XLUCS 시작(cch 위치)
                 fHigh = item["fHigh"]
 
                 if not text:
