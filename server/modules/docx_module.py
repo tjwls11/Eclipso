@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+import logging
 from typing import List, Tuple
 
 # 공통 유틸/스키마
@@ -16,6 +17,9 @@ from .common import (
     sanitize_docx_content_types,
 )
 from server.core.schemas import XmlMatch, XmlLocation
+
+log = logging.getLogger("xml_redaction")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
 
 # ─────────────────────
@@ -177,6 +181,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 # ─────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
+    log.info(
+        "[DOCX][RED] filename=%s low=%s size=%d",
+        filename,
+        low,
+        len(data) if isinstance(data, (bytes, bytearray)) else -1,
+    )
 
     if low == "[content_types].xml":
         return sanitize_docx_content_types(data)
@@ -191,4 +201,29 @@ def redact_item(filename: str, data: bytes, comp):
     if low.startswith("word/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)
 
+    if low.startswith("word/media/") and low.endswith(IMAGE_EXTS):
+        log.info("[DOCX][IMG] image=%s size=%d", filename, len(data))
+        return data
+
     return data
+
+
+def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    out: List[Tuple[str, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+        names = zipf.namelist()
+        log.info("[DOCX][IMG-EXTRACT] entries=%d", len(names))
+        for name in names:
+            low = name.lower()
+            if not low.startswith("word/media/"):
+                continue
+            if not low.endswith(IMAGE_EXTS):
+                continue
+            try:
+                data = zipf.read(name)
+            except KeyError:
+                continue
+            out.append((name, data))
+            log.info("[DOCX][IMG-EXTRACT] name=%s size=%d", name, len(data))
+    log.info("[DOCX][IMG-EXTRACT] total=%d", len(out))
+    return out
