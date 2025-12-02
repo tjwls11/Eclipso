@@ -20,7 +20,6 @@ def iter_biff_records(data: bytes):
         off += length
 
 
-
 # ShortXLUnicodeString
 def parse_short_xlucs(buf: bytes, off: int, single_byte_codec: str):
     if off + 2 > len(buf):
