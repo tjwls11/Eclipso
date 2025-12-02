@@ -22,11 +22,10 @@ def iter_biff_records(data: bytes):
     off, n = 0, len(data)
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
-        header_off = off
         off += 4
         payload = data[off:off + length]
         off += length
-        yield opcode, length, payload, header_off
+        yield opcode, payload
 
 
 # ───────────────────────────────────────────────
@@ -185,6 +184,18 @@ class SSTParser:
         return out
 
 
+    def read(self, n: int) -> bytes:
+        out = b""
+        while n > 0 and self.i < len(self.chunks):
+            left = self._bytes_left()
+            if left == 0:
+                self._next_chunk()
+                continue
+            take = min(left, n)
+            out += self.chunks[self.i][self.pos:self.pos + take]
+            self.pos += take
+            n -= take
+        return out
 
 # 문자열 추출
 def extract_sst(wb: bytes, strings: List[str]) -> List[str]:
@@ -471,7 +482,6 @@ def redact(file_bytes: bytes) -> bytes:
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):
-            print("[ERROR] Workbook 없음")
             return file_bytes
         orig_wb = ole.openstream("Workbook").read()
 
