@@ -20,7 +20,6 @@ def iter_biff_records(data: bytes):
         off += length
 
 
-
 # ShortXLUnicodeString
 def parse_short_xlucs(buf: bytes, off: int, single_byte_codec: str):
     if off + 2 > len(buf):
@@ -404,26 +403,14 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
 # ───────────────────────────────────────────────
 # 차트 부분 전체 처리
 # ───────────────────────────────────────────────
-def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
-    try:
-        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-            entries = ole.listdir()
-    except Exception as e:
-        print(f"[ERR] cannot scan OLE: {e}")
-        return file_bytes
-
+def redact_workbooks(file_bytes: bytes, single_byte_codec: str = "cp949") -> bytes:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
         tmp.write(file_bytes)
         temp_path = tmp.name
 
-    # 실패 시 반드시 temp 삭제
-    def cleanup():
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
     try:
-        # temp 파일을 write_mode 로 열어 모든 스트림 수정 시도
-        with olefile.OleFileIO(temp_path, write_mode=True) as olew:
+        with olefile.OleFileIO(temp_path, write_mode=True) as ole:
+            entries = ole.listdir()
 
             for entry in entries:
                 if len(entry) < 2:
@@ -431,54 +418,48 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
 
                 top = entry[0]
                 name = entry[-1]
-                path_str = "/".join(entry)
 
-                # Workbook 스트림 수정
+                # Workbook 레닥션
                 if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
-                    print(f"[INFO] redact Workbook: {path_str}")
+                    print(f"[INFO] redact Workbook: {'/'.join(entry)}")
 
-                    try:
-                        with olefile.OleFileIO(temp_path) as ole_r:
-                            wb_data = ole_r.openstream(entry).read()
+                    # 같은 핸들에서 바로 읽기
+                    wb_data = ole.openstream(entry).read()
 
-                        new_biff = redact_seriesTexts(wb_data, single_byte_codec)
+                    new_biff = redact_seriesTexts(wb_data, single_byte_codec)
 
-                        if new_biff != wb_data:
-                            olew.write_stream(path_str, new_biff)
-                            print(f"  [WRITE] Workbook updated: {path_str}")
+                    if new_biff != wb_data:
+                        # 같은 엔트리를 그대로 사용해서 write_stream
+                        ole.write_stream(entry, new_biff)
+                        print(f"  [WRITE] Workbook updated: {'/'.join(entry)}")
+                    else:
+                        print("  [SKIP] Workbook unchanged")
 
-                    except Exception as e:
-                        print(f"[ERR] Workbook redact failed: {e}")
-                        cleanup()
-                        return file_bytes  # 실패시 전체 원본 반환
 
-                # EPRINT 스트림 수정
+                # EPRINT 레닥션
                 if top == "ObjectPool" and name == "\x03EPRINT":
-                    print(f"[INFO] redact EPRINT: {path_str}")
+                    print(f"[INFO] redact EPRINT: {'/'.join(entry)}")
 
-                    try:
-                        with olefile.OleFileIO(temp_path) as ole_r:
-                            emf_data = ole_r.openstream(entry).read()
+                    emf_data = ole.openstream(entry).read()
+                    new_emf = redact_emf_stream(emf_data)
 
-                        new_emf = redact_emf_stream(emf_data)
+                    if new_emf != emf_data:
+                        ole.write_stream(entry, new_emf)
+                        print(f"  [WRITE] EPRINT updated: {'/'.join(entry)}")
+                    else:
+                        print("  [SKIP] EPRINT unchanged")
 
-                        if new_emf != emf_data:
-                            olew.write_stream(path_str, new_emf)
-                            print(f"  [WRITE] EPRINT updated: {path_str}")
-
-                    except Exception as e:
-                        print(f"[ERR] EPRINT redact failed: {e}")
-                        cleanup()
-                        return file_bytes   # 실패시 전체 원본 반환
-
-        # 전체 수정 성공
         with open(temp_path, "rb") as f:
             result = f.read()
 
-        cleanup()
         return result
 
     except Exception as e:
-        print(f"[ERR] redact_workbooks unexpected: {e}")
-        cleanup()
+        print(f"[ERR] redact_workbooks exception: {e}")
+        # 실패 시 원본 그대로 반환
         return file_bytes
+
+    finally:
+        # temp 파일 정리
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
