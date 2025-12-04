@@ -403,68 +403,63 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
 # ───────────────────────────────────────────────
 # 차트 부분 전체 처리
 # ───────────────────────────────────────────────
-def redact_workbooks(file_bytes: bytes, single_byte_codec="cp949") -> bytes:
-    try:
-        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-            modified = file_bytes
+def redact_workbooks(file_bytes: bytes, single_byte_codec: str = "cp949") -> bytes:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
+        tmp.write(file_bytes)
+        temp_path = tmp.name
 
-            # OLE 내부 엔트리 전체 순회
-            for entry in ole.listdir():
+    try:
+        with olefile.OleFileIO(temp_path, write_mode=True) as ole:
+            entries = ole.listdir()
+
+            for entry in entries:
                 if len(entry) < 2:
                     continue
 
                 top = entry[0]
                 name = entry[-1]
 
-                # 1) Workbook 레닥션
+                # Workbook 레닥션
                 if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
-                    path_str = "/".join(entry)
-                    print(f"[INFO] found Workbook stream: {path_str}")
+                    print(f"[INFO] redact Workbook: {'/'.join(entry)}")
 
+                    # 같은 핸들에서 바로 읽기
                     wb_data = ole.openstream(entry).read()
 
-                    # BIFF 전체 레닥션
                     new_biff = redact_seriesTexts(wb_data, single_byte_codec)
 
-                    # 변화가 있으면 파일 전체에 반영
                     if new_biff != wb_data:
-                        # 임시 DOC 파일을 만들고 olefile로 재작성
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
-                            tmp.write(modified)
-                            temp_path = tmp.name
+                        # 같은 엔트리를 그대로 사용해서 write_stream
+                        ole.write_stream(entry, new_biff)
+                        print(f"  [WRITE] Workbook updated: {'/'.join(entry)}")
+                    else:
+                        print("  [SKIP] Workbook unchanged")
 
-                        with olefile.OleFileIO(temp_path, write_mode=True) as olew:
-                            olew.write_stream(path_str, new_biff)
-                            print(f"  [WRITE] replaced Workbook: {path_str}")
 
-                        with open(temp_path, "rb") as f:
-                            modified = f.read()
-                        os.remove(temp_path)
-
-                # 2) EPRINT 레닥션
+                # EPRINT 레닥션
                 if top == "ObjectPool" and name == "\x03EPRINT":
-                    path_str = "/".join(entry)
-                    print(f"[INFO] found EPRINT stream: {path_str}")
+                    print(f"[INFO] redact EPRINT: {'/'.join(entry)}")
 
                     emf_data = ole.openstream(entry).read()
-
                     new_emf = redact_emf_stream(emf_data)
 
                     if new_emf != emf_data:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
-                            tmp.write(modified)
-                            temp_path = tmp.name
+                        ole.write_stream(entry, new_emf)
+                        print(f"  [WRITE] EPRINT updated: {'/'.join(entry)}")
+                    else:
+                        print("  [SKIP] EPRINT unchanged")
 
-                        with olefile.OleFileIO(temp_path, write_mode=True) as olew:
-                            olew.write_stream(path_str, new_emf)
-                            print(f"  [WRITE] replaced EPRINT: {path_str}")
+        with open(temp_path, "rb") as f:
+            result = f.read()
 
-                        with open(temp_path, "rb") as f:
-                            modified = f.read()
-                        os.remove(temp_path)
-
-            return modified
+        return result
 
     except Exception as e:
         print(f"[ERR] redact_workbooks exception: {e}")
+        # 실패 시 원본 그대로 반환
         return file_bytes
+
+    finally:
+        # temp 파일 정리
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
