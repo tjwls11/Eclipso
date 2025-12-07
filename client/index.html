@@ -7,23 +7,11 @@
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
     <script>
       /* PDF.js worker */
       pdfjsLib.GlobalWorkerOptions.workerSrc =
-        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-
-      /* 백엔드 주소 (개발 기본값) */
-      (function () {
-        const origin = window.location.origin || "";
-        if (origin.includes("127.0.0.1") || origin.includes("localhost")) {
-          window.API_BASE = "http://127.0.0.1:8000";
-        } else {
-          window.API_BASE = origin.replace(/\/$/, "");
-        }
-      })();
-
-      /* HWPX 웹뷰어를 쓸 경우 설정 */
-      window.HWPX_VIEWER_URL = "";
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
 
     <style>

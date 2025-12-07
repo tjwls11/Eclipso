@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 OLE(CFBF) 스트림 동일 길이 마스킹 + FAT/MiniFAT 브루트포스 쓰기 + 상세 로그.
 환경변수:
