@@ -229,20 +229,11 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> 
         doc.close()
 
 
+#    PRESET_PATTERNS 기반 텍스트 레닥션.
 def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> bytes:
-    """
-    PRESET_PATTERNS 기반 텍스트 레닥션.
-
-    ※ 중요:
-      - 여기서는 **regex + validator 기반 박스만 사용**한다.
-      - extra_spans(NER / 기타 매칭 결과)는 PDF 레닥션에서는
-        FAIL/OK 구분이 확실하지 않아서 현재는 *레닥션에 사용하지 않는다*.
-        (필요하면 나중에 valid=True 인 것만 별도 하이라이트 용도로 쓸 수 있음)
-    """
     # PRESET 전체를 PatternItem 형태로 만들어서 이름만 넘김
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
 
-    # extra_spans 는 지금 단계에서는 완전히 무시
-    # (FAIL 이라도 강제로 들어오는 걸 막기 위해)
+    # extra_spans 완전히 무시
     return apply_redaction(pdf_bytes, boxes)

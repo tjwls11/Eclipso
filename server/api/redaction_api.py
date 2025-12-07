@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -11,24 +10,17 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 
-from server.core.schemas import DetectResponse, PatternItem
+from server.core.schemas import DetectResponse, PatternItem, Box
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
 from server.core.redaction_rules import PRESET_PATTERNS
-
-# XML 계열 처리 모듈 (있는 버전/시그니처에 최대 호환)
-try:
-    from server.modules.xml_redaction import xml_scan, xml_redact_to_file
-except Exception:
-    xml_scan = None          # 타입: Callable | None
-    xml_redact_to_file = None
+from server.modules.common import compile_rules  # ★ 추가
+# 더 이상 find_sensitive_spans 는 사용하지 않음
+# from server.core.matching import find_sensitive_spans
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
 
 
-# ---------------------------
-# 공통 유틸
-# ---------------------------
 def _ensure_pdf(file: UploadFile) -> None:
     if file is None:
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
@@ -57,25 +49,32 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
     if not s or s.lower() in ("null", "none"):
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
-
     try:
         obj = json.loads(s)
     except json.JSONDecodeError as e:
         raise HTTPException(
             status_code=400,
-            detail=("잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
-                    f"구체적 오류: {e}")
+            detail=(
+                "잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
+                f"구체적 오류: {e}"
+            ),
         )
 
     if isinstance(obj, dict):
         if "patterns" in obj and isinstance(obj["patterns"], list):
             arr = obj["patterns"]
         else:
-            raise HTTPException(status_code=400, detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요")
+            raise HTTPException(
+                status_code=400,
+                detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요",
+            )
     elif isinstance(obj, list):
         arr = obj
     else:
-        raise HTTPException(status_code=400, detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태")
+        raise HTTPException(
+            status_code=400,
+            detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태",
+        )
 
     try:
         return [PatternItem(**p) for p in arr]
@@ -135,7 +134,8 @@ async def detect(
     else:
         log.debug("patterns_json(len=%d): %r", len(patterns_json), patterns_json[:200])
 
-    patterns = _parse_patterns_json(patterns_json)
+    items = _parse_patterns_json(patterns_json)
+    patterns = _compile_patterns(items)
     boxes = detect_boxes_from_patterns(pdf, patterns)
     return DetectResponse(total_matches=len(boxes), boxes=boxes)
 

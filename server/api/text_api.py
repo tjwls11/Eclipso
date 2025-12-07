@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 from fastapi import APIRouter, UploadFile, HTTPException
 from typing import Dict, Any, List
@@ -17,9 +16,6 @@ router = APIRouter(prefix="/text", tags=["text"])
     description="업로드한 문서에서 본문 텍스트를 추출하여 반환"
 )
 async def extract_text(file: UploadFile):
-    """
-    업로드 문서에서 텍스트를 추출해 { full_text }로 반환.
-    """
     try:
         return await extract_from_file(file)
     except HTTPException as e:
@@ -34,7 +30,6 @@ async def extract_text(file: UploadFile):
     description="서버에 등록된 개인정보 정규식 규칙들의 이름 배열을 반환"
 )
 async def list_rules():
-    """정의된 정규식 룰 이름 배열 반환"""
     return [r["name"] for r in PRESET_PATTERNS]
 
 # ──────────────────────────────────────────────────────────────────────────────
