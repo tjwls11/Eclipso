@@ -1,10 +1,11 @@
 from fastapi import APIRouter, UploadFile, File, Response, HTTPException
 from pathlib import Path
+from typing import List, Dict, Any
 
 from server.modules import doc_module, hwp_module, ppt_module, xls_module, pdf_module
 from server.modules.xml_redaction import xml_redact_to_file
 
-from server.core.regex_utils import match_text
+from server.api.redaction_api import match_text
 from server.modules.ner_module import run_ner
 
 import tempfile
@@ -12,6 +13,7 @@ import os
 import traceback
 
 router = APIRouter(prefix="/redact", tags=["redact"])
+
 
 @router.post(
     "/file",
@@ -25,9 +27,11 @@ async def redact_file(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
     file_bytes = await file.read()
 
-    out = None
+    out: bytes | None = None
     mime = "application/octet-stream"
-    encoded_fileName = file.filename.encode("utf-8", "ignore").decode("latin-1", "ignore")
+    encoded_fileName = file.filename.encode("utf-8", "ignore").decode(
+        "latin-1", "ignore"
+    )
 
     try:
         if ext == ".doc":
@@ -47,7 +51,8 @@ async def redact_file(file: UploadFile = File(...)):
             mime = "application/vnd.ms-excel"
 
         elif ext == ".pdf":
-            import fitz 
+            import fitz
+
             try:
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 text = "\n".join([p.get_text("text") or "" for p in doc])
@@ -58,42 +63,78 @@ async def redact_file(file: UploadFile = File(...)):
             if not text.strip():
                 raise HTTPException(400, "PDF 본문이 비어 있습니다.")
 
-            # 정규식 결과 수집
-            regex_res = match_text(text)
-            regex_spans = []
-            for it in (regex_res.get("items", []) or []):
-                s, e = it.get("start"), it.get("end")
-                if s is not None and e is not None and e > s:
-                    regex_spans.append({
+            regex_result = match_text(text)
+            regex_spans: List[Dict[str, Any]] = []
+            for it in (regex_result.get("items", []) or []):
+                s = it.get("start")
+                e = it.get("end")
+                if s is None or e is None or e <= s:
+                    continue
+                label = (
+                    it.get("label")
+                    or it.get("rule")
+                    or it.get("name")
+                    or "REGEX"
+                )
+                regex_spans.append(
+                    {
                         "start": int(s),
                         "end": int(e),
-                        "label": it.get("rule"),
+                        "label": str(label),
                         "source": "regex",
-                    })
+                        "score": None,
+                    }
+                )
 
-            # NER 실행
-            policy = {"chunk_size": 1500, "chunk_overlap": 50, "allowed_labels": None}
-            ner_spans = run_ner(text=text, policy=policy)
+            masked_text = text
+            if regex_spans:
+                chars = list(text)
+                for sp in regex_spans:
+                    s = int(sp["start"])
+                    e = int(sp["end"])
+                    if s < 0:
+                        s = 0
+                    if e > len(chars):
+                        e = len(chars)
+                    for i in range(s, e):
+                        if 0 <= i < len(chars) and chars[i] != "\n":
+                            chars[i] = " "
+                masked_text = "".join(chars)
 
-            # 단순 병합 (겹치는 것 제거)
+            policy = {
+                "chunk_size": 1500,
+                "chunk_overlap": 50,
+                "allowed_labels": None,
+            }
+            ner_spans: List[Dict[str, Any]] = run_ner(
+                text=masked_text, policy=policy
+            )
+
             all_spans = regex_spans + ner_spans
-            all_spans.sort(key=lambda x: (x.get("start", 0), x.get("end", 0)))
-            final_spans = []
-            used_ranges = []
+            all_spans.sort(
+                key=lambda x: (x.get("start", 0), x.get("end", 0))
+            )
+
+            final_spans: List[Dict[str, Any]] = []
+            used_ranges: List[tuple[int, int]] = []
+
             for span in all_spans:
-                start = span.get("start", 0)
-                end = span.get("end", 0)
+                start = int(span.get("start", 0))
+                end = int(span.get("end", 0))
                 if end <= start:
                     continue
-                # 겹치는지 확인
-                overlaps = any(min(end, used_end) > max(start, used_start) 
-                            for used_start, used_end in used_ranges)
-                if not overlaps:
-                    final_spans.append(span)
-                    used_ranges.append((start, end))
+                overlaps = any(
+                    min(end, used_end) > max(start, used_start)
+                    for (used_start, used_end) in used_ranges
+                )
+                if overlaps:
+                    continue
+                final_spans.append(span)
+                used_ranges.append((start, end))
 
-            # 병합된 스팬으로 PDF 텍스트 레닥션
-            out = pdf_module.apply_text_redaction(file_bytes, extra_spans=final_spans)
+            out = pdf_module.apply_text_redaction(
+                file_bytes, extra_spans=final_spans
+            )
             mime = "application/pdf"
 
         elif ext in (".docx", ".pptx", ".xlsx", ".hwpx"):
@@ -123,5 +164,7 @@ async def redact_file(file: UploadFile = File(...)):
     return Response(
         content=out,
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{encoded_fileName}"'}
+        headers={
+            "Content-Disposition": f'attachment; filename="{encoded_fileName}"'
+        },
     )

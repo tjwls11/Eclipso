@@ -11,11 +11,9 @@ from urllib.parse import quote
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 
 from server.core.schemas import DetectResponse, PatternItem, Box
-from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
+from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction,extract_table_layout    
 from server.core.redaction_rules import PRESET_PATTERNS
-from server.modules.common import compile_rules  # ★ 추가
-# 더 이상 find_sensitive_spans 는 사용하지 않음
-# from server.core.matching import find_sensitive_spans
+from server.modules.common import compile_rules
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
@@ -163,35 +161,11 @@ async def apply(
     )
 
 
-# ─────────────────────────────────────────────────────────────
-# 텍스트 매칭 (정규식 + validator)  →  /text/match 가 이 함수 사용
-# ─────────────────────────────────────────────────────────────
 
 def match_text(text: str):
-    """
-    정규식 기반 민감정보 매칭
-
-    - 입력: text
-    - 출력: { items, counts }
-
-    items:
-      - rule   : 룰 이름 (rrn, phone_mobile, ...)
-      - value  : 매칭 문자열
-      - start  : 텍스트 내 시작 오프셋
-      - end    : 텍스트 내 끝 오프셋
-      - context: 주변 20자 전후
-      - valid  : validator 기준 유효 여부 (True = OK, False = FAIL)
-
-    counts:
-      - OK(True) 인 것만 rule 별로 카운트 (FAIL 은 카운트에서 제외)
-    """
     try:
         if not isinstance(text, str):
             text = str(text)
-
-        # modules.common.compile_rules() 는 이미
-        # PRESET_PATTERNS + RULES 기반으로
-        # (name, compiled_regex, need_valid, priority, validator) 튜플을 만들어줌.
         comp = compile_rules()
 
         matches: List[Dict[str, Any]] = {}
@@ -240,3 +214,31 @@ def match_text(text: str):
     except Exception as e:  # pragma: no cover
         log.exception("match_text 내부 오류")
         raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")
+
+@router.post(
+    "/redactions/tables",
+    summary="PDF 표 레이아웃 탐지",
+    description=(
+        "pymupdf4llm으로 PDF 내 표 위치와 행/열 개수만 탐지\n"
+        "- 입력: file(PDF)\n"
+        "- 출력: { tables: [ { page, bbox, row_count, col_count }, ... ] }"
+    ),
+)
+async def detect_tables(
+    file: UploadFile = File(..., description="PDF 파일"),
+):
+    # 기존 유틸 재사용
+    _ensure_pdf(file)
+    pdf_bytes = _read_pdf(file)
+
+    # pdf_module.extract_table_layout 호출
+    try:
+        data = extract_table_layout(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"표 레이아웃 추출 중 오류: {e}",
+        )
+
+    # 그대로 JSON 반환
+    return data

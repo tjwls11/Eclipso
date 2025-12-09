@@ -2,10 +2,6 @@ from __future__ import annotations
 from typing import List, Dict, Any, Tuple, Iterable
 import re
 
-from server.modules.ner_tag.ps_postprocess import postprocess_ps_spans
-from server.modules.ner_tag.lc_postprocess import postprocess_lc_spans
-
-
 # chunking
 def _chunk_text(
     text: str,
@@ -229,8 +225,6 @@ def run_ner(text: str, policy: Dict[str, Any]) -> List[Dict[str, Any]]:
             spans.extend(_normalize_raw_entities(raw, s, sub))
         except Exception:
             continue
-    spans = postprocess_ps_spans(text, spans)   
-    spans = postprocess_lc_spans(text, spans) 
 
     spans.sort(key=lambda x: (x["start"], x["end"]))
     return spans
