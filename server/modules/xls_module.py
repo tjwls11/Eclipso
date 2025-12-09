@@ -13,12 +13,8 @@ FOOTER = 0x0015
 HEADERFOOTER = 0x089C
 
 
-def le16(b, off=0): 
-    return struct.unpack_from("<H", b, off)[0]
-
-
-def le32(b, off=0): 
-    return struct.unpack_from("<I", b, off)[0]
+def le16(b, off=0): return struct.unpack_from("<H", b, off)[0]
+def le32(b, off=0): return struct.unpack_from("<I", b, off)[0]
 
 
 def iter_biff_records(data: bytes):
@@ -49,7 +45,6 @@ def get_sst_blocks(wb: bytes) -> Optional[List[Tuple[bytes, int]]]:
                 break
     return blocks if blocks else None
 
-
 class XLUCSString:
     def __init__(self):
         self.cch = 0
@@ -63,7 +58,6 @@ class XLUCSString:
         self.text = ""
 
         self.byte_positions: list[int] = []
-
 
 class SSTParser:
     def __init__(self, blocks: List[Tuple[bytes, int]]):
@@ -144,6 +138,7 @@ class SSTParser:
         self.reading_text = False
         return bytes(out), pos_list
 
+
     def parse_exlucs(self) -> XLUCSString:
         x = XLUCSString()
 
@@ -177,9 +172,9 @@ class SSTParser:
 
         return x
 
+
     def parse(self) -> List[XLUCSString]:
-        # SST 헤더 스킵 (cstTotal, cstUnique)
-        self.read_n(8)
+        self.read_n(8)   # SST 헤더 스킵 (cstTotal, cstUnique)
         out = []
         while True:
             try:
@@ -187,6 +182,7 @@ class SSTParser:
             except EOFError:
                 break
         return out
+
 
 
 # 문자열 추출
@@ -199,6 +195,7 @@ def extract_sst(wb: bytes, strings: List[str]) -> List[str]:
             if 0 <= idx < len(strings):
                 texts.append(strings[idx])
     return texts
+
 
 
 def encode_masked_text(text: str, fHigh: int) -> bytes:
@@ -217,6 +214,7 @@ def encode_masked_text(text: str, fHigh: int) -> bytes:
         out.extend(encoded)
 
     return bytes(out)
+
 
 
 def parse_xlucs(payload: bytes, off: int):
@@ -244,13 +242,13 @@ def parse_xlucs(payload: bytes, off: int):
     return text, cch, fHigh, next_off, raw_len
 
 
+
 def extract_headerfooter(payload: bytes, count=6):
     items = []
 
     off = 0
 
-    # frtHeader, guidSView
-    off += 28
+    off += 28 # frtHeader, guidSView
 
     # flags
     flags = le16(payload, off)
@@ -283,6 +281,7 @@ def extract_headerfooter(payload: bytes, count=6):
         off = next_off
 
     return items
+
 
 
 def extract_text(file_bytes: bytes):
@@ -340,6 +339,8 @@ def extract_text(file_bytes: bytes):
         return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
+
+
 def mask_except_hypen(orig_segment: str) -> str:
     out_chars = []
     for ch in orig_segment:
@@ -348,6 +349,7 @@ def mask_except_hypen(orig_segment: str) -> str:
         else:
             out_chars.append("*")
     return "".join(out_chars)
+
 
 
 def redact_xlucs(text: str) -> str:
@@ -438,7 +440,9 @@ def redact_hdr_fdr(wb: bytearray) -> None:
                 wb[text_start:text_end] = raw
 
 
-# OLE 파일 교체
+
+
+#OLE 파일 교체
 def overlay_workbook_stream(file_bytes: bytes, orig_wb: bytes, new_wb: bytes) -> bytes:
     full = bytearray(file_bytes)
 
@@ -468,38 +472,29 @@ def redact(file_bytes: bytes) -> bytes:
         if not ole.exists("Workbook"):
             print("[ERROR] Workbook 없음")
             return file_bytes
-        orig_wb = ole.openstream("Workbook").read()
+        wb = bytearray(ole.openstream("Workbook").read())
 
-    wb = bytearray(orig_wb)
+    off = 0
+    while off + 4 < len(wb):
+        opcode, length = struct.unpack_from("<HH", wb, off)
+        off += 4
+        payload_off = off
+        payload_end = off + length
 
-    # SST 레닥션
-    blocks = get_sst_blocks(wb)
-    if not blocks:
-        return file_bytes
+        if opcode in (0x00FC, 0x00FD, 0x0204):  # SST, LABELSST, LABEL
+            chunk = wb[payload_off:payload_end]
+            try:
+                text = chunk.decode("utf-16le", errors="ignore") or chunk.decode("cp949", errors="ignore")
+                red = apply_redaction_rules(text)
+                enc = red.encode("utf-16le")
+                wb[payload_off:payload_end] = enc[:length].ljust(length, b"\x00")
+            except Exception:
+                pass
 
-    xlucs_list = SSTParser(blocks).parse()
+        off = payload_end
 
-    for x in xlucs_list:
-        red_text = redact_xlucs(x.text)
+    return bytes(wb)
 
-        # 문자 수 동일해야 함
-        if len(red_text) != len(x.text):
-            raise ValueError("동일길이 레닥션 실패 (문자 수 불일치)")
-
-        # fHigh 기반 인코딩
-        raw = encode_masked_text(red_text, x.fHigh)
-
-        # byte_positions와 길이 동일해야 함
-        if len(raw) != len(x.byte_positions):
-            raise ValueError("raw 길이 mismatch")
-
-        # CONTINUE-aware 바이트 패치
-        for i, pos in enumerate(x.byte_positions):
-            wb[pos] = raw[i]
-    print("[OK] SST 텍스트 레닥션 완료")
-    
-    # 헤더/바닥글 레닥션
-    redact_hdr_fdr(wb)
-    print("[OK] 헤더/푸터 텍스트 레닥션 완료")
-
-    return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
+def extract_text(file_bytes: bytes) -> dict:
+    """text_api.py 에서 호출되는 공통 인터페이스"""
+    return extract_text_from_xls(file_bytes)
