@@ -1,9 +1,6 @@
 from __future__ import annotations
-
 import re
 from typing import List, Tuple
-
-
 try:
     from ..modules.common import compile_rules
 except Exception:  # pragma: no cover
@@ -39,7 +36,7 @@ def find_sensitive_spans(text: str) -> List[Tuple[int, int, str, str]]:
 
         for m in rx.finditer(text):
             value = m.group(0)
-            # validator 필요하면 검사
+            # validator 검사
             if need_valid and not _is_valid(value, validator):
                 # 유효하지 않은 후보 → 결과에서 완전히 제외
                 continue
