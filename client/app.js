@@ -83,6 +83,25 @@ function setStatus(msg) {
   if (el) el.textContent = msg || ''
 }
 
+function setStatusSub(msg) {
+  const el = $('#status-sub')
+  if (el) el.textContent = msg || ''
+}
+
+function setProgress(pct, label = '', opts = {}) {
+  const forceShow = !!opts.forceShow
+  const p = Number.isFinite(+pct) ? Math.max(0, Math.min(100, +pct)) : 0
+  safeShow('progress-wrap', forceShow || p > 0)
+  safeWidthPct('progress-bar', `${p}%`)
+  safeText('progress-pct', `${Math.round(p)}%`)
+  safeText('progress-label', label || '-')
+}
+
+function resetProgress() {
+  setProgress(0, '-', { forceShow: false })
+  setStatusSub('')
+}
+
 function safeJson(v) {
   try {
     return JSON.stringify(v ?? null)
@@ -443,6 +462,53 @@ function injectBoxesIntoMarkdown(md, detections) {
   if (!s.trim() || !detections?.length) return s
   if (s.includes('class="pii-box"')) return s
 
+  const escapeRegExp = (str) =>
+    String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  // placeholder(__TAG_n__)는 유지하면서 텍스트만 escape (XSS 방지 + 태그 복원 유지)
+  const escHtmlKeepPlaceholders = (text) =>
+    String(text)
+      .split(/(__TAG_\d+__)/g)
+      .map((part) => (/^__TAG_\d+__$/.test(part) ? part : escHtml(part)))
+      .join('')
+
+  const findNeedle = (hay, needle, cursor) => {
+    let idx = hay.indexOf(needle, cursor)
+    if (idx >= 0) return { idx, len: needle.length }
+    idx = hay.indexOf(needle, 0)
+    if (idx >= 0) return { idx, len: needle.length }
+
+    // 표/셀 등에서 "중간 줄바꿈/공백/<br>"로 끊어진 케이스 보정
+    if (!needle || needle.length < 4) return null
+
+    // 문자 사이에 짧은 공백/제로폭/태그 placeholder가 끼는 것을 허용
+    const gap = '(?:[\\s\\u200b\\u200c\\u200d\\ufeff]{0,2}|__TAG_\\d+__){0,2}'
+    const pat = Array.from(needle)
+      .map((ch) => escapeRegExp(ch))
+      .join(gap)
+    let re
+    try {
+      re = new RegExp(pat, 'g')
+    } catch {
+      return null
+    }
+
+    const tryExec = (start) => {
+      re.lastIndex = Math.max(0, start || 0)
+      return re.exec(hay)
+    }
+
+    let m = tryExec(cursor)
+    if (!m) m = tryExec(0)
+    if (!m || typeof m.index !== 'number') return null
+
+    const raw = String(m[0] || '')
+    const maxExtra = Math.min(24, Math.max(6, Math.floor(needle.length * 0.6)))
+    if (raw.length > needle.length + maxExtra) return null
+
+    return { idx: m.index, len: raw.length }
+  }
+
   const tags = []
   s = s.replace(/<[^>]+>/g, (match) => {
     const placeholder = `__TAG_${tags.length}__`
@@ -456,12 +522,14 @@ function injectBoxesIntoMarkdown(md, detections) {
     if (!needle || needle.length < 2) continue
     if (/^[A-Za-z]$/.test(needle)) continue
 
-    let idx = s.indexOf(needle, cursor)
-    if (idx < 0) idx = s.indexOf(needle, 0)
-    if (idx < 0) continue
+    const found = findNeedle(s, needle, cursor)
+    if (!found) continue
+    const idx = found.idx
+    const matchLen = found.len
 
     const before = s.slice(0, idx)
-    const after = s.slice(idx + needle.length)
+    const mid = s.slice(idx, idx + matchLen)
+    const after = s.slice(idx + matchLen)
 
     const tag =
       d.source === 'regex'
@@ -491,7 +559,9 @@ function injectBoxesIntoMarkdown(md, detections) {
     const pill = `<span class="ml-1 inline-block px-1.5 py-0.5 rounded-full text-[10px] font-bold align-[2px] bg-gray-900/5 text-gray-900">${escHtml(
       tag
     )}</span>`
-    const wrapped = `<span ${attrs}>${escHtml(needle)}${pill}</span>`
+    const wrapped = `<span ${attrs}>${escHtmlKeepPlaceholders(
+      mid
+    )}${pill}</span>`
     s = before + wrapped + after
     cursor = (before + wrapped).length
   }
@@ -570,7 +640,8 @@ function stripEmailLinks(viewer) {
     const text = String(a.textContent || '').trim()
 
     const looksEmail = emailRe.test(text)
-    const isMailto = hrefLow.startsWith('mailto:') || hrefLow.includes('mailto:')
+    const isMailto =
+      hrefLow.startsWith('mailto:') || hrefLow.includes('mailto:')
 
     // "이메일 텍스트"를 클릭 링크로 만들지 않기
     if (isMailto && looksEmail) return unwrap(a)
@@ -628,6 +699,12 @@ function normalizeTsvTablesToMarkdown(md) {
   const escCell = (s) => String(s ?? '').replace(/\|/g, '\\|')
   const toPipeRow = (cells) => `| ${cells.map(escCell).join(' | ')} |`
 
+  const isPlaceholderHeader = (v) => {
+    const s = String(v || '').trim()
+    if (!s) return false
+    return /^col\s*\d+$/i.test(s) || /^column\s*\d+$/i.test(s)
+  }
+
   const emitTable = (rows) => {
     if (!rows || rows.length < 2) return false
     const hasSeparator = rows.some(
@@ -642,7 +719,7 @@ function normalizeTsvTablesToMarkdown(md) {
       while (rr.length < colCount) rr.push('')
       return rr
     })
-    const header = norm[0]
+    const header = norm[0].map((c) => (isPlaceholderHeader(c) ? '' : c))
     const body = norm.slice(1)
     const sep = Array.from({ length: colCount }, () => '---')
     out.push('', toPipeRow(header), toPipeRow(sep))
@@ -1138,14 +1215,30 @@ function renderScanReport(stats) {
 
   const nerBox = byId('stats-policy-nerlabels')
   if (nerBox) {
-    nerBox.innerHTML = selectedNer
-      .map(
-        (lab) =>
-          `<span class="inline-flex items-center px-2 py-1 rounded-full border border-gray-200 bg-gray-50 text-gray-600 text-[11px]">${escHtml(
-            String(lab).toUpperCase()
-          )}</span>`
-      )
-      .join('')
+    // "감지된 NER 라벨" 기준으로 표시(정책은 선택 라벨, 강조는 감지 여부)
+    const detectedLabelSet = new Set(
+      Object.keys(stats.by_label || {}).map((x) => String(x).toUpperCase())
+    )
+
+    const chips = (selectedNer || []).map((labRaw) => {
+      const lab = String(labRaw).toUpperCase()
+      const hit = detectedLabelSet.has(lab)
+      const cnt = hit ? Number(stats.by_label?.[lab] || 0) : 0
+      const cls = hit
+        ? 'border-indigo-200 bg-indigo-50 text-indigo-700'
+        : 'border-gray-200 bg-gray-50 text-gray-600'
+      const suffix = hit && cnt ? ` · ${cnt}` : ''
+      return `<span class="inline-flex items-center px-2 py-1 rounded-full border text-[11px] ${cls}">${escHtml(
+        lab + suffix
+      )}</span>`
+    })
+
+    if (!chips.length) {
+      nerBox.innerHTML =
+        '<span class="inline-flex items-center px-2 py-1 rounded-full border border-gray-200 bg-gray-50 text-gray-600 text-[11px]">없음</span>'
+    } else {
+      nerBox.innerHTML = chips.join('')
+    }
   }
 
   safeText('stats-json', JSON.stringify(stats, null, 2))
@@ -1162,7 +1255,9 @@ async function doScan() {
   state.nerLabels = selectedNerLabels()
   state.t0 = performance.now()
 
-  setStatus('분석 시작...')
+  setStatus('분석 준비 중...')
+  setStatusSub('')
+  setProgress(0, '대기', { forceShow: false })
   lockInputs(true)
 
   try {
@@ -1170,6 +1265,9 @@ async function doScan() {
     fd.append('file', f)
 
     const t1 = performance.now()
+    setStatus('텍스트 추출 중...')
+    setStatusSub('파일 업로드 · 서버 처리')
+    setProgress(10, '텍스트 추출', { forceShow: true })
     const r1 = await fetch(`${API_BASE()}/text/extract`, {
       method: 'POST',
       body: fd,
@@ -1180,13 +1278,17 @@ async function doScan() {
 
     const fullText = String(extractData.full_text || '')
     state.extractedText = fullText
+    setStatusSub(`추출 완료 · ${fullText.length.toLocaleString()} chars`)
+    setProgress(35, '텍스트 추출 완료', { forceShow: true })
 
     const md = extractData.markdown || fallbackMarkdownFromText(fullText)
     state.markdown = md
     setPages([md])
 
     const t2 = performance.now()
-    setStatus('패턴 탐색...')
+    setStatus('패턴 탐색 중...')
+    setStatusSub('정규식 규칙 매칭')
+    setProgress(45, '패턴 탐색', { forceShow: true })
     const r2 = await fetch(`${API_BASE()}/text/match`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1200,8 +1302,23 @@ async function doScan() {
     state.timings.match_ms = performance.now() - t2
     state.matchData = filterMatchByRules(rawMatchData, state.rules)
 
+    const matchItems = Array.isArray(state.matchData?.items)
+      ? state.matchData.items
+      : []
+    const matchValid = matchItems.filter((x) => x?.valid !== false).length
+    setStatusSub(`패턴 탐색 완료 · ${matchValid.toLocaleString()}건`)
+    setProgress(60, '패턴 탐색 완료', { forceShow: true })
+
     const t3 = performance.now()
-    setStatus('NER 탐지...')
+    setStatus('NER 탐지 중...')
+    setStatusSub(
+      `라벨: ${
+        (state.nerLabels || [])
+          .map((x) => String(x).toUpperCase())
+          .join(', ') || '-'
+      } · 서버 처리`
+    )
+    setProgress(70, 'NER 탐지', { forceShow: true })
     const nerResp = await requestNerSmart(
       fullText,
       buildExcludeSpansFromMatch(state.matchData),
@@ -1209,6 +1326,8 @@ async function doScan() {
     )
     state.timings.ner_ms = performance.now() - t3
     state.nerItems = nerResp.items
+    setStatusSub(`NER 탐지 완료 · ${state.nerItems.length.toLocaleString()}건`)
+    setProgress(85, 'NER 탐지 완료', { forceShow: true })
 
     state.detections = buildDetections(
       state.matchData,
@@ -1233,6 +1352,10 @@ async function doScan() {
       )
     }
 
+    setStatus('결과 렌더링 중...')
+    setStatusSub('하이라이트/목록 생성')
+    setProgress(95, '렌더링', { forceShow: true })
+
     renderCurrentPage()
     wireViewerClick()
     renderMatchResults()
@@ -1249,7 +1372,10 @@ async function doScan() {
       })
     )
 
+    const totalMs = Math.round(state.timings.total_ms || 0)
     setStatus('완료')
+    setStatusSub(totalMs ? `총 소요: ${totalMs.toLocaleString()}ms` : '')
+    setProgress(100, '완료', { forceShow: true })
 
     const btn = $('#btn-save-redacted')
     if (btn) {
@@ -1259,6 +1385,8 @@ async function doScan() {
   } catch (e) {
     console.error(e)
     setStatus('오류 발생')
+    setStatusSub(e?.message ? String(e.message) : '')
+    setProgress(0, '오류', { forceShow: true })
   } finally {
     lockInputs(false)
   }
@@ -1278,6 +1406,8 @@ async function doRedactAndDownload() {
   btn && (btn.disabled = true)
 
   setStatus('레닥션 실행 중...')
+  setStatusSub('파일 업로드 · 서버 마스킹')
+  setProgress(10, '레닥션', { forceShow: true })
   lockInputs(true)
 
   const t0 = performance.now()
@@ -1303,6 +1433,7 @@ async function doRedactAndDownload() {
     }
 
     const blob = await r.blob()
+    setProgress(85, '다운로드 준비', { forceShow: true })
     const cd = r.headers.get('Content-Disposition')
     const filename =
       parseContentDispositionFilename(cd) ||
@@ -1327,10 +1458,14 @@ async function doRedactAndDownload() {
     }
 
     setStatus('레닥션 완료 · 다운로드 시작')
+    setStatusSub('')
+    setProgress(100, '레닥션 완료', { forceShow: true })
   } catch (e) {
     console.error(e)
     alert(`레닥션 실패: ${e?.message || e}`)
     setStatus('레닥션 오류')
+    setStatusSub(e?.message ? String(e.message) : '')
+    setProgress(0, '오류', { forceShow: true })
   } finally {
     btn && (btn.disabled = false)
     lockInputs(false)
@@ -1349,6 +1484,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setupDropZone()
   wireMatchTabs()
   updateSegButtons(state.filters.seg || 'all')
+  resetProgress()
 
   $('#file')?.addEventListener('change', () => {
     const btn = $('#btn-save-redacted')
@@ -1366,6 +1502,8 @@ document.addEventListener('DOMContentLoaded', () => {
     state.timings = null
     state.t0 = null
     setStatus('파일 선택됨 · 스캔 실행')
+    setStatusSub('')
+    setProgress(0, '대기', { forceShow: false })
   })
 
   $('#filter-search')?.addEventListener('input', (e) => {

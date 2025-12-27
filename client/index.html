@@ -172,8 +172,35 @@
             </div>
 
             <!-- 상태표시 -->
-            <div class="rounded-lg bg-gray-50 px-3 py-2 text-sm">
-              <span id="status" class="text-gray-500">대기 중</span>
+            <div class="rounded-lg bg-gray-50 px-3 py-2 text-sm space-y-2">
+              <div class="flex items-center justify-between gap-3">
+                <span id="status" class="text-gray-500 whitespace-pre-line"
+                  >대기 중</span
+                >
+                <span id="status-sub" class="text-xs text-gray-400"></span>
+              </div>
+
+              <!-- 진행바 -->
+              <div id="progress-wrap" class="w-full hidden">
+                <div
+                  class="h-2 w-full rounded-full bg-gray-200 overflow-hidden"
+                >
+                  <div
+                    id="progress-bar"
+                    class="h-2 rounded-full transition-[width] duration-300"
+                    style="
+                      width: 0%;
+                      background-color: oklch(65.802% 0.05764 310.975);
+                    "
+                  ></div>
+                </div>
+                <div
+                  class="mt-1 flex items-center justify-between text-[11px] text-gray-500"
+                >
+                  <span id="progress-label">-</span>
+                  <span id="progress-pct">0%</span>
+                </div>
+              </div>
             </div>
           </section>
         </aside>
