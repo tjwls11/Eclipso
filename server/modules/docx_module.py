@@ -6,11 +6,13 @@ import zipfile
 import logging
 import os
 import inspect
+import xml.etree.ElementTree as ET
 from typing import List, Tuple
 
 try:
     from .common import (
         cleanup_text,
+        cleanup_text_keep_tabs,
         compile_rules,
         sub_text_nodes,
         chart_sanitize,
@@ -22,6 +24,7 @@ try:
 except Exception:  # pragma: no cover - 구조가 달라졌을 때 대비
     from server.modules.common import (  # type: ignore
         cleanup_text,
+        cleanup_text_keep_tabs,
         compile_rules,
         sub_text_nodes,
         chart_sanitize,
@@ -224,22 +227,119 @@ def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
             continue
 
     return cleanup_text("\n".join(p for p in parts if p))
-def docx_text(zipf: zipfile.ZipFile) -> str:
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NS = {"w": _W_NS}
+_W = f"{{{_W_NS}}}"
+
+
+def _docx_sym_to_char(el: ET.Element) -> str:
+    try:
+        hx = el.attrib.get(_W + "char")
+        if not hx:
+            return ""
+        return chr(int(hx, 16))
+    except Exception:
+        return ""
+
+
+def _paragraph_text_layout(p: ET.Element) -> str:
+    # 페이지/컬럼 브레이크(문단 속성)
+    parts: List[str] = []
+    try:
+        if p.find("./w:pPr/w:pageBreakBefore", _NS) is not None:
+            parts.append("\n[PAGE_BREAK]\n")
+    except Exception:
+        pass
+
+    # 문단 내부를 문서 순서대로 스캔(런/하이퍼링크/필드 등 포함)
+    for el in p.iter():
+        tag = el.tag
+        if tag == _W + "t" or tag == _W + "delText":
+            if el.text:
+                parts.append(el.text)
+        elif tag == _W + "tab":
+            parts.append("\t")
+        elif tag == _W + "br" or tag == _W + "cr":
+            br_type = el.attrib.get(_W + "type") or ""
+            if br_type == "page":
+                parts.append("\n[PAGE_BREAK]\n")
+            elif br_type == "column":
+                parts.append("\n[COLUMN_BREAK]\n")
+            else:
+                parts.append("\n")
+        elif tag == _W + "noBreakHyphen":
+            parts.append("-")
+        elif tag == _W + "sym":
+            ch = _docx_sym_to_char(el)
+            if ch:
+                parts.append(ch)
+
+    # 문단 끝 공백만 제거(선행 탭/공백은 레이아웃 신호일 수 있어 보존)
+    return "".join(parts).rstrip()
+
+
+def _table_text_layout(tbl: ET.Element) -> str:
+    # 표를 Markdown 유사 형태로 출력해 셀 경계를 보존
+    lines: List[str] = []
+    for tr in tbl.findall("./w:tr", _NS):
+        cells: List[str] = []
+        for tc in tr.findall("./w:tc", _NS):
+            cell_parts: List[str] = []
+            # 셀 내부는 여러 문단이 있을 수 있음 -> 줄바꿈은 공백으로 약하게 평탄화
+            for p in tc.findall(".//w:p", _NS):
+                t = _paragraph_text_layout(p)
+                if t:
+                    cell_parts.append(t)
+            cell_text = " ".join(cell_parts).strip()
+            cells.append(cell_text)
+        # 빈 행도 표 구조 유지를 위해 유지
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines).rstrip()
+
+
+def docx_text_layout(zipf: zipfile.ZipFile) -> str:
     try:
         xml_bytes = zipf.read("word/document.xml")
     except KeyError:
-        xml_bytes = b""
+        return ""
 
-    xml = xml_bytes.decode("utf-8", "ignore")
-    text_main = "".join(
-        m.group(1) for m in re.finditer(r"<w:t[^>]*>(.*?)</w:t>", xml, re.DOTALL)
-    )
-    text_main = cleanup_text(text_main)
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        # 최후의 fallback: 기존 방식(레이아웃 손실)
+        xml = xml_bytes.decode("utf-8", "ignore")
+        text_main = "".join(
+            m.group(1) for m in re.finditer(r"<w:t[^>]*>(.*?)</w:t>", xml, re.DOTALL)
+        )
+        return cleanup_text(text_main)
+
+    body = root.find(".//w:body", _NS)
+    if body is None:
+        return ""
+
+    blocks: List[str] = []
+    for child in list(body):
+        if child.tag == _W + "p":
+            blocks.append(_paragraph_text_layout(child))
+        elif child.tag == _W + "tbl":
+            blocks.append(_table_text_layout(child))
+        else:
+            # sectPr 등은 무시
+            continue
+
+    # 탭/개행 보존형 정리(표/탭이 중요한 케이스)
+    return cleanup_text_keep_tabs("\n".join(blocks))
+def docx_text(zipf: zipfile.ZipFile) -> str:
+    # 기본은 레이아웃 보존형, 실패 시 내부에서 기존 방식으로 fallback
+    text_main = docx_text_layout(zipf)
 
     # 차트 + 임베디드 XLSX
     text_charts = _collect_chart_texts(zipf)
 
-    return cleanup_text("\n".join(x for x in [text_main, text_charts] if x))
+    # 레이아웃 텍스트에 차트 텍스트를 덧붙일 때는 과도한 공백 압축은 피함
+    return cleanup_text_keep_tabs("\n".join(x for x in [text_main, text_charts] if x))
 
 def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
