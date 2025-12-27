@@ -6,7 +6,7 @@ import time
 import struct
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 # --- 외부 의존성: olefile ---
 try:
@@ -112,6 +112,50 @@ def visible_replace_keep_len_with_logs(data: bytes, old: str):
         else:
             i += 1
     return struct.pack("<" + "H" * len(u16), *u16), total
+
+
+def utf16_same_len_replace_custom(data: bytes, old: str, repl_text: str) -> Tuple[bytes, int]:
+    try:
+        old_u16 = old.encode("utf-16le", "ignore")
+        repl_u16 = repl_text.encode("utf-16le", "ignore")
+    except Exception:
+        return data, 0
+    if not old_u16 or len(old_u16) != len(repl_u16):
+        return data, 0
+    ba = bytearray(data)
+    cnt = 0
+    i = 0
+    n = len(old_u16)
+    while True:
+        j = ba.find(old_u16, i)
+        if j == -1:
+            break
+        ba[j : j + n] = repl_u16
+        cnt += 1
+        i = j + n
+    return bytes(ba), cnt
+
+
+def utf8_same_len_replace_custom(data: bytes, old: str, repl_text: str) -> Tuple[bytes, int]:
+    try:
+        old_b = old.encode("utf-8", "ignore")
+        repl_b = repl_text.encode("utf-8", "ignore")
+    except Exception:
+        return data, 0
+    if not old_b or len(old_b) != len(repl_b):
+        return data, 0
+    ba = bytearray(data)
+    cnt = 0
+    i = 0
+    n = len(old_b)
+    while True:
+        j = ba.find(old_b, i)
+        if j == -1:
+            break
+        ba[j : j + n] = repl_b
+        cnt += 1
+        i = j + n
+    return bytes(ba), cnt
 
 
 _ASCII_EMAIL_CHARS = set(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._%+-")
@@ -310,7 +354,7 @@ def _probe_set(secrets: List[str]) -> Dict[str, List[bytes]]:
 
 
 # ------------- 메인: 프리뷰/콘텐츠 스트림 제로필 + 파이프라인 -------------
-def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[str], *, mask_preview: bool = False) -> bytes:
+def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_preview: bool = False) -> bytes:
     if not isinstance(bin_bytes, (bytes, bytearray, memoryview)) or len(bin_bytes) < 8:
         return bytes(bin_bytes)
 
@@ -339,7 +383,23 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[str], *, mask_p
         env_preview = os.getenv("OLE_MASK_PREVIEW", "0") in ("1", "true", "TRUE")
         force_blank_preview = mask_preview or env_preview
 
-        probes = _probe_set(secrets)
+        # secrets: "문자열"(전체 마스킹) 또는 (old, replace_text) 튜플(부분 마스킹) 지원
+        replace_pairs: List[Tuple[str, str]] = []
+        secrets_only: List[str] = []
+        for it in (secrets or []):
+            if isinstance(it, tuple) and len(it) == 2:
+                a, b = it
+                a = str(a or "")
+                b = str(b or "")
+                if a and b and len(a) == len(b):
+                    replace_pairs.append((a, b))
+                    secrets_only.append(a)
+            else:
+                s = str(it or "")
+                if s:
+                    secrets_only.append(s)
+
+        probes = _probe_set(secrets_only)
         changed_any = False
 
         def _need_force_blank(name: str) -> bool:
@@ -384,10 +444,22 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[str], *, mask_p
                 ascii_hits = 0
                 g_ascii = 0
                 g_u16 = 0
-                for s in secrets or []:
+                # (B-1) 부분 마스킹(커스텀 치환): old -> replace_text (동일 길이)
+                for old, repl_text in replace_pairs:
+                    changed, k = utf16_same_len_replace_custom(changed, old, repl_text)
+                    u16_hits += k
+                    changed, k0 = utf8_same_len_replace_custom(changed, old, repl_text)
+                    ascii_hits += k0
+
+                # (B-2) 전체 마스킹: old -> '*'
+                for s in secrets_only:
+                    if any(s == p[0] for p in replace_pairs):
+                        continue
                     changed, k = utf16_same_len_replace_with_logs(changed, s)
                     u16_hits += k
-                for s in secrets or []:
+                for s in secrets_only:
+                    if any(s == p[0] for p in replace_pairs):
+                        continue
                     changed2, k2 = visible_replace_keep_len_with_logs(changed, s)
                     if k2:
                         changed = changed2

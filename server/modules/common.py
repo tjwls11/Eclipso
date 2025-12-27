@@ -160,14 +160,95 @@ def _filter_allowed_by_forbidden(allowed, forbidden):
         out.append((s, e, nm, pr))
     return out
 
-def _apply_spans(src: str, allowed) -> tuple[str, int]:
+def _mask_digits_keep_first_n(v: str, keep_n: int) -> str:
+    dcnt = 0
+    out = []
+    for ch in (v or ""):
+        if ch.isdigit():
+            dcnt += 1
+            out.append(ch if dcnt <= keep_n else "*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_digits_keep_last_n(v: str, keep_last_n: int) -> str:
+    s = v or ""
+    digit_pos = [i for i, ch in enumerate(s) if ch.isdigit()]
+    if len(digit_pos) <= keep_last_n:
+        return s
+    keep = set(digit_pos[-keep_last_n:])
+    out = []
+    for i, ch in enumerate(s):
+        if ch.isdigit() and i not in keep:
+            out.append("*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_phone_keep_first_group(v: str) -> str:
+    s = v or ""
+    m = re.search(r"\d+", s)
+    if not m:
+        return s
+    cut = m.end()
+    out = []
+    for i, ch in enumerate(s):
+        if i >= cut and ch.isdigit():
+            out.append("*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_card_keep_first4_last4(v: str) -> str:
+    s = v or ""
+    digit_pos = [i for i, ch in enumerate(s) if ch.isdigit()]
+    if len(digit_pos) <= 8:
+        return s
+    keep = set(digit_pos[:4] + digit_pos[-4:])
+    out = []
+    for i, ch in enumerate(s):
+        if ch.isdigit() and i not in keep:
+            out.append("*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_value_with_policy(rule: str, v: str, masking_policy: Optional[dict]) -> str:
+    # 기본: 기존 전체 마스킹
+    r = (rule or "").lower()
+    pol = masking_policy or {}
+
+    # 이메일은 기존 로직 유지(형식 보존)
+    if r == "email":
+        return _mask_email(v)
+
+    # 부분 마스킹 규칙
+    if r == "rrn" and str(pol.get("rrn") or "") == "keep_birth6":
+        return _mask_digits_keep_first_n(v, 6)
+    if r == "fgn" and str(pol.get("fgn") or "") == "keep_birth6":
+        return _mask_digits_keep_first_n(v, 6)
+
+    if r in ("phone_mobile", "phone_city") and str(pol.get("phone") or "") == "keep_first_group":
+        return _mask_phone_keep_first_group(v)
+
+    if r == "card" and str(pol.get("card") or "") == "keep_first4_last4":
+        return _mask_card_keep_first4_last4(v)
+
+    return _mask_keep_rules(v)
+
+
+def _apply_spans(src: str, allowed, masking_policy: Optional[dict] = None) -> tuple[str, int]:
     if not allowed:
         return src, 0
     allowed.sort(key=lambda t: (t[0], -t[3], -(t[1] - t[0])))
     out = list(src)
     hits = 0
     for s, e, nm, _pr in sorted(allowed, key=lambda t: t[0], reverse=True):
-        out[s:e] = list(_mask_value(nm, src[s:e]))
+        out[s:e] = list(_mask_value_with_policy(nm, src[s:e], masking_policy))
         hits += 1
     return "".join(out), hits
 
@@ -235,7 +316,7 @@ def _xml_text_to_bytes(text: str, enc: str, bom: bytes) -> bytes:
     except Exception:
         return (text or "").encode("utf-8", "ignore")
 
-def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
+def sub_text_nodes(xml_bytes: bytes, comp, masking_policy: Optional[Dict[str, Any]] = None) -> Tuple[bytes, int]:
     s, enc, bom = _xml_bytes_to_text(xml_bytes)
     all_allowed: List[tuple] = []
     all_forbidden: List[tuple] = []
@@ -250,7 +331,7 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
         for f_s, f_e in forbidden:
             all_forbidden.append((base + f_s, base + f_e))
     all_allowed = _filter_allowed_by_forbidden(all_allowed, all_forbidden)
-    masked, hits = _apply_spans(s, all_allowed)
+    masked, hits = _apply_spans(s, all_allowed, masking_policy=masking_policy)
     return _xml_text_to_bytes(masked, enc, bom), hits
 
 def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:

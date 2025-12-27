@@ -501,18 +501,49 @@ def mask_except_hypen(orig_segment: str) -> str:
     return "".join(out_chars)
 
 
-def redact_xlucs(text: str, extra_literals: Optional[List[str]] = None) -> str:
+def redact_xlucs(text: str, extra_literals: Optional[List[Any]] = None) -> str:
     if not text:
         return text
 
     norm_text, index_map = normalization_index(text)
 
-    spans = find_sensitive_spans(norm_text)
-    spans = spans or []
+    # spans/extra_literals가 주어지면(= file_redact_api에서 선택된 항목만 전달) 내부 정규식 탐지는 생략한다.
+    # 그래야 "탐지/선택 안 된 항목"이 추가로 레닥션되지 않는다.
+    spans = []
+    if not extra_literals:
+        spans = find_sensitive_spans(norm_text) or []
 
     # NER/스팬 기반 리터럴도 동일 길이로 추가 마스킹
-    lits = [str(x).strip() for x in (extra_literals or []) if str(x).strip()]
-    lits = sorted(set([x for x in lits if len(x) >= 2]), key=lambda x: (-len(x), x))
+    lits: List[Any] = []
+    for x in (extra_literals or []):
+        if isinstance(x, tuple) and len(x) == 2:
+            a, b = x
+            a = str(a or "").strip()
+            b = str(b or "")
+            if len(a) >= 2 and len(a) == len(b):
+                lits.append((a, b))
+        else:
+            a = str(x or "").strip()
+            if len(a) >= 2:
+                lits.append(a)
+
+    # dedupe
+    seen_s = set()
+    seen_t = set()
+    norm_lits: List[Any] = []
+    for it in lits:
+        if isinstance(it, tuple):
+            key = (it[0], it[1])
+            if key in seen_t:
+                continue
+            seen_t.add(key)
+            norm_lits.append(it)
+        else:
+            if it in seen_s:
+                continue
+            seen_s.add(it)
+            norm_lits.append(it)
+    lits = sorted(norm_lits, key=lambda x: (-len(x[0]) if isinstance(x, tuple) else -len(x), x[0] if isinstance(x, tuple) else x))
 
     chars = list(text)
     spans = sorted(spans, key=lambda x: x[0], reverse=True)
@@ -520,19 +551,23 @@ def redact_xlucs(text: str, extra_literals: Optional[List[str]] = None) -> str:
     # 0) 리터럴 우선(부분 문자열 충돌 방지)
     if lits:
         for lit in lits:
-            masked = mask_except_hypen(lit)
-            if not lit or lit not in text:
+            if isinstance(lit, tuple):
+                raw_lit, masked = lit
+            else:
+                raw_lit = lit
+                masked = mask_except_hypen(raw_lit)
+            if not raw_lit or raw_lit not in text:
                 continue
             # 뒤에서부터 치환(인덱스 안정)
             start = 0
             while True:
-                pos = text.find(lit, start)
+                pos = text.find(raw_lit, start)
                 if pos == -1:
                     break
                 start = pos + 1
                 # 기록
                 s = pos
-                e = pos + len(lit)
+                e = pos + len(raw_lit)
                 for i, ch in enumerate(masked):
                     chars[s + i] = ch
 
@@ -618,7 +653,7 @@ def overlay_workbook_stream(file_bytes: bytes, orig_wb: bytes, new_wb: bytes) ->
 def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
     print("[INFO] XLS Redaction 시작")
 
-    extra_literals: List[str] = []
+    extra_literals: List[Any] = []
     if spans and isinstance(spans, list):
         for sp in spans:
             if not isinstance(sp, dict):
@@ -627,9 +662,14 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
             if t is None:
                 continue
             v = str(t).strip()
-            if len(v) >= 2:
-                extra_literals.append(v)
-    extra_literals = sorted(set(extra_literals), key=lambda x: (-len(x), x))
+            rt = sp.get("replace_text")
+            if isinstance(rt, str) and rt and len(rt) == len(v):
+                if len(v) >= 2:
+                    extra_literals.append((v, rt))
+            else:
+                if len(v) >= 2:
+                    extra_literals.append(v)
+    # dedupe/정렬은 redact_xlucs에서 처리
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):

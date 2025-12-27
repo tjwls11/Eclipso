@@ -483,8 +483,8 @@ def extract_text(file_bytes: bytes) -> Dict[str, Any]:
     return out
 
 
-def _collect_literals_from_spans(spans) -> List[str]:
-    out: List[str] = []
+def _collect_literals_from_spans(spans) -> List[Any]:
+    out: List[Any] = []
     if not spans or not isinstance(spans, list):
         return out
     for sp in spans:
@@ -495,8 +495,30 @@ def _collect_literals_from_spans(spans) -> List[str]:
             continue
         v = str(t).strip()
         if len(v) >= 2:
-            out.append(v)
-    return sorted(set(out), key=lambda x: (-len(x), x))
+            rt = sp.get("replace_text")
+            if isinstance(rt, str) and rt and len(rt) == len(v):
+                out.append((v, rt))
+            else:
+                out.append(v)
+
+    # dedupe
+    seen_s = set()
+    seen_t = set()
+    norm: List[Any] = []
+    for it in out:
+        if isinstance(it, tuple) and len(it) == 2:
+            k = (it[0], it[1])
+            if k in seen_t:
+                continue
+            seen_t.add(k)
+            norm.append(it)
+        else:
+            if it in seen_s:
+                continue
+            seen_s.add(it)
+            norm.append(it)
+
+    return sorted(norm, key=lambda x: (-len(x[0]) if isinstance(x, tuple) else -len(x), x[0] if isinstance(x, tuple) else x))
 
 
 def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:

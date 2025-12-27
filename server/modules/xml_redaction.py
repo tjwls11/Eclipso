@@ -206,7 +206,7 @@ def xml_redact_to_file(
     comp = compile_rules()
     kind = detect_xml_type(filename)
     log.info("XML redact: file=%s kind=%s", filename, kind)
-    _ = (ner_entities, ner_allowed, masking_policy)
+    # masking_policy는 module.redact_item/sub_text_nodes에서 부분 마스킹에 사용될 수 있음
 
     allowed_set = {str(x).upper() for x in (ner_allowed or []) if str(x).strip()} if ner_allowed else None
 
@@ -271,13 +271,13 @@ def xml_redact_to_file(
                     continue
 
                 if kind == "docx":
-                    red = docx.redact_item(name, data, comp)
+                    red = docx.redact_item(name, data, comp, masking_policy=masking_policy)
                 elif kind == "xlsx":
-                    red = xlsx.redact_item(name, data, comp)
+                    red = xlsx.redact_item(name, data, comp, masking_policy=masking_policy)
                 elif kind == "pptx":
-                    red = pptx.redact_item(name, data, comp)
+                    red = pptx.redact_item(name, data, comp, masking_policy=masking_policy)
                 elif kind == "hwpx":
-                    red = hwpx.redact_item(name, data, comp)
+                    red = hwpx.redact_item(name, data, comp, masking_policy=masking_policy)
                 else:
                     red = None
 

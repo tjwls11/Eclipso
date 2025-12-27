@@ -119,6 +119,24 @@ def _append_token(
     if not token:
         return
     out_text_parts.append(token)
+    # 기본은 단어 bbox를 문자마다 동일하게 기록하지만,
+    # 부분 마스킹(span의 일부)에서 "단어 전체 bbox"로 확장되는 문제를 막기 위해
+    # bbox가 있을 때는 문자 단위로 x축을 균등 분할하여 bbox를 부여한다.
+    if bbox is not None and len(token) > 1:
+        try:
+            x0, y0, x1, y1 = map(float, bbox)
+            w = max(0.0, x1 - x0)
+            n = len(token)
+            if w > 0.0 and n > 0 and n <= 128:
+                cw = w / float(n)
+                for i, _ch in enumerate(token):
+                    bx0 = x0 + cw * i
+                    bx1 = x0 + cw * (i + 1)
+                    out_chars.append({"bbox": (bx0, y0, bx1, y1), "line_id": line_id})
+                return
+        except Exception:
+            pass
+
     for _ch in token:
         out_chars.append({"bbox": bbox, "line_id": line_id})
 

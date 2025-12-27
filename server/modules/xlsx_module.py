@@ -252,12 +252,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "xlsx", text
 
 
-def redact_item(filename: str, data: bytes, comp):
+def redact_item(filename: str, data: bytes, comp, masking_policy=None):
     low = filename.lower()
     log.info("[XLSX][RED] filename=%s low=%s size=%d", filename, low, len(data))
 
     if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
-        b, _ = sub_text_nodes(data, comp)
+        b, _ = sub_text_nodes(data, comp, masking_policy=masking_policy)
         return b
 
     if low.startswith("xl/charts/") and low.endswith(".xml"):

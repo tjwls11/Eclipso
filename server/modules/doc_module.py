@@ -541,19 +541,40 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
             cur += cp_len
 
         replaced = bytearray(word_data)
-        for s, e, _ in targets:
+        for s, e, repl_text in targets:
             for text_start, text_end, fc_base, bpc in piece_spans:
                 if s >= text_end or e <= text_start:
                     continue
                 local_start, local_end = max(s, text_start), min(e, text_end)
                 byte_start = fc_base + (local_start - text_start) * bpc
                 byte_len = (local_end - local_start) * bpc
-                mask = (
-                    (replacement_char.encode("utf-16le")[:2] * (byte_len // 2))
-                    if bpc == 2
-                    else replacement_char.encode("latin-1")[:1] * byte_len
-                )
-                replaced[byte_start : byte_start + byte_len] = mask
+                seg = None
+                try:
+                    if isinstance(repl_text, str) and len(repl_text) >= (e - s):
+                        seg = repl_text[(local_start - s) : (local_end - s)]
+                except Exception:
+                    seg = None
+
+                if seg is None:
+                    # fallback: full mask
+                    mask = (
+                        (replacement_char.encode("utf-16le")[:2] * (byte_len // 2))
+                        if bpc == 2
+                        else replacement_char.encode("cp1252", "ignore")[:1] * byte_len
+                    )
+                    replaced[byte_start : byte_start + byte_len] = mask
+                    continue
+
+                if bpc == 2:
+                    enc = seg.encode("utf-16le", "ignore")
+                    if len(enc) != byte_len:
+                        enc = (replacement_char.encode("utf-16le")[:2] * (byte_len // 2))
+                    replaced[byte_start : byte_start + byte_len] = enc
+                else:
+                    enc = seg.encode("cp1252", "ignore")
+                    if len(enc) != byte_len:
+                        enc = replacement_char.encode("cp1252", "ignore")[:1] * byte_len
+                    replaced[byte_start : byte_start + byte_len] = enc
 
         return create_new_ole_file(file_bytes, bytes(replaced))
     except Exception as e:
@@ -755,33 +776,14 @@ def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]
             return file_bytes
 
         norm_text, index_map = normalization_index(raw_text)
-        matches = find_sensitive_spans(norm_text)
-        matches = split_matches(matches, norm_text)
+        def _mask_except_hyphen(seg: str) -> str:
+            return "".join("-" if ch == "-" else "*" for ch in (seg or ""))
 
-        span_ranges: List[Tuple[int, int]] = []
-        if spans and isinstance(spans, list):
-            n = len(norm_text)
-            for sp in spans:
-                if not isinstance(sp, dict):
-                    continue
-                s = sp.get("start")
-                e = sp.get("end")
-                if s is None or e is None:
-                    continue
-                try:
-                    s = int(s)
-                    e = int(e)
-                except Exception:
-                    continue
-                s = max(0, min(n, s))
-                e = max(0, min(n, e))
-                if e <= s:
-                    continue
-                span_ranges.append((s, e))
-        if span_ranges:
-            # find_sensitive_spans와 동일 포맷으로 합치기(값은 참고용)
-            for s, e in span_ranges:
-                matches.append((s, e, norm_text[s:e], "SPAN"))
+        # 기본: 내부 탐지(선택 정책이 없을 때만)
+        matches = []
+        if not spans:
+            matches = find_sensitive_spans(norm_text)
+            matches = split_matches(matches, norm_text)
 
         targets = []
         def _map_pos(idx: int) -> Optional[int]:
@@ -809,7 +811,44 @@ def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]
             end = end0 + 1
             if end <= start:
                 end = start + max(1, (e - s))
-            targets.append((start, end, val))
+            # 내부 탐지는 전체 마스킹(하이픈 보존)
+            repl = _mask_except_hyphen(val)
+            targets.append((start, end, repl))
+
+        # spans가 주어지면(= file_redact_api에서 선택된 항목만 전달) 그 범위만 레닥션한다.
+        if spans and isinstance(spans, list):
+            n = len(norm_text)
+            for sp in spans:
+                if not isinstance(sp, dict):
+                    continue
+                s = sp.get("start")
+                e = sp.get("end")
+                if s is None or e is None:
+                    continue
+                try:
+                    s = int(s)
+                    e = int(e)
+                except Exception:
+                    continue
+                s = max(0, min(n, s))
+                e = max(0, min(n, e))
+                if e <= s:
+                    continue
+
+                start = _map_pos(s)
+                end0 = _map_pos(e - 1)
+                if start is None or end0 is None:
+                    continue
+                end = end0 + 1
+
+                seg = norm_text[s:e]
+                rt = sp.get("replace_text")
+                if isinstance(rt, str) and rt and len(rt) == len(seg):
+                    repl = rt
+                else:
+                    repl = _mask_except_hyphen(seg)
+
+                targets.append((start, end, repl))
         return replace_text(file_bytes, targets)
 
     except Exception as e:

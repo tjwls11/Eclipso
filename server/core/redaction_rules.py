@@ -40,6 +40,7 @@ FGN_RE = re.compile(
 # 카드번호
 CARD_RE = re.compile(r"(?:\d[ -]?){15,16}")
 
+
 # 이메일
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
 

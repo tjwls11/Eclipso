@@ -385,7 +385,7 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 
     return out, "docx", text
 
-def redact_item(filename: str, data: bytes, comp):
+def redact_item(filename: str, data: bytes, comp, masking_policy=None):
     low = filename.lower()
     log.info(
         "[DOCX][RED] filename=%s low=%s size=%d",
@@ -402,11 +402,11 @@ def redact_item(filename: str, data: bytes, comp):
         return chart_rels_sanitize(data)
 
     if low == "word/document.xml":
-        return sub_text_nodes(data, comp)[0]
+        return sub_text_nodes(data, comp, masking_policy=masking_policy)[0]
 
     if low.startswith("word/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
-        return sub_text_nodes(b2, comp)[0]
+        return sub_text_nodes(b2, comp, masking_policy=masking_policy)[0]
 
     if low.startswith("word/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)

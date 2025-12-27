@@ -3,6 +3,30 @@ const API_BASE = () => window.API_BASE || 'http://127.0.0.1:8000'
 const $ = (sel) => document.querySelector(sel)
 const $$ = (sel) => Array.from(document.querySelectorAll(sel))
 
+/** ---------- Persistence (localStorage) ---------- */
+const PREFS_KEY = 'eclipso_ui_prefs_v1'
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY)
+    if (!raw) return {}
+    const obj = JSON.parse(raw)
+    return obj && typeof obj === 'object' ? obj : {}
+  } catch {
+    return {}
+  }
+}
+
+function savePrefs(patch) {
+  try {
+    const cur = loadPrefs()
+    const next = { ...(cur || {}), ...(patch || {}) }
+    localStorage.setItem(PREFS_KEY, JSON.stringify(next))
+  } catch {
+    // ignore
+  }
+}
+
 /** ---------- State ---------- */
 let state = {
   file: null,
@@ -30,7 +54,20 @@ let state = {
   filters: { q: '', seg: 'all' },
 
   ui: {},
+
+  // 부분 마스킹 정책(레닥션에만 사용)
+  // 예: { ps: "keep_first_char", rrn: "keep_birth6", phone: "keep_first_group" }
+  maskingPolicy: {},
 }
+
+// load persisted prefs early (so loadRules can reflect initial button state)
+;(function hydratePrefsEarly() {
+  const p = loadPrefs()
+  if (p && typeof p === 'object') {
+    if (p.maskingPolicy && typeof p.maskingPolicy === 'object')
+      state.maskingPolicy = { ...p.maskingPolicy }
+  }
+})()
 
 /** ---------- Safe DOM helpers (핵심: null 방지) ---------- */
 const byId = (id) => document.getElementById(id)
@@ -281,17 +318,114 @@ async function loadRules() {
     const box = $('#rules-container')
     if (!box) return
     box.innerHTML = ''
+
+    const prefs = loadPrefs()
+    const persistedSelectedRules = Array.isArray(prefs?.selectedRules)
+      ? prefs.selectedRules.map((x) => String(x))
+      : null
+
+    const isRulePartialSupported = (ruleName) => {
+      const r = String(ruleName || '').toLowerCase()
+      return (
+        r.includes('rrn') ||
+        r.includes('fgn') ||
+        r.includes('card') ||
+        r.includes('phone_mobile') ||
+        r.includes('phone_city') ||
+        r.includes('phone')
+      )
+    }
+
+    const getRuleKey = (ruleName) => {
+      const r = String(ruleName || '').toLowerCase()
+      if (r.includes('rrn')) return 'rrn'
+      if (r.includes('fgn')) return 'fgn'
+      if (r.includes('phone')) return 'phone'
+      if (r.includes('card')) return 'card'
+      return r
+    }
+
+    const isRulePartialOn = (ruleName) => {
+      const key = getRuleKey(ruleName)
+      return !!state.maskingPolicy?.[key]
+    }
+
+    const setRulePartialOn = (ruleName, on) => {
+      const key = getRuleKey(ruleName)
+      state.maskingPolicy = state.maskingPolicy || {}
+      if (!on) delete state.maskingPolicy[key]
+      else {
+        if (key === 'rrn' || key === 'fgn')
+          state.maskingPolicy[key] = 'keep_birth6'
+        else if (key === 'phone') state.maskingPolicy[key] = 'keep_first_group'
+        else if (key === 'card') state.maskingPolicy[key] = 'keep_first4_last4'
+        else state.maskingPolicy[key] = 'partial'
+      }
+      savePrefs({ maskingPolicy: state.maskingPolicy })
+    }
+
+    const applyRuleBtnStyle = (btn, on) => {
+      if (!btn) return
+      btn.textContent = on ? '부분' : '전체'
+      btn.className =
+        'text-[11px] px-2 py-0.5 rounded-full border transition ' +
+        (on
+          ? 'border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+          : 'border-gray-200 bg-gray-50 text-gray-600 hover:bg-gray-100')
+    }
+
     for (const rule of rules) {
+      const wrap = document.createElement('div')
+      wrap.className = 'flex items-center justify-between gap-2'
+
       const el = document.createElement('label')
       el.className =
-        'flex items-center gap-2 cursor-pointer hover:text-indigo-600 transition'
+        'flex items-center gap-2 cursor-pointer hover:text-indigo-600 transition min-w-0'
+      const checkedAttr =
+        persistedSelectedRules && persistedSelectedRules.length
+          ? persistedSelectedRules.includes(String(rule))
+            ? 'checked'
+            : ''
+          : 'checked'
+      const ruleLabel = ruleToKind(rule)
       el.innerHTML = `<input type="checkbox" name="rule" value="${escHtml(
         rule
-      )}" checked class="rounded border-zinc-300 text-indigo-600 focus:ring-indigo-500"><span>${escHtml(
-        rule
-      )}</span>`
-      box.appendChild(el)
+      )}" ${checkedAttr} class="rounded border-zinc-300 text-indigo-600 focus:ring-indigo-500"><span class="truncate" title="${escHtml(
+        String(rule || '')
+      )}">${escHtml(ruleLabel)}</span>`
+
+      wrap.appendChild(el)
+
+      if (isRulePartialSupported(rule)) {
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.title = '부분 마스킹 (전체/부분)'
+
+        const key = getRuleKey(rule)
+        applyRuleBtnStyle(btn, isRulePartialOn(rule))
+        btn.addEventListener('click', (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+
+          const next = !isRulePartialOn(rule)
+          setRulePartialOn(rule, next)
+          applyRuleBtnStyle(btn, next)
+        })
+        wrap.appendChild(btn)
+      }
+
+      box.appendChild(wrap)
     }
+
+    // persist rule checkbox changes
+    box
+      .querySelectorAll('input[type="checkbox"][name="rule"]')
+      .forEach((cb) => {
+        cb.addEventListener('change', () => {
+          const selected = $$('input[name="rule"]:checked').map((x) => x.value)
+          savePrefs({ selectedRules: selected })
+        })
+      })
   } catch {
     // 기본값 유지
   }
@@ -307,6 +441,55 @@ function selectedNerLabels() {
   $('#ner-show-lc')?.checked !== false && labels.push('LC')
   $('#ner-show-og')?.checked !== false && labels.push('OG')
   return labels
+}
+
+function setupPsMaskModeButton() {
+  const btn = document.getElementById('btn-ps-mask-mode')
+  if (!btn) return
+
+  const mode = () => {
+    const ps = String(state.maskingPolicy?.ps || '')
+    const two = String(state.maskingPolicy?.ps_twochar || '')
+    if (ps !== 'keep_first_char') return 'full'
+    if (two === 'mask_full') return 'keep_first_char_strict'
+    return 'keep_first_char'
+  }
+
+  const apply = () => {
+    const m = mode()
+    btn.textContent = m === 'full' ? '전체' : '부분'
+    btn.title =
+      m === 'full'
+        ? '이름(PS) 마스킹: 전체'
+        : m === 'keep_first_char'
+        ? '이름(PS) 마스킹: 성만 남김'
+        : '이름(PS) 마스킹: 성만 남김(2글자 이름은 전체 마스킹)'
+    btn.className =
+      'ml-auto text-[11px] px-2 py-0.5 rounded-full border transition ' +
+      (m !== 'full'
+        ? 'border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+        : 'border-gray-200 bg-gray-50 text-gray-600 hover:bg-gray-100')
+  }
+
+  btn.addEventListener('click', (e) => {
+    e.preventDefault()
+    state.maskingPolicy = state.maskingPolicy || {}
+    const m = mode()
+    if (m === 'full') {
+      state.maskingPolicy.ps = 'keep_first_char'
+      delete state.maskingPolicy.ps_twochar
+    } else if (m === 'keep_first_char') {
+      state.maskingPolicy.ps = 'keep_first_char'
+      state.maskingPolicy.ps_twochar = 'mask_full'
+    } else {
+      delete state.maskingPolicy.ps
+      delete state.maskingPolicy.ps_twochar
+    }
+    savePrefs({ maskingPolicy: state.maskingPolicy })
+    apply()
+  })
+
+  apply()
 }
 
 /** ---------- Markdown fallback ---------- */
@@ -388,7 +571,6 @@ function ruleToKind(rule) {
   if (r.includes('email')) return '이메일'
   if (r.includes('passport')) return '여권번호'
   if (r.includes('driver')) return '운전면허번호'
-  if (r.includes('account') || r.includes('bank')) return '계좌번호'
   if (r.includes('phone') || r.includes('tel') || r.includes('mobile'))
     return '전화번호'
   return String(rule)
@@ -1418,10 +1600,14 @@ async function doRedactAndDownload() {
     const rulesJson = safeJson(state.rules || [])
     const labelsJson = safeJson(state.nerLabels || [])
     const entsJson = safeJson(state.nerItems || [])
+    const maskingJson = safeJson(state.maskingPolicy || {})
 
     rulesJson && fd.append('rules_json', rulesJson)
     labelsJson && fd.append('ner_labels_json', labelsJson)
     entsJson && fd.append('ner_entities_json', entsJson)
+    maskingJson &&
+      maskingJson !== '{}' &&
+      fd.append('masking_json', maskingJson)
 
     const r = await fetch(`${API_BASE()}/redact/file`, {
       method: 'POST',
@@ -1480,11 +1666,40 @@ function renderCurrentPage() {
 
 /** ---------- Init ---------- */
 document.addEventListener('DOMContentLoaded', () => {
+  // hydrate NER label checkboxes from prefs (optional)
+  try {
+    const p = loadPrefs()
+    const ner =
+      p?.nerLabels && typeof p.nerLabels === 'object' ? p.nerLabels : null
+    if (ner) {
+      const ps = document.getElementById('ner-show-ps')
+      const lc = document.getElementById('ner-show-lc')
+      const og = document.getElementById('ner-show-og')
+      if (ps && typeof ner.ps === 'boolean') ps.checked = ner.ps
+      if (lc && typeof ner.lc === 'boolean') lc.checked = ner.lc
+      if (og && typeof ner.og === 'boolean') og.checked = ner.og
+    }
+  } catch {}
+
   loadRules()
   setupDropZone()
   wireMatchTabs()
   updateSegButtons(state.filters.seg || 'all')
   resetProgress()
+  setupPsMaskModeButton()
+  ;['ner-show-ps', 'ner-show-lc', 'ner-show-og'].forEach((id) => {
+    const el = document.getElementById(id)
+    if (!el) return
+    el.addEventListener('change', () => {
+      savePrefs({
+        nerLabels: {
+          ps: document.getElementById('ner-show-ps')?.checked !== false,
+          lc: document.getElementById('ner-show-lc')?.checked !== false,
+          og: document.getElementById('ner-show-og')?.checked !== false,
+        },
+      })
+    })
+  })
 
   $('#file')?.addEventListener('change', () => {
     const btn = $('#btn-save-redacted')

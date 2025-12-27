@@ -371,7 +371,13 @@ def _except_hyphen(text: str) -> str:
     return "".join("-" if ch == "-" else "*" for ch in text)
 
 # 특정 인코딩 기준 동일 길이 마스킹
-def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
+def replace_bytes_with_enc(
+    data: bytes,
+    old: str,
+    enc: str,
+    max_log: int = 0,
+    replace_text: Optional[str] = None,
+):
     try:
         needle = old.encode(enc, "ignore")
     except Exception:
@@ -380,7 +386,7 @@ def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
     if not needle:
         return data, 0, []
 
-    masked_text = _except_hyphen(old)
+    masked_text = str(replace_text) if replace_text is not None else _except_hyphen(old)
 
     if enc == "utf-16le":
         repl = masked_text.encode("utf-16le")
@@ -553,14 +559,38 @@ def _replace_in_bindata_smart(raw: bytes) -> Tuple[bytes, int]:
 # ─────────────────────────────
 # 레닥션 메인
 # ─────────────────────────────
-def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
+def redact(
+    file_bytes: bytes,
+    spans: Optional[List[Dict[str, Any]]] = None,
+    masking_policy: Optional[Dict[str, Any]] = None,
+) -> bytes:
     container = bytearray(file_bytes)
 
     full_raw = extract_text(file_bytes)["full_text"]
     full_norm = normalization_text(full_raw)
-    targets = _collect_targets_by_regex(full_norm)
 
-    # NER spans에서 텍스트 추출하여 targets에 추가
+    # 부분 마스킹을 쓰는 규칙은 "전체 문자열 타겟"을 넣으면 부분이 덮어써지므로 제외
+    pol = masking_policy or {}
+    exclude_rules: set[str] = set()
+    if str(pol.get("rrn") or "") == "keep_birth6":
+        exclude_rules.add("rrn")
+    if str(pol.get("fgn") or "") == "keep_birth6":
+        exclude_rules.add("fgn")
+    if str(pol.get("phone") or "") == "keep_first_group":
+        exclude_rules.update({"phone_mobile", "phone_city"})
+    if str(pol.get("card") or "") == "keep_first4_last4":
+        exclude_rules.add("card")
+    if str(pol.get("account") or "") in ("keep_last3", "keep_last4"):
+        exclude_rules.add("account")
+
+    targets: List[str] = []
+    for _s, _e, val, rule in find_sensitive_spans(full_norm):
+        if rule in exclude_rules:
+            continue
+        if val and val.strip():
+            targets.append(val)
+
+    # spans에서 텍스트 추출하여 targets에 추가
     if spans:
         for span in spans:
             if not isinstance(span, dict):
@@ -578,12 +608,29 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
                 continue
             target_text = full_raw[s:e]
             if target_text and target_text.strip():
-                targets.append(target_text)
+                # replace_text가 있으면 "전체 문자열 -> 부분 마스킹 문자열"로 치환
+                rt = span.get("replace_text")
+                if isinstance(rt, str) and rt and len(rt) == len(target_text):
+                    # key는 원문 텍스트(정확히 매칭되는 경우에만)
+                    targets.append((target_text, rt))
+                else:
+                    targets.append(target_text)
     
-    # 중복 제거 및 정렬
-    targets = sorted(set(targets), key=lambda x: (-len(x), x))
+    # targets 정규화: (old, repl)과 old 문자열을 분리해 중복/정렬
+    rep_map: dict[str, str] = {}
+    plain_targets: List[str] = []
+    for t in targets:
+        if isinstance(t, tuple) and len(t) == 2:
+            old, repl = t
+            if isinstance(old, str) and isinstance(repl, str) and old and (len(old) == len(repl)):
+                rep_map[old] = repl
+        elif isinstance(t, str) and t:
+            plain_targets.append(t)
 
-    print(f"[DBG] sensitive targets = {targets}")
+    plain_targets = sorted(set(plain_targets), key=lambda x: (-len(x), x))
+    rep_items = sorted(rep_map.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+
+    print(f"[DBG] sensitive targets = {plain_targets + [k for k,_ in rep_items]}")
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         streams = ole.listdir(streams=True, storages=False)
@@ -607,7 +654,9 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
                     break
                 if tag == TAG_PARA_TEXT and size > 0:
                     seg = bytes(buf[off:off + size])
-                    for t in targets:
+                    for old, repl in rep_items:
+                        seg, _, _ = replace_bytes_with_enc(seg, old, "utf-16le", replace_text=repl)
+                    for t in plain_targets:
                         seg, _, _ = replace_bytes_with_enc(seg, t, "utf-16le")
                     buf[off:off + size] = seg
                 off += size
@@ -677,7 +726,9 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
                 if "prv" in name and "text" in name:
                     raw = ole.openstream(path).read()
                     new_raw = raw
-                    for t in targets:
+                    for old, repl in rep_items:
+                        new_raw, _, _ = replace_bytes_with_enc(new_raw, old, "utf-16le", replace_text=repl)
+                    for t in plain_targets:
                         new_raw, _, _ = replace_bytes_with_enc(new_raw, t, "utf-16le")
 
                     if len(new_raw) < len(raw):
