@@ -5,15 +5,17 @@ import os
 import re
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
+import time
+from collections import Counter
 
 from PIL import Image, ImageDraw, ImageOps, ImageFilter
 
 try:
     from server.modules.ocr_module import easyocr_blocks
-    from server.modules.ocr_qwen_post import classify_blocks_with_qwen
 except Exception:
     from .ocr_module import easyocr_blocks
-    from .ocr_qwen_post import classify_blocks_with_qwen
+
+classify_blocks_with_qwen = None
 
 
 # 이메일 완화 정규식 (OCR 오타/기호 변형 대응)
@@ -279,6 +281,79 @@ def _merge_email_from_line_tokens(line: List[Dict[str, Any]], comp) -> List[Dict
         bx0, by0, bx1, by1 = _union_bbox((bx0, by0, bx1, by1), _block_bbox(line[i]))
 
     return [{"text": val, "normalized": val, "bbox": [bx0, by0, bx1, by1]}]
+
+
+def _merge_phone_from_line_tokens(lines: List[List[Dict[str, Any]]], comp) -> List[Dict[str, Any]]:
+    rx_m, need_m, val_m = _get_rule(comp, "phone_mobile")
+    rx_c, need_c, val_c = _get_rule(comp, "phone_city")
+    if rx_m is None and rx_c is None:
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    def _ok(rule: str, val: str) -> bool:
+        if rule == "phone_mobile":
+            if need_m and callable(val_m):
+                return _run_validator(val, val_m)
+            return True
+        if rule == "phone_city":
+            if need_c and callable(val_c):
+                return _run_validator(val, val_c)
+            return True
+        return True
+
+    for line in lines:
+        if not line:
+            continue
+
+        texts = [_normalize_ocr_text(str(b.get("text") or "").strip()) for b in line]
+        if not any(ch.isdigit() for t in texts for ch in t):
+            continue
+
+        joined = ""
+        spans: List[Tuple[int, int]] = []
+        for t in texts:
+            t2 = (t or "").replace(" ", "")
+            s = len(joined)
+            joined += t2
+            e = len(joined)
+            spans.append((s, e))
+
+        hits: List[Tuple[int, int, str]] = []
+        if rx_m is not None:
+            for m in rx_m.finditer(joined):
+                hits.append((m.start(), m.end(), "phone_mobile"))
+        if rx_c is not None:
+            for m in rx_c.finditer(joined):
+                hits.append((m.start(), m.end(), "phone_city"))
+        if not hits:
+            continue
+
+        # deterministic order: left to right, prefer longer match
+        hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+        for ms, me, rule in hits[:6]:
+            val = joined[ms:me]
+            if not val:
+                continue
+            if not _ok(rule, val):
+                continue
+
+            hit_idxs: List[int] = []
+            for i, (s, e) in enumerate(spans):
+                if e <= ms or s >= me:
+                    continue
+                hit_idxs.append(i)
+            if not hit_idxs:
+                continue
+
+            bx0, by0, bx1, by1 = _block_bbox(line[hit_idxs[0]])
+            for i in hit_idxs[1:]:
+                bx0, by0, bx1, by1 = _union_bbox((bx0, by0, bx1, by1), _block_bbox(line[i]))
+
+            out.append({"text": val, "normalized": val, "bbox": [bx0, by0, bx1, by1]})
+
+    return out
 
 
 def _merge_cards_from_digit_groups(
@@ -592,8 +667,6 @@ def _tighten_overwide_bbox(text: str, bbox: List[float], *, char_px_factor: floa
     nx0 = cx - half
     nx1 = cx + half
     return [nx0, y0, nx1, y1]
-
-
 def detect_sensitive_ocr_blocks(
     image: Image.Image,
     *,
@@ -601,6 +674,7 @@ def detect_sensitive_ocr_blocks(
     filename: str = "",
     logger: Optional[logging.Logger] = None,
     comp=None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if comp is None:
         from server.modules.common import compile_rules
@@ -608,7 +682,7 @@ def detect_sensitive_ocr_blocks(
 
     log = logger or logging.getLogger("ocr_image_redactor")
 
-    use_llm = _env_bool(f"{env_prefix}_OCR_LLM", _env_bool(f"{env_prefix}_OCR_USE_LLM", True))
+    use_llm = _env_bool(f"{env_prefix}_OCR_USE_LLM", True)
     debug = _env_bool(f"{env_prefix}_OCR_DEBUG", False)
 
     conf1 = _env_float(f"{env_prefix}_OCR_MINCONF", 0.30)
@@ -617,24 +691,33 @@ def detect_sensitive_ocr_blocks(
 
     pass2 = _env_bool(f"{env_prefix}_OCR_SECOND_PASS", True)
     pass3 = _env_bool(f"{env_prefix}_OCR_UPSCALE_PASS", True)
+
+    line_y_tol = _env_int(f"{env_prefix}_OCR_LINE_Y_TOL", 18)
     upscale = _env_float(f"{env_prefix}_OCR_UPSCALE", 2.0)
+    max_px_for_upscale = _env_int(f"{env_prefix}_OCR_MAX_PX_FOR_UPSCALE", 2200000)
+    card_nextline_tol = _env_float(f"{env_prefix}_OCR_CARD_NEXTLINE_TOL", 140.0)
 
     gpu_env = os.getenv(f"{env_prefix}_OCR_GPU")
     if gpu_env is None:
-        gpu = _torch_cuda_available()  # 자동 감지
+        gpu = _torch_cuda_available()
     else:
         gpu = _env_bool(f"{env_prefix}_OCR_GPU", False) and _torch_cuda_available()
 
-    max_px_for_upscale = _env_int(f"{env_prefix}_OCR_MAX_PX_FOR_UPSCALE", 2200000)  # ~1920x1146 정도
-    if (not gpu) and pass3:
-        try:
-            if (image.width * image.height) >= max_px_for_upscale:
-                pass3 = False
-        except Exception:
-            pass
+    if meta is not None:
+        meta["env_prefix"] = env_prefix
+        meta["filename"] = filename
+        meta["size"] = getattr(image, "size", None)
+        meta["gpu"] = bool(gpu)
+        meta["conf1"] = conf1
+        meta["conf2"] = conf2
+        meta["conf3"] = conf3
+        meta["pass2"] = bool(pass2)
+        meta["pass3"] = bool(pass3)
+        meta["use_llm"] = bool(use_llm)
 
-    line_y_tol = _env_float(f"{env_prefix}_OCR_LINE_YTOL", 12.0)
-    card_nextline_tol = _env_float(f"{env_prefix}_OCR_CARD_NEXTLINE_TOL", 140.0)
+    if debug:
+        print(f"[{env_prefix}] OCR start image='{filename}' size={getattr(image, 'size', None)} gpu={gpu}", flush=True)
+    t_ocr0 = time.perf_counter()
 
     blocks_all: List[Dict[str, Any]] = []
 
@@ -646,26 +729,42 @@ def detect_sensitive_ocr_blocks(
         blocks_all += b2
 
     if pass3:
-        b3, (sx3, sy3) = _ocr_pass(image, conf3, gpu=gpu, autocontrast=True, upscale=upscale, sharpen=True)
-        for bb in b3:
-            try:
-                x0, y0, x1, y1 = map(float, bb.get("bbox") or [0, 0, 0, 0])
-                bb["bbox"] = _scale_bbox([x0, y0, x1, y1], sx3, sy3)
-            except Exception:
-                pass
-        blocks_all += b3
+        w, h = image.size
+        if (w * h) <= max_px_for_upscale:
+            b3, (sx3, sy3) = _ocr_pass(image, conf3, gpu=gpu, autocontrast=True, upscale=upscale, sharpen=True)
+            for bb in b3:
+                try:
+                    x0, y0, x1, y1 = map(float, bb.get("bbox") or [0, 0, 0, 0])
+                    bb["bbox"] = _scale_bbox([x0, y0, x1, y1], sx3, sy3)
+                except Exception:
+                    pass
+            blocks_all += b3
 
     blocks = _dedup_blocks(blocks_all)
+
+    dt_ocr_ms = int((time.perf_counter() - t_ocr0) * 1000)
+    if meta is not None:
+        meta["dt_ocr_ms"] = dt_ocr_ms
+        meta["raw_blocks"] = int(len(blocks_all))
+        meta["dedup_blocks"] = int(len(blocks))
+        meta["sample_texts"] = [str(b.get("text") or "") for b in (blocks[:5] if isinstance(blocks, list) else [])]
+
     if debug:
-        print(f"[{env_prefix}] RAW OCR blocks=", len(blocks_all))
-        print(f"[{env_prefix}] OCR blocks=", len(blocks), "image=", filename, "gpu=", gpu)
+        print(
+            f"[{env_prefix}] OCR done ms={dt_ocr_ms} raw_blocks={len(blocks_all)} dedup_blocks={len(blocks)}",
+            flush=True,
+        )
 
     if not blocks:
+        if meta is not None:
+            meta["matched_rules"] = 0
         return []
 
     lines = _group_lines(blocks, y_tol=line_y_tol)
 
     synthetic: List[Dict[str, Any]] = []
+    synthetic += _merge_phone_from_line_tokens(lines, comp)
+    # _merge_email_from_line_tokens expects a single line (list of blocks), not lines
     for line in lines:
         synthetic += _merge_email_from_line_tokens(line, comp)
     synthetic += _merge_cards_from_digit_groups(lines, comp, y_next_tol=card_nextline_tol)
@@ -675,11 +774,39 @@ def detect_sensitive_ocr_blocks(
         blocks.append(s)
 
     llm_blocks = blocks
+    llm_ok = False
+
+    if debug:
+        print(f"[{env_prefix}] LLM classify start blocks={len(blocks)}", flush=True)
+    t_llm0 = time.perf_counter()
     if use_llm:
         try:
-            llm_blocks = classify_blocks_with_qwen(blocks)
-        except Exception:
+            fn = classify_blocks_with_qwen
+            if fn is None:
+                try:
+                    from server.modules.ocr_qwen_post import classify_blocks_with_qwen as fn  # type: ignore
+                except Exception:
+                    try:
+                        from .ocr_qwen_post import classify_blocks_with_qwen as fn  # type: ignore
+                    except Exception:
+                        fn = None
+
+            llm_blocks = fn(blocks) if callable(fn) else None
+            llm_blocks = llm_blocks or blocks
+            llm_ok = True
+        except Exception as e:
             llm_blocks = blocks
+            llm_ok = False
+            print(f"[{env_prefix}] LLM classify failed -> fallback err={e}", flush=True)
+
+    dt_llm_ms = int((time.perf_counter() - t_llm0) * 1000)
+    kinds = Counter((b.get("kind") or "none") for b in (llm_blocks or []))
+    if meta is not None:
+        meta["dt_llm_ms"] = dt_llm_ms
+        meta["llm_ok"] = bool(llm_ok)
+        meta["kind_counts"] = dict(kinds)
+    if debug:
+        print(f"[{env_prefix}] LLM classify done ms={dt_llm_ms} ok={llm_ok} kind_counts={dict(kinds)}", flush=True)
 
     kind_to_rules = {
         "email": ["email"],
@@ -700,10 +827,10 @@ def detect_sensitive_ocr_blocks(
         candidates = kind_to_rules.get(llm_kind)
 
         rule, val = _match_text_to_rules(txt, comp, candidates=candidates) if candidates else (None, None)
+
         if rule is None:
             rule, val = _match_text_to_rules(txt, comp, candidates=None)
 
-        # 이메일 강제 fallback
         if rule is None:
             em = _fallback_find_email(txt)
             if em:
@@ -714,18 +841,120 @@ def detect_sensitive_ocr_blocks(
 
         bb = dict(b)
         bb["rule"] = rule
-        bb["value"] = val or txt
+        bb["value"] = val
         matched.append(bb)
 
+    regex_count = len(matched)
+
+    # ─────────────────────────────────────────────────────────────
+    # NER 매칭: OCR 블록 텍스트를 합쳐서 NER 돌리고 결과를 bbox에 매핑
+    # ─────────────────────────────────────────────────────────────
+    use_ner = _env_bool(f"{env_prefix}_OCR_USE_NER", True)  # 기본값 True
+    ner_count = 0
+
+    if use_ner and llm_blocks:
+        try:
+            from server.modules.ner_module import run_ner
+
+            # 1) 블록 텍스트를 합치면서 각 블록의 문자 위치 추적
+            joined_parts: List[Tuple[int, int, Dict[str, Any]]] = []  # (start, end, block)
+            joined_text = ""
+            for b in llm_blocks:
+                txt = str(b.get("text") or "").strip()
+                if not txt:
+                    continue
+                start = len(joined_text)
+                joined_text += txt + " "
+                end = len(joined_text) - 1  # 공백 제외
+                joined_parts.append((start, end, b))
+
+            if joined_text.strip():
+                # 2) NER 실행
+                ner_policy = {
+                    "chunk_size": 2000,
+                    "chunk_overlap": 100,
+                    "allowed_labels": ["PS", "LC", "OG"],  # 이름, 장소, 조직
+                    "merge_gap": 0,
+                }
+                ner_spans = run_ner(joined_text, ner_policy) or []
+
+                if debug:
+                    print(f"[{env_prefix}] NER found {len(ner_spans)} spans", flush=True)
+
+                # 3) NER span을 OCR 블록 bbox에 매핑
+                matched_block_ids = {id(m.get("_src_block")) for m in matched if m.get("_src_block")}
+                # 이미 regex로 매칭된 블록의 bbox도 체크
+                matched_bboxes = {tuple(m.get("bbox", [])) for m in matched}
+
+                for sp in ner_spans:
+                    sp_start = sp.get("start", 0)
+                    sp_end = sp.get("end", 0)
+                    sp_label = str(sp.get("label") or "").upper()
+                    sp_text = str(sp.get("text") or "").strip()
+
+                    if not sp_text or sp_end <= sp_start:
+                        continue
+
+                    # 해당 span과 겹치는 블록들 찾기
+                    hit_blocks: List[Dict[str, Any]] = []
+                    for bs, be, blk in joined_parts:
+                        # span과 블록이 겹치는지 확인
+                        if be <= sp_start or bs >= sp_end:
+                            continue
+                        hit_blocks.append(blk)
+
+                    if not hit_blocks:
+                        continue
+
+                    # 가장 잘 맞는 블록 찾기 (텍스트가 가장 유사한 블록)
+                    best_block = hit_blocks[0]
+                    best_score = 0
+                    for hb in hit_blocks:
+                        hb_text = str(hb.get("text") or "").strip()
+                        # 정확히 일치하면 최고 점수
+                        if hb_text == sp_text:
+                            best_block = hb
+                            best_score = 100
+                            break
+                        # 포함되어 있으면 길이 비율로 점수
+                        if sp_text in hb_text or hb_text in sp_text:
+                            score = min(len(sp_text), len(hb_text)) / max(len(sp_text), len(hb_text), 1)
+                            if score > best_score:
+                                best_score = score
+                                best_block = hb
+
+                    # 단일 블록의 bbox 사용
+                    bx0, by0, bx1, by1 = _block_bbox(best_block)
+                    
+                    # 중복 방지
+                    bbox_key = (round(bx0, 1), round(by0, 1))
+                    if bbox_key in matched_bboxes:
+                        continue
+
+                    matched.append({
+                        "text": sp_text,
+                        "normalized": sp_text,
+                        "bbox": [bx0, by0, bx1, by1],
+                        "rule": f"ner_{sp_label.lower()}",
+                        "value": sp_text,
+                        "ner_label": sp_label,
+                    })
+                    matched_bboxes.add(bbox_key)
+                    ner_count += 1
+
+        except Exception as e:
+            if debug:
+                print(f"[{env_prefix}] NER failed: {repr(e)}", flush=True)
+            if meta is not None:
+                meta["ner_error"] = repr(e)
+
+    if meta is not None:
+        meta["matched_rules"] = regex_count
+        meta["matched_ner"] = ner_count
+        meta["matched_total"] = len(matched)
     if debug:
-        counts: Dict[str, int] = {}
-        for m in matched:
-            r = m.get("rule") or "unknown"
-            counts[r] = counts.get(r, 0) + 1
-        print(f"[{env_prefix}] OCR matched rules=", counts)
-
+        print(f"[{env_prefix}] MATCH done regex={regex_count} ner={ner_count} total={len(matched)}", flush=True)
     return matched
-
 
 def redact_image_bytes(
     image_bytes: bytes,

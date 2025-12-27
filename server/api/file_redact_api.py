@@ -366,7 +366,118 @@ async def redact_file(
             plain_result = pdf_module.extract_text_indexed(file_bytes) or {}
             plain_text = str(plain_result.get("full_text") or "")
             if not plain_text.strip():
-                raise HTTPException(400, "PDF plain text가 비어 있습니다.")
+
+                ocr_on = os.getenv("ECLIPSO_PDF_OCR_REDACT", "1") not in ("0", "false", "FALSE", "off", "OFF")
+                if ocr_on:
+                    try:
+                        dpi = int(float(os.getenv("ECLIPSO_PDF_OCR_DPI", "220")))
+                        min_conf = float(os.getenv("ECLIPSO_PDF_OCR_MINCONF", "0.25"))
+                        embed_on = os.getenv("ECLIPSO_PDF_OCR_EMBED_IMAGES", "1") not in (
+                            "0",
+                            "false",
+                            "FALSE",
+                            "off",
+                            "OFF",
+                        )
+
+                        allowed_lower: Optional[Set[str]] = None
+                        if isinstance(rules, list) and rules:
+                            allowed_lower = {str(x).strip().lower() for x in rules if str(x).strip()}
+
+                        entity_texts: List[str] = []
+                        try:
+                            allowed_set: Optional[Set[str]] = None
+                            if ner_allowed:
+                                allowed_set = {str(x).upper() for x in ner_allowed}
+
+                            for ent in (client_entities or []):
+                                if not isinstance(ent, dict):
+                                    continue
+                                lab = str(ent.get("label") or "").upper()
+                                if allowed_set is not None and lab and lab not in allowed_set:
+                                    continue
+                                t = str(ent.get("text") or "").strip()
+                                if len(t) >= 2:
+                                    entity_texts.append(t)
+                        except Exception:
+                            entity_texts = []
+
+                        boxes: List[Any] = []
+                        if embed_on:
+                            try:
+                                boxes.extend(
+                                    pdf_module.detect_sensitive_boxes_from_embedded_images(
+                                        file_bytes,
+                                        min_conf=float(min_conf),
+                                        allowed_rules=allowed_lower,
+                                    )
+                                )
+                            except Exception as e:
+                                if _MASK_DEBUG:
+                                    print(f"[PDF][OCR][DEBUG] embedded_images OCR 실패 err={e}")
+
+                        # NER 텍스트 기반 매칭(임베드 이미지 OCR)
+                        if embed_on and entity_texts:
+                            try:
+                                boxes.extend(
+                                    pdf_module.detect_boxes_from_embedded_image_targets(
+                                        file_bytes,
+                                        targets=entity_texts,
+                                        min_conf=float(min_conf),
+                                    )
+                                )
+                            except Exception as e:
+                                if _MASK_DEBUG:
+                                    print(f"[PDF][OCR][DEBUG] embedded_targets OCR 실패 err={e}")
+
+                        try:
+                            boxes.extend(
+                                pdf_module.detect_sensitive_boxes_from_ocr(
+                                    file_bytes,
+                                    dpi=int(dpi),
+                                    min_conf=float(min_conf),
+                                    allowed_rules=allowed_lower,
+                                )
+                            )
+                        except Exception as e:
+                            if _MASK_DEBUG:
+                                print(f"[PDF][OCR][DEBUG] page_render OCR 실패 err={e}")
+
+                        # NER 텍스트 기반 매칭(페이지 렌더 OCR)
+                        if entity_texts:
+                            try:
+                                boxes.extend(
+                                    pdf_module.detect_boxes_from_ocr_targets(
+                                        file_bytes,
+                                        targets=entity_texts,
+                                        dpi=int(dpi),
+                                        min_conf=float(min_conf),
+                                    )
+                                )
+                            except Exception as e:
+                                if _MASK_DEBUG:
+                                    print(f"[PDF][OCR][DEBUG] page_targets OCR 실패 err={e}")
+
+                        if boxes:
+                            if _MASK_DEBUG:
+                                print(
+                                    f"[PDF][OCR][DEBUG] boxes={len(boxes)} dpi={dpi} min_conf={min_conf} rules={len(allowed_lower or []) or 'ALL'} ner_texts={len(entity_texts)}"
+                                )
+                            out = pdf_module.apply_redaction(file_bytes, boxes, fill="black")
+                            mime = "application/pdf"
+                            return Response(
+                                content=out,
+                                media_type=mime,
+                                headers={"Content-Disposition": f'attachment; filename="{encoded_fileName}"'},
+                            )
+                    except Exception as e:
+                        if _MASK_DEBUG:
+                            print(f"[PDF][OCR][DEBUG] OCR 레닥션 fallback 실패 err={e}")
+
+                raise HTTPException(
+                    400,
+                    "PDF plain text가 비어 있습니다. (OCR 레닥션은 기본 ON이지만, 현재 설정으로 민감정보를 찾지 못했습니다. DPI/CONF를 조정해보세요)",
+                )
 
             print(f"[PDF][DEBUG] plain_len={len(plain_text)} ner_allowed={ner_allowed}")
 

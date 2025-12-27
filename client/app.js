@@ -195,6 +195,69 @@ function setPages(pages) {
   updatePageControls()
 }
 
+function splitMarkdownToPages(md, maxChars = 3200) {
+  const s = String(md || '').replace(/\r\n/g, '\n')
+  if (!s.trim()) return ['']
+  const hardMax = Math.max(800, Number(maxChars) || 3200)
+  if (s.length <= hardMax) return [s]
+
+  const out = []
+  let i = 0
+  while (i < s.length) {
+    const end = Math.min(s.length, i + hardMax)
+    if (end >= s.length) {
+      out.push(s.slice(i))
+      break
+    }
+
+    // 가능한 한 "문단 경계"에서 끊기
+    let cut = s.lastIndexOf('\n\n', end)
+    if (cut < i + 600) cut = s.lastIndexOf('\n', end)
+    if (cut < i + 300) cut = end
+
+    out.push(s.slice(i, cut).trimEnd())
+    i = cut
+  }
+
+  return out.filter((x) => typeof x === 'string' && x.trim().length > 0)
+}
+
+function buildPagesFromExtractData(extractData, fallbackMd) {
+  const ed = extractData && typeof extractData === 'object' ? extractData : {}
+
+  // 0) 서버가 viewer-safe 페이지 배열을 주면 최우선 사용(base64 이미지 split 방지)
+  const pv = Array.isArray(ed.pages_view) ? ed.pages_view : []
+  if (pv.length) {
+    return pv.map((x) => String(x || '')).filter((x) => x.trim().length > 0)
+  }
+
+  // 1) PDF 등: pages_md가 있으면 "진짜 페이지"로 사용
+  const pmd = Array.isArray(ed.pages_md) ? ed.pages_md : []
+  if (pmd.length) {
+    return pmd
+      .slice()
+      .sort((a, b) => Number(a?.page || 0) - Number(b?.page || 0))
+      .map((p) => String(p?.markdown || ''))
+      .filter((x) => x.trim().length > 0)
+  }
+
+  // 2) 모듈이 pages를 여러 개 제공하는 경우
+  const p = Array.isArray(ed.pages) ? ed.pages : []
+  if (p.length > 1) {
+    const pages = p
+      .slice()
+      .sort((a, b) => Number(a?.page || 0) - Number(b?.page || 0))
+      .map((it) => String(it?.text || ''))
+    // viewer는 markdown 렌더링이므로, 텍스트를 그대로 markdown으로 사용
+    return pages
+      .map((t) => (t.trim() ? t : ''))
+      .filter((x) => x.trim().length > 0)
+  }
+
+  // 3) 그 외(대부분 OLE/XML): markdown/full_text를 "가상 페이지"로 분할
+  return splitMarkdownToPages(fallbackMd, 3200)
+}
+
 function updatePageControls() {
   const total = Math.max(1, state.pages.length || 1)
   const idx = Math.max(0, Math.min(total - 1, state.pageIndex || 0))
@@ -654,10 +717,9 @@ function injectBoxesIntoMarkdown(md, detections) {
       .map((part) => (/^__TAG_\d+__$/.test(part) ? part : escHtml(part)))
       .join('')
 
-  const findNeedle = (hay, needle, cursor) => {
-    let idx = hay.indexOf(needle, cursor)
-    if (idx >= 0) return { idx, len: needle.length }
-    idx = hay.indexOf(needle, 0)
+  const findNeedleFrom = (hay, needle, startAt) => {
+    const start = Math.max(0, startAt || 0)
+    let idx = hay.indexOf(needle, start)
     if (idx >= 0) return { idx, len: needle.length }
 
     // 표/셀 등에서 "중간 줄바꿈/공백/<br>"로 끊어진 케이스 보정
@@ -675,13 +737,8 @@ function injectBoxesIntoMarkdown(md, detections) {
       return null
     }
 
-    const tryExec = (start) => {
-      re.lastIndex = Math.max(0, start || 0)
-      return re.exec(hay)
-    }
-
-    let m = tryExec(cursor)
-    if (!m) m = tryExec(0)
+    re.lastIndex = start
+    const m = re.exec(hay)
     if (!m || typeof m.index !== 'number') return null
 
     const raw = String(m[0] || '')
@@ -698,20 +755,48 @@ function injectBoxesIntoMarkdown(md, detections) {
     return placeholder
   })
 
-  let cursor = 0
-  for (const d of detections) {
-    const needle = String(d.text || '').trim()
+  const overlaps = (a0, a1, b0, b1) => Math.min(a1, b1) - Math.max(a0, b0) > 0
+
+  const occupied = []
+  const reps = []
+
+  // 길이가 긴(=더 구체적인) 텍스트부터 먼저 매칭해서, 중첩/겹침을 최소화한다.
+  const dets = Array.isArray(detections) ? detections.slice() : []
+  dets.sort((a, b) => {
+    const av = a?.valid === false ? 0 : 1
+    const bv = b?.valid === false ? 0 : 1
+    if (av !== bv) return bv - av
+    const asrc = a?.source === 'regex' ? 0 : 1
+    const bsrc = b?.source === 'regex' ? 0 : 1
+    if (asrc !== bsrc) return asrc - bsrc
+    const al = String(a?.text || '').trim().length
+    const bl = String(b?.text || '').trim().length
+    return bl - al
+  })
+
+  for (const d of dets) {
+    const needle = String(d?.text || '').trim()
     if (!needle || needle.length < 2) continue
     if (/^[A-Za-z]$/.test(needle)) continue
 
-    const found = findNeedle(s, needle, cursor)
+    let startAt = 0
+    let found = null
+    while (true) {
+      const f = findNeedleFrom(s, needle, startAt)
+      if (!f) break
+      const a0 = f.idx
+      const a1 = f.idx + f.len
+      if (!occupied.some(([b0, b1]) => overlaps(a0, a1, b0, b1))) {
+        found = f
+        break
+      }
+      startAt = f.idx + 1
+    }
     if (!found) continue
+
     const idx = found.idx
     const matchLen = found.len
-
-    const before = s.slice(0, idx)
-    const mid = s.slice(idx, idx + matchLen)
-    const after = s.slice(idx + matchLen)
+    occupied.push([idx, idx + matchLen])
 
     const tag =
       d.source === 'regex'
@@ -719,7 +804,7 @@ function injectBoxesIntoMarkdown(md, detections) {
         : `NER·${d.label || 'UNK'}`
 
     const baseCls =
-      'pii-box inline px-[2px] rounded-md cursor-pointer align-baseline'
+      'pii-box inline-flex flex-wrap items-center gap-1 px-[2px] rounded-md cursor-pointer align-baseline'
     const clsOk =
       'bg-indigo-500/10 shadow-[inset_0_0_0_2px_rgba(79,70,229,0.95)]'
     const clsFail =
@@ -738,14 +823,23 @@ function injectBoxesIntoMarkdown(md, detections) {
       .filter(Boolean)
       .join(' ')
 
-    const pill = `<span class="ml-1 inline-block px-1.5 py-0.5 rounded-full text-[10px] font-bold align-[2px] bg-gray-900/5 text-gray-900">${escHtml(
+    const pill = `<span class="inline-block px-1.5 py-0.5 rounded-full text-[10px] font-bold whitespace-nowrap bg-gray-900/5 text-gray-900">${escHtml(
       tag
     )}</span>`
-    const wrapped = `<span ${attrs}>${escHtmlKeepPlaceholders(
-      mid
-    )}${pill}</span>`
+
+    reps.push({ idx, len: matchLen, attrs, pill })
+  }
+
+  // 뒤에서부터 치환하면 인덱스가 깨지지 않는다.
+  reps.sort((a, b) => (b.idx || 0) - (a.idx || 0))
+  for (const r of reps) {
+    const before = s.slice(0, r.idx)
+    const mid = s.slice(r.idx, r.idx + r.len)
+    const after = s.slice(r.idx + r.len)
+    const wrapped = `<span ${r.attrs}>${escHtmlKeepPlaceholders(mid)}${
+      r.pill
+    }</span>`
     s = before + wrapped + after
-    cursor = (before + wrapped).length
   }
 
   tags.forEach((tag, i) => {
@@ -755,13 +849,74 @@ function injectBoxesIntoMarkdown(md, detections) {
   return s
 }
 
+function filterDetectionsForViewer(detections) {
+  const arr = Array.isArray(detections) ? detections.slice() : []
+  if (!arr.length) return []
+
+  const hasRange = (d) => Number.isFinite(+d?.start) && Number.isFinite(+d?.end)
+  const overlap = (a, b) =>
+    Math.min(a.end, b.end) - Math.max(a.start, b.start) > 0
+
+  // 1) exact duplicate (same range+source+text) 제거
+  const seen = new Set()
+  const dedup = []
+  for (const d of arr) {
+    const k = `${d?.source || ''}|${d?.start ?? ''}|${d?.end ?? ''}|${String(
+      d?.text ?? ''
+    )}`
+    if (seen.has(k)) continue
+    seen.add(k)
+    dedup.push(d)
+  }
+
+  // 2) viewer에서는 regex(valid) 우선, 그 위에 겹치는 NER은 제거(라벨 중첩 방지)
+  const regexRanges = dedup
+    .filter((d) => d?.source === 'regex' && d?.valid !== false && hasRange(d))
+    .map((d) => ({ start: +d.start, end: +d.end }))
+
+  const out = []
+  for (const d of dedup) {
+    if (d?.source === 'ner' && hasRange(d) && regexRanges.length) {
+      const sp = { start: +d.start, end: +d.end }
+      if (regexRanges.some((r) => overlap(r, sp))) continue
+    }
+    out.push(d)
+  }
+
+  // 3) 같은 타입끼리 완전 포함(contained)되는 경우 긴 것만 남김(중첩 라벨 방지)
+  const withRange = out
+    .filter(hasRange)
+    .slice()
+    .sort((a, b) => {
+      const as = +a.start
+      const bs = +b.start
+      if (as !== bs) return as - bs
+      const al = +a.end - +a.start || 0
+      const bl = +b.end - +b.start || 0
+      return bl - al
+    })
+  const kept = []
+  for (const d of withRange) {
+    const s = +d.start
+    const e = +d.end
+    const sameSource = (x) => (x?.source || '') === (d?.source || '')
+    const contains = (x) => +x.start <= s && +x.end >= e
+    if (kept.some((x) => sameSource(x) && contains(x))) continue
+    kept.push(d)
+  }
+
+  const noRange = out.filter((d) => !hasRange(d))
+  return kept.concat(noRange)
+}
+
 function renderMarkdownToViewer(md, detections) {
   const viewer = $('#doc-viewer')
   if (!viewer) return
 
+  const detsForViewer = filterDetectionsForViewer(detections)
   const md2 = injectBoxesIntoMarkdown(
     normalizeTsvTablesToMarkdown(md),
-    detections
+    detsForViewer
   )
 
   let html = ''
@@ -775,6 +930,7 @@ function renderMarkdownToViewer(md, detections) {
   const clean = DOMPurify.sanitize(html, {
     ADD_TAGS: [
       'span',
+      'img',
       'table',
       'thead',
       'tbody',
@@ -786,6 +942,16 @@ function renderMarkdownToViewer(md, detections) {
     ],
     ADD_ATTR: [
       'class',
+      'src',
+      'alt',
+      'title',
+      'loading',
+      'decoding',
+      'data-eclipso',
+      'data-eclipso-name',
+      'data-eclipso-page',
+      'data-eclipso-tags',
+      'data-eclipso-anns',
       'data-id',
       'data-source',
       'data-kind',
@@ -795,18 +961,195 @@ function renderMarkdownToViewer(md, detections) {
       'colspan',
       'rowspan',
     ],
+    ALLOWED_URI_REGEXP:
+      /^(?:(?:https?|mailto|tel):|data:image\/(?:png|jpeg|jpg|gif|webp);base64,)/i,
   })
 
   viewer.innerHTML = clean
   applyMarkdownTailwind(viewer)
   stripEmailLinks(viewer)
+  decorateImagesWithOcrOverlays(viewer)
+}
+
+function decorateImagesWithDetectionTags(viewer, detsForViewer) {
+  if (!viewer) return
+
+  const imgs = Array.from(viewer.querySelectorAll('img'))
+  if (!imgs.length) return
+
+  const parseTagsAttr = (s) => {
+    // "OCR·주민등록번호:2|OCR·전화번호:1" -> [ [tag, count], ... ]
+    const raw = String(s || '').trim()
+    if (!raw) return []
+    const parts = raw
+      .split('|')
+      .map((x) => x.trim())
+      .filter(Boolean)
+    const out = []
+    for (const p of parts) {
+      const i = p.lastIndexOf(':')
+      if (i <= 0) {
+        out.push([p, 1])
+        continue
+      }
+      const tag = p.slice(0, i).trim()
+      const n = Number(p.slice(i + 1).trim())
+      out.push([tag, Number.isFinite(n) && n > 0 ? n : 1])
+    }
+    return out
+  }
+
+  const chipsFromEntries = (entries) => {
+    const maxChips = 10
+    const chips = entries.slice(0, maxChips).map(([tag, n]) => {
+      const label = n > 1 ? `${tag} · ${n}` : tag
+      return `<span class="inline-flex items-center px-2 py-1 rounded-full text-[11px] font-semibold border border-gray-200 bg-white/90 text-gray-800 whitespace-nowrap">${escHtml(
+        label
+      )}</span>`
+    })
+    const rest = entries.length - maxChips
+    if (rest > 0) {
+      chips.push(
+        `<span class="inline-flex items-center px-2 py-1 rounded-full text-[11px] font-semibold border border-gray-200 bg-white/90 text-gray-600 whitespace-nowrap">+${rest}</span>`
+      )
+    }
+    return `<div class="absolute top-2 left-2 right-2 flex flex-wrap gap-1 justify-start pointer-events-none">${chips.join(
+      ''
+    )}</div>`
+  }
+
+  // global fallback(이미지별 OCR 태그가 없을 때만)
+  const globalCounts = new Map()
+  for (const d of Array.isArray(detsForViewer) ? detsForViewer : []) {
+    if (!d) continue
+    if (d.source === 'regex' && d.valid === false) continue
+    const tag =
+      d.source === 'regex'
+        ? `REGEX·${d.kind || 'UNK'}`
+        : `NER·${String(d.label || 'UNK').toUpperCase()}`
+    globalCounts.set(tag, (globalCounts.get(tag) || 0) + 1)
+  }
+  const globalEntries = Array.from(globalCounts.entries()).sort(
+    (a, b) => (b[1] || 0) - (a[1] || 0)
+  )
+
+  for (const img of imgs) {
+    // 이미 래핑된 경우 스킵
+    const parent = img.parentElement
+    if (!parent) continue
+    if (parent.classList.contains('eclipso-img-wrap')) continue
+
+    // img를 감싸고 상단 오버레이를 추가
+    const wrap = document.createElement('div')
+    wrap.className = 'eclipso-img-wrap relative'
+    parent.insertBefore(wrap, img)
+    wrap.appendChild(img)
+
+    const ov = document.createElement('div')
+    const perImg = parseTagsAttr(img.getAttribute('data-eclipso-tags') || '')
+    const entries = perImg.length ? perImg : globalEntries
+    if (!entries.length) continue
+    ov.innerHTML = chipsFromEntries(entries)
+    wrap.appendChild(ov.firstChild)
+  }
+}
+
+function decorateImagesWithOcrOverlays(viewer) {
+  if (!viewer) return
+
+  const imgs = Array.from(viewer.querySelectorAll('img'))
+  if (!imgs.length) return
+
+  const b64ToUtf8 = (b64) => {
+    const s = String(b64 || '').trim()
+    if (!s) return ''
+    try {
+      const bin = atob(s)
+      const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
+      return new TextDecoder('utf-8').decode(bytes)
+    } catch {
+      return ''
+    }
+  }
+
+  const parseAnns = (b64) => {
+    const raw = b64ToUtf8(b64)
+    if (!raw) return []
+    try {
+      const arr = JSON.parse(raw)
+      return Array.isArray(arr) ? arr : []
+    } catch {
+      return []
+    }
+  }
+
+  const clamp01 = (x) => Math.max(0, Math.min(1, Number(x)))
+
+  for (const img of imgs) {
+    const annsB64 = img.getAttribute('data-eclipso-anns') || ''
+    const anns = parseAnns(annsB64)
+    if (!anns.length) continue
+
+    const parent = img.parentElement
+    if (!parent) continue
+
+    // wrapper가 없으면 생성(칩 함수가 먼저 돌지만, 안전망)
+    let wrap = parent.classList.contains('eclipso-img-wrap') ? parent : null
+    if (!wrap) {
+      wrap = document.createElement('div')
+      wrap.className = 'eclipso-img-wrap relative'
+      parent.insertBefore(wrap, img)
+      wrap.appendChild(img)
+    }
+
+    // 기존 레이어 제거(리렌더 시 중복 방지)
+    wrap.querySelectorAll('.eclipso-ocr-layer').forEach((el) => el.remove())
+
+    const layer = document.createElement('div')
+    layer.className = 'eclipso-ocr-layer absolute inset-0 pointer-events-none'
+    wrap.appendChild(layer)
+
+    for (const a of anns) {
+      if (!a) continue
+      const x0 = clamp01(a.x0)
+      const y0 = clamp01(a.y0)
+      const x1 = clamp01(a.x1)
+      const y1 = clamp01(a.y1)
+      if (!(x1 > x0 && y1 > y0)) continue
+
+      const box = document.createElement('div')
+      box.className = 'absolute'
+      box.style.left = `${(x0 * 100).toFixed(2)}%`
+      box.style.top = `${(y0 * 100).toFixed(2)}%`
+      box.style.width = `${((x1 - x0) * 100).toFixed(2)}%`
+      box.style.height = `${((y1 - y0) * 100).toFixed(2)}%`
+      box.style.border = '2px solid rgba(124,58,237,0.95)'
+      box.style.background = 'rgba(124,58,237,0.12)'
+      box.style.borderRadius = '6px'
+
+      const tag = String(a.tag || '').trim()
+      if (tag) {
+        const chip = document.createElement('div')
+        chip.className =
+          'absolute -top-3 left-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold'
+        chip.style.background = 'rgba(124,58,237,0.95)'
+        chip.style.color = '#fff'
+        chip.style.border = '1px solid rgba(124,58,237,1)'
+        chip.textContent = tag
+        box.appendChild(chip)
+      }
+
+      const txt = String(a.text || '').trim()
+      if (txt) box.setAttribute('title', txt)
+
+      layer.appendChild(box)
+    }
+  }
 }
 
 function stripEmailLinks(viewer) {
   if (!viewer) return
-  // 문서뷰어에서는 "이메일 형태"가 하이퍼링크로 남지 않도록 방지한다.
-  // - href 대소문자/변형(mailto:, MAILTO:, mailto:?subject=...) 케이스 대응
-  // - 앵커를 제거하되, 내부 하이라이트(span.pii-box 등)는 유지되도록 "unwrap" 처리
+
   const emailRe = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
 
   const unwrap = (a) => {
@@ -867,6 +1210,10 @@ function applyMarkdownTailwind(viewer) {
   add('table', 'w-full border-collapse my-2 text-[12px]')
   add('th', 'border border-gray-200 px-2 py-1 text-left bg-gray-50 align-top')
   add('td', 'border border-gray-200 px-2 py-1 align-top')
+  add(
+    'img',
+    'max-w-full h-auto rounded-lg border border-gray-200 bg-white my-2'
+  )
 }
 
 function normalizeTsvTablesToMarkdown(md) {
@@ -1464,8 +1811,9 @@ async function doScan() {
     setProgress(35, '텍스트 추출 완료', { forceShow: true })
 
     const md = extractData.markdown || fallbackMarkdownFromText(fullText)
-    state.markdown = md
-    setPages([md])
+    const pages = buildPagesFromExtractData(extractData, md)
+    setPages(pages)
+    state.markdown = String(state.pages[state.pageIndex] || '')
 
     const t2 = performance.now()
     setStatus('패턴 탐색 중...')
@@ -1659,6 +2007,8 @@ async function doRedactAndDownload() {
 }
 
 function renderCurrentPage() {
+  // pages 기반 렌더링: 항상 현재 페이지 markdown을 state.markdown에 반영
+  state.markdown = String(state.pages?.[state.pageIndex] || '')
   updatePageControls()
   renderMarkdownToViewer(state.markdown, state.detections)
   applyDocOrientationHint(state.markdown, $('#doc-viewer'))
@@ -1740,4 +2090,19 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#btn-stats-json-toggle')?.addEventListener('click', () =>
     safeToggleHidden('stats-json')
   )
+
+  // 문서 페이지 이동
+  $('#btn-page-prev')?.addEventListener('click', () => {
+    state.pageIndex = Math.max(0, (state.pageIndex || 0) - 1)
+    state.selectedId = null
+    clearViewerSelection()
+    renderCurrentPage()
+  })
+  $('#btn-page-next')?.addEventListener('click', () => {
+    const total = Math.max(1, state.pages.length || 1)
+    state.pageIndex = Math.min(total - 1, (state.pageIndex || 0) + 1)
+    state.selectedId = null
+    clearViewerSelection()
+    renderCurrentPage()
+  })
 })
