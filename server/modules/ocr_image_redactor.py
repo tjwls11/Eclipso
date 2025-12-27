@@ -849,15 +849,15 @@ def detect_sensitive_ocr_blocks(
     # ─────────────────────────────────────────────────────────────
     # NER 매칭: OCR 블록 텍스트를 합쳐서 NER 돌리고 결과를 bbox에 매핑
     # ─────────────────────────────────────────────────────────────
-    use_ner = _env_bool(f"{env_prefix}_OCR_USE_NER", True)  # 기본값 True
     ner_count = 0
-
-    if use_ner and llm_blocks:
+    
+    # NER 자동 실행 (에러 나도 레닥션은 계속 진행)
+    if llm_blocks:
         try:
             from server.modules.ner_module import run_ner
 
             # 1) 블록 텍스트를 합치면서 각 블록의 문자 위치 추적
-            joined_parts: List[Tuple[int, int, Dict[str, Any]]] = []  # (start, end, block)
+            joined_parts: List[Tuple[int, int, Dict[str, Any]]] = []
             joined_text = ""
             for b in llm_blocks:
                 txt = str(b.get("text") or "").strip()
@@ -865,15 +865,15 @@ def detect_sensitive_ocr_blocks(
                     continue
                 start = len(joined_text)
                 joined_text += txt + " "
-                end = len(joined_text) - 1  # 공백 제외
+                end = len(joined_text) - 1
                 joined_parts.append((start, end, b))
 
-            if joined_text.strip():
+            if joined_text.strip() and joined_parts:
                 # 2) NER 실행
                 ner_policy = {
                     "chunk_size": 2000,
                     "chunk_overlap": 100,
-                    "allowed_labels": ["PS", "LC", "OG"],  # 이름, 장소, 조직
+                    "allowed_labels": ["PS", "LC", "OG"],
                     "merge_gap": 0,
                 }
                 ner_spans = run_ner(joined_text, ner_policy) or []
@@ -882,69 +882,75 @@ def detect_sensitive_ocr_blocks(
                     print(f"[{env_prefix}] NER found {len(ner_spans)} spans", flush=True)
 
                 # 3) NER span을 OCR 블록 bbox에 매핑
-                matched_block_ids = {id(m.get("_src_block")) for m in matched if m.get("_src_block")}
-                # 이미 regex로 매칭된 블록의 bbox도 체크
-                matched_bboxes = {tuple(m.get("bbox", [])) for m in matched}
+                # 이미 regex로 매칭된 블록의 bbox 체크용 set
+                matched_bboxes: set = set()
+                for m in matched:
+                    bbox = m.get("bbox")
+                    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        try:
+                            matched_bboxes.add((round(float(bbox[0]), 1), round(float(bbox[1]), 1)))
+                        except Exception:
+                            pass
 
                 for sp in ner_spans:
-                    sp_start = sp.get("start", 0)
-                    sp_end = sp.get("end", 0)
-                    sp_label = str(sp.get("label") or "").upper()
-                    sp_text = str(sp.get("text") or "").strip()
+                    try:
+                        sp_start = int(sp.get("start") or 0)
+                        sp_end = int(sp.get("end") or 0)
+                        sp_label = str(sp.get("label") or "").upper()
+                        sp_text = str(sp.get("text") or "").strip()
 
-                    if not sp_text or sp_end <= sp_start:
-                        continue
-
-                    # 해당 span과 겹치는 블록들 찾기
-                    hit_blocks: List[Dict[str, Any]] = []
-                    for bs, be, blk in joined_parts:
-                        # span과 블록이 겹치는지 확인
-                        if be <= sp_start or bs >= sp_end:
+                        if not sp_text or sp_end <= sp_start:
                             continue
-                        hit_blocks.append(blk)
 
-                    if not hit_blocks:
-                        continue
+                        # 해당 span과 겹치는 블록들 찾기
+                        hit_blocks: List[Dict[str, Any]] = []
+                        for bs, be, blk in joined_parts:
+                            if be <= sp_start or bs >= sp_end:
+                                continue
+                            hit_blocks.append(blk)
 
-                    # 가장 잘 맞는 블록 찾기 (텍스트가 가장 유사한 블록)
-                    best_block = hit_blocks[0]
-                    best_score = 0
-                    for hb in hit_blocks:
-                        hb_text = str(hb.get("text") or "").strip()
-                        # 정확히 일치하면 최고 점수
-                        if hb_text == sp_text:
-                            best_block = hb
-                            best_score = 100
-                            break
-                        # 포함되어 있으면 길이 비율로 점수
-                        if sp_text in hb_text or hb_text in sp_text:
-                            score = min(len(sp_text), len(hb_text)) / max(len(sp_text), len(hb_text), 1)
-                            if score > best_score:
-                                best_score = score
+                        if not hit_blocks:
+                            continue
+
+                        # 가장 잘 맞는 블록 찾기
+                        best_block = hit_blocks[0]
+                        best_score = 0
+                        for hb in hit_blocks:
+                            hb_text = str(hb.get("text") or "").strip()
+                            if hb_text == sp_text:
                                 best_block = hb
+                                break
+                            if sp_text in hb_text or hb_text in sp_text:
+                                score = min(len(sp_text), len(hb_text)) / max(len(sp_text), len(hb_text), 1)
+                                if score > best_score:
+                                    best_score = score
+                                    best_block = hb
 
-                    # 단일 블록의 bbox 사용
-                    bx0, by0, bx1, by1 = _block_bbox(best_block)
-                    
-                    # 중복 방지
-                    bbox_key = (round(bx0, 1), round(by0, 1))
-                    if bbox_key in matched_bboxes:
-                        continue
+                        # 단일 블록의 bbox 사용
+                        bx0, by0, bx1, by1 = _block_bbox(best_block)
+                        
+                        # 중복 방지
+                        bbox_key = (round(bx0, 1), round(by0, 1))
+                        if bbox_key in matched_bboxes:
+                            continue
 
-                    matched.append({
-                        "text": sp_text,
-                        "normalized": sp_text,
-                        "bbox": [bx0, by0, bx1, by1],
-                        "rule": f"ner_{sp_label.lower()}",
-                        "value": sp_text,
-                        "ner_label": sp_label,
-                    })
-                    matched_bboxes.add(bbox_key)
-                    ner_count += 1
+                        matched.append({
+                            "text": sp_text,
+                            "normalized": sp_text,
+                            "bbox": [bx0, by0, bx1, by1],
+                            "rule": f"ner_{sp_label.lower()}",
+                            "value": sp_text,
+                            "ner_label": sp_label,
+                        })
+                        matched_bboxes.add(bbox_key)
+                        ner_count += 1
+                    except Exception:
+                        continue  # 개별 span 에러는 무시하고 계속
 
         except Exception as e:
+            # NER 실패해도 레닥션은 계속 진행 (regex 매칭 결과는 유지)
             if debug:
-                print(f"[{env_prefix}] NER failed: {repr(e)}", flush=True)
+                print(f"[{env_prefix}] NER failed (continuing with regex only): {repr(e)}", flush=True)
             if meta is not None:
                 meta["ner_error"] = repr(e)
 
