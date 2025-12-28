@@ -3,23 +3,41 @@ from typing import List, Dict, Any, Tuple, Optional, Set
 
 from server.core.normalize import normalization_index
 from server.core.matching import find_sensitive_spans
+from server.modules.ocr_image_redactor import redact_image_bytes
 
+# BIFF 구조 제어 레코드
+BOF = 0x0809 
+EOF = 0x000A 
 
-SST = 0x00FC
-CONTINUE = 0x003C
-LABELSST = 0x00FD
-HEADER = 0x0014
-FOOTER = 0x0015
-HEADERFOOTER = 0x089C
-BOF = 0x0809
-EOF = 0x000A
-BOUNDSHEET = 0x0085
-CODEPAGE = 0x0042
+# 셀 값 관련 레코드
+LABEL = 0x00FD
 NUMBER = 0x0203
 RK = 0x027E
 MULRK = 0x00BD
 BOOLERR = 0x0205
 FORMULA = 0x0006
+
+# 시트 정보 관련 레코드
+BOUNDSHEET = 0x0085
+CODEPAGE = 0x0042
+
+# 문자열 / 텍스트 관련 레코드
+SST = 0x00FC 
+CONTINUE = 0x003C
+LABELSST = 0x00FD 
+
+# 헤더/푸터 관련 레코드
+HEADER = 0x0014
+FOOTER = 0x0015
+HEADERFOOTER = 0x089C
+
+# 이미지 관련 레코드
+MSODRAWINGGROUP = 0x00EB
+
+# 텍스트박스 관련 레코드
+MSODRAWING = 0x00EC
+OBJ        = 0x005D
+TXO = 0x01B6
 
 
 def le16(b, off=0) -> int:
@@ -30,6 +48,7 @@ def le32(b, off=0) -> int:
     return struct.unpack_from("<I", b, off)[0]
 
 
+# BIFF 레코드 순회 제너레이터
 def iter_biff_records(data: bytes):
     off, n = 0, len(data)
     while off + 4 <= n:
@@ -40,8 +59,8 @@ def iter_biff_records(data: bytes):
         off += length
         yield opcode, length, payload, header_off
 
-
-def iter_biff_records_from(data: bytes, start_off: int):
+# BIFF 레코드 순회 제너레이터 (특정 오프셋부터)
+def iter_biff_records_from_offset(data: bytes, start_off: int):
     off, n = int(start_off), len(data)
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
@@ -109,12 +128,11 @@ def _parse_boundsheets(wb: bytes) -> List[Tuple[str, int]]:
 
 
 def _extract_sheet_grid(wb: bytes, strings: List[str], sheet_off: int, max_rows: int = 200, max_cols: int = 50) -> List[List[str]]:
-
     cells: Dict[int, Dict[int, str]] = {}
     max_r = 0
     max_c = 0
 
-    for opcode, length, payload, hdr in iter_biff_records_from(wb, sheet_off):
+    for opcode, length, payload, hdr in iter_biff_records_from_offset(wb, sheet_off):
         if opcode == EOF:
             break
         try:
@@ -443,62 +461,466 @@ def extract_headerfooter(payload: bytes, count=6):
     return items
 
 
-def extract_text(file_bytes: bytes):
+# MSODRAWING 레코드와 그 뒤의 CONTINUE 레코드를 묶어 OfficeArt 바이트 스트림으로 수집
+def collect_msodrawing(wb: bytes) -> List[Dict[str, Any]]:
+    recs = list(iter_biff_records(wb))
+    out: List[Dict[str, Any]] = []
+
+    i = 0
+    while i < len(recs):
+        op, _, payload, _ = recs[i]
+        if op != MSODRAWING:
+            i += 1
+            continue
+
+        start_idx = i
+        chunks = [payload]
+
+        j = i + 1
+        while j < len(recs) and recs[j][0] == CONTINUE:
+            chunks.append(recs[j][2])
+            j += 1
+
+        out.append({
+            "start_idx": start_idx,
+            "end_idx": j - 1,
+            "officeart_bytes": b"".join(chunks),
+        })
+        i = j
+
+    return out
+
+
+# OfficeArt 스트림의 마지막 레코드가 ClientTextbox(F00D, 길이 0)인지 판별
+def last_record_is_clienttextbox(officeart: bytes) -> bool:
+    cur = 0
+    n = len(officeart)
+    last_type = None
+    last_len = None
+
+    while cur + 8 <= n:
+        rv, ri, rt, rl = parse_officeArtRecordHdr(officeart, cur)
+        last_type, last_len = rt, rl
+        cur += 8 + rl
+
+    # 정확히 끝까지 파싱되었는지 체크
+    if cur != n:
+        return False
+
+    return (last_type == 0xF00D and last_len == 0)
+
+
+# ClientTextbox 뒤에 반드시 따라야 하는 TxO 레코드의 인덱스를 명세 기준으로 수집
+def collect_textbox_txo_idx(wb: bytes) -> List[int]:
+    recs = list(iter_biff_records(wb))
+    streams = collect_msodrawing(wb)
+    txo_indices: List[int] = []
+
+    for s in streams:
+        if not last_record_is_clienttextbox(s["officeart_bytes"]):
+            continue
+
+        next_idx = s["end_idx"] + 1
+        if next_idx < len(recs) and recs[next_idx][0] == TXO:
+            txo_indices.append(next_idx)
+
+    return txo_indices
+
+
+# TxO의 cchText / cbRuns 값이 명세 조건을 만족하는지 검사
+def txo_spec_satisfy(cchText: int, cbRuns: int) -> bool:
+    if cchText == 0:
+        return cbRuns == 0
+    # cchText > 0 이면 cbRuns는 16 이상 + 8의 배수
+    if cbRuns < 16 or (cbRuns % 8) != 0:
+        return False
+    return True
+
+
+# CONTINUE 레코드 집합에서 XLUnicodeStringNoCch 텍스트를 실제로 소비
+def consume_text(records, start_idx: int, cchText: int):
+    remain = cchText
+    idx = start_idx
+    text_bytes = bytearray()
+    positions: List[int] = []
+    last_fHigh = 0
+
+    while idx < len(records) and remain > 0:
+        cop, clen, cpayload, chdr = records[idx]
+        if cop != CONTINUE or clen <= 0:
+            break
+
+        # 첫 바이트는 flags, 이후가 문자열 데이터
+        flags = cpayload[0]
+        fHigh = flags & 0x01
+        last_fHigh = fHigh
+        char_size = 2 if fHigh else 1
+
+        data = cpayload[1:]
+        abs_start = chdr + 4 + 1  # BIFF 헤더 + flags
+
+        can_take = min(remain, len(data) // char_size)
+        take_bytes = can_take * char_size
+
+        if take_bytes:
+            text_bytes.extend(data[:take_bytes])
+            positions.extend(range(abs_start, abs_start + take_bytes))
+            remain -= can_take
+
+        idx += 1
+
+    return cchText - remain, text_bytes, positions, last_fHigh, idx
+
+
+# CONTINUE 레코드들의 payload 길이를 합산하여 TxORuns 공간 계산
+def sum_continue_payload(records, start_idx: int) -> int:
+    total = 0
+    idx = start_idx
+    while idx < len(records):
+        cop, clen, _, _ = records[idx]
+        if cop != CONTINUE or clen <= 0:
+            break
+        total += clen
+        idx += 1
+    return total
+
+
+# TxO payload 내부에서 cchText / cbRuns 위치를 명세 + CONTINUE 검증으로 결정
+def parse_txo_header_by_spec(records, txo_idx: int):
+    _, ln, payload, _ = records[txo_idx]
+
+    if ln < 10:
+        return 4, 0, 0, 0, txo_idx + 1
+
+    best = None # 여러 TxO 헤더 후보 중 명세와 실제 CONTINUE 구조에 가장 잘 맞는 결과를 저장
+
+    for off in range(4, min(ln - 6, 64)):
+        cchText = le16(payload, off)
+        cbRuns  = le16(payload, off + 2)
+        ifntEmpty = le16(payload, off + 4)
+
+        if not txo_spec_satisfy(cchText, cbRuns):
+            continue
+
+        consumed, _, _, _, next_idx = consume_text(
+            records, txo_idx + 1, cchText
+        )
+        if consumed != cchText:
+            continue
+
+        remain_runs = sum_continue_payload(records, next_idx)
+        if cbRuns > 0 and remain_runs < cbRuns:
+            continue
+
+        score = (1000 if remain_runs == cbRuns else 0) + (100 if cchText > 0 else 0) - off
+        if best is None or score > best[0]:
+            best = (score, off, cchText, cbRuns, ifntEmpty, next_idx)
+
+    if best:
+        _, off, cchText, cbRuns, ifntEmpty, next_idx = best
+        return off, cchText, cbRuns, ifntEmpty, next_idx
+
+    return 4, 0, 0, 0, txo_idx + 1
+
+
+# TxO 레코드에 연결된 텍스트와 해당 바이트의 절대 오프셋 목록을 추출
+def read_txo_text_positions(records, txo_idx: int) -> Tuple[str, int, List[int]]:
+    _, cchText, _, _, _ = parse_txo_header_by_spec(records, txo_idx)
+
+    if cchText == 0:
+        return "", 0, []
+
+    consumed, text_bytes, positions, fHigh, _ = consume_text(
+        records, txo_idx + 1, cchText
+    )
+    if consumed != cchText or not positions:
+        return "", 0, []
+
+    text = (
+        text_bytes.decode("utf-16le", errors="ignore")
+        if fHigh else
+        text_bytes.decode("latin1", errors="ignore")
+    )
+    return text, fHigh, positions
+
+
+def extract_textbox(wb: bytes) -> List[str]:
+    records = list(iter_biff_records(wb))
+    texts: List[str] = []
+
+    # ClientTextbox → TxO 위치 수집
+    txo_indices = collect_textbox_txo_idx(wb)
+
+    for txo_idx in txo_indices:
+        text, _fHigh, _positions = read_txo_text_positions(records, txo_idx)
+        if text:
+            texts.append(text)
+
+    return texts
+
+
+# msoDrawingGroup payload 모으기
+def get_msoDrawingGroup(wb: bytes) -> List[Tuple[bytes, int]]:
+    blocks = []
+    started = False
+
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode == MSODRAWINGGROUP:
+            blocks.append((payload, hdr + 4))
+            started = True
+        elif started and opcode == CONTINUE:
+            blocks.append((payload, hdr + 4))
+        elif started:
+            break
+
+    return blocks
+
+
+# 각 바이트가 원본 wb의 어느 절대 오프셋에 대응되는지 positions로 기록
+def concat_block_pos(blocks: List[Tuple[bytes, int]]) -> Tuple[bytes, List[int]]:
+    out = bytearray()
+    pos_list : List[int] = []
+
+    for payload, abs_off, in blocks:
+        out.extend(payload)
+        pos_list.extend(list(range(abs_off, abs_off + len(payload))))
+    return bytes(out), pos_list
+
+
+# OfficeArtRecordHeader 파싱
+def parse_officeArtRecordHdr(data: bytes, off: int) -> Tuple[int, int, int, int]:
+    if off + 8 > len(data):
+        raise EOFError("OfficeArtRecordHeader가 범위를 벗어났습니다.")
+    
+    ver_inst = le16(data, off)
+    recVer = ver_inst & 0x000F
+    recInstance = (ver_inst & 0xFFF0) >> 4
+    recType = le16(data, off + 2)
+    recLen = le32(data, off + 4)
+    return recVer, recInstance, recType, recLen
+
+
+# OfficeArt 컨테이너 내부 child record들을 순회
+def iter_officeart_container_children(data: bytes, container_off: int):
+    _, _, _, recLen = parse_officeArtRecordHdr(data, container_off)
+    container_end = container_off + 8 + recLen
+    cur = container_off + 8
+
+    while cur + 8 <= container_end:
+        rv, ri, rt, rl = parse_officeArtRecordHdr(data, cur)
+        yield cur, rv, ri, rt, rl
+        cur += 8 + rl
+
+    if cur != container_end:
+        raise ValueError("[ERROR] OfficeArt 컨테이너 경계 불일치")
+
+
+# OfficeArtBlip의 rh 기준으로 BLIPFileData가 시작되는 오프셋을 계산
+def blip_filedata_offset(recType, recInstance):
+    if recType == 0xF01D:  # JPEG
+        return 8 + 16 + (16 if recInstance in (0x46B, 0x6E3) else 0) + 1
+    
+    if recType == 0xF01E:  # PNG
+        return 8 + 16 + (16 if recInstance == 0x6E1 else 0) + 1
+    
+    if recType == 0xF01F:  # DIB
+        return 8 + 16 + (16 if recInstance == 0x7A9 else 0) + 1
+    
+    if recType == 0xF029:  # TIFF
+        return 8 + 16 + (16 if recInstance == 0x6E5 else 0) + 1
+    
+    if recType in (0xF01A, 0xF01B, 0xF01C):  # EMF/WMF/PICT
+        return 8 + 16 + (16 if recInstance in (0x3D5, 0x217, 0x543) else 0) + 34
+    
+    return None
+
+
+# 이미지 치환
+def patch_positions(wb: bytearray, positions: List[int], start: int, new_bytes: bytes) -> None:
+    for i, b in enumerate(new_bytes):
+        wb[positions[start + i]] = b
+
+def replace_img(img_bytes, meta):
     try:
-        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-            if not ole.exists("Workbook"):
-                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        redacted, hit = redact_image_bytes(
+            img_bytes,
+            filename="xls_image",
+            env_prefix="XLS",
+        )
 
-            wb = ole.openstream("Workbook").read()
+        if not hit:
+            return img_bytes
 
-        blocks = get_sst_blocks(wb)
-        if blocks:
-            xlucs_list = SSTParser(blocks).parse()
-            strings = [x.text for x in xlucs_list]
-        else:
-            strings = []
+        if len(redacted) <= len(img_bytes):  # 작아지면 패딩
+            return redacted + b"\x00" * (len(img_bytes) - len(redacted))
 
-        
-        # 본문 텍스트
-        body = extract_sst(wb, strings)
+        return img_bytes  # 커지면 원본 유지
 
-        header_texts: List[str] = []
-        for opcode, _length, payload, _hdr in iter_biff_records(wb):
-            if opcode in (HEADER, FOOTER):
-                text, _cch, _fHigh, _next_off, _raw_len = parse_xlucs(payload, 0)
-                if text:
-                    header_texts.append(text)
-            elif opcode == HEADERFOOTER:
-                items = extract_headerfooter(payload)
-                for item in items:
-                    if item["text"]:
-                        header_texts.append(item["text"])
+    except Exception:
+        return img_bytes  # OCR 실패 시 원본 이미지 유지
 
-        
-        # 전체 합치기
-        combined_texts = body + header_texts
-        full_text = "\n".join(combined_texts)
-        md = extract_markdown_tables_from_xls(file_bytes)
 
+# MSODRAWINGGROUP(0x00EB) 안의 BStore에서 BLIPFileData를 추출
+def parse_images(wb: bytearray, replace_img=None) -> Dict[str, Any]:
+    blocks = get_msoDrawingGroup(bytes(wb))
+    if not blocks:
+        return {"found": False, "images": 0, "patched": 0}
+
+    # BIFF CONTINUE 연결 → OfficeArt 스트림
+    data, pos = concat_block_pos(blocks)
+
+    # OfficeArtDggContainer (0xF000)
+    dgg_off = 0
+    rv, ri, rt, rl = parse_officeArtRecordHdr(data, dgg_off)
+    if rt != 0xF000:
+        raise ValueError(
+            f"[ERROR] OfficeArtDggContainer(0xF000)을 기대했으나 {hex(rt)} 레코드 발견"
+        )
+
+    # OfficeArtBStoreContainer (0xF001)
+    bstore_off = None
+    for off, cv, ci, ct, cl in iter_officeart_container_children(data, dgg_off):
+        if ct == 0xF001:
+            bstore_off = off
+            break
+
+    if bstore_off is None:
         return {
-            "body": body,
-            "header_footer": header_texts,
-            "full_text": full_text,
-            
-            "markdown": md if isinstance(md, str) and md.strip() else full_text,
-            "pages": [{"page": 1, "text": full_text}],
+            "found": True,
+            "dgg": True,
+            "bstore": False,
+            "images": 0,
+            "patched": 0,
         }
 
-    except Exception as e:
-        print("[ERROR extract]:", e)
-        return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+    images = 0
+    patched = 0
 
+    # BStore child 순회
+    for rec_off, rv, ri, rt, rl in iter_officeart_container_children(data, bstore_off):
+        rec_start = rec_off
+        rec_end = rec_off + 8 + rl
 
-def mask_except_hypen(orig_segment: str) -> str:
-    out_chars: List[str] = []
-    for ch in orig_segment:
-        out_chars.append("-" if ch == "-" else "*")
-    return "".join(out_chars)
+        # FBSE (0xF007)
+        if rt == 0xF007:
+            # FBSE 고정 영역 최소 36바이트
+            if rl < 36:
+                continue
+
+            fbse_fixed = rec_start + 8
+            if fbse_fixed + 36 > len(data):
+                continue
+
+            btWin32 = data[fbse_fixed + 0]
+            btMacOS = data[fbse_fixed + 1]
+            rgbUid  = data[fbse_fixed + 2 : fbse_fixed + 18]
+            tag     = le16(data, fbse_fixed + 18)
+            size    = le32(data, fbse_fixed + 20)
+            cRef    = le32(data, fbse_fixed + 24)
+            foDelay = le32(data, fbse_fixed + 28)
+            cbName  = data[fbse_fixed + 33]
+
+            # 빈 슬롯은 스킵
+            if cRef == 0:
+                continue
+
+            # nameData 뒤
+            emb_off = fbse_fixed + 36 + cbName
+
+            # embeddedBlip 존재 여부
+            if emb_off + 8 > rec_end:
+                continue
+
+            try:
+                brv, bri, brt, brl = parse_officeArtRecordHdr(data, emb_off)
+            except Exception:
+                continue
+
+            blip_end = emb_off + 8 + brl
+            if blip_end > rec_end:
+                continue
+
+            fd_off = blip_filedata_offset(brt, bri)
+            if fd_off is None:
+                continue
+
+            filedata_start = emb_off + fd_off
+            filedata_end   = blip_end
+            if filedata_end > len(data):
+                continue
+
+            blip_bytes = data[filedata_start:filedata_end]
+            images += 1
+
+            if replace_img is not None:
+                new_bytes = replace_img(
+                    blip_bytes,
+                    {
+                        "blipType": brt,
+                        "btWin32": btWin32,
+                        "btMacOS": btMacOS,
+                        "rgbUid": rgbUid,
+                        "tag": tag,
+                        "size": size,
+                        "cRef": cRef,
+                        "foDelay": foDelay,
+                    },
+                )
+
+                # 길이 보존
+                if len(new_bytes) < len(blip_bytes):
+                    new_bytes += b"\x00" * (len(blip_bytes) - len(new_bytes))
+                elif len(new_bytes) > len(blip_bytes):
+                    new_bytes = blip_bytes
+
+                patch_positions(wb, pos, filedata_start, new_bytes)
+                patched += 1
+
+        # 단독 OfficeArtBlip
+        elif rt in (
+            0xF01A,  # EMF
+            0xF01B,  # WMF
+            0xF01C,  # PICT
+            0xF01D,  # JPEG
+            0xF01E,  # PNG
+            0xF01F,  # DIB
+            0xF029,  # TIFF
+            0xF02A,
+        ):
+            fd_off = blip_filedata_offset(rt, ri)
+            if fd_off is None:
+                continue
+
+            filedata_start = rec_start + fd_off
+            filedata_end   = rec_end
+            if filedata_end > len(data):
+                continue
+
+            blip_bytes = data[filedata_start:filedata_end]
+            images += 1
+
+            if replace_img is not None:
+                new_bytes = replace_img(blip_bytes, {"blipType": rt})
+
+                if len(new_bytes) < len(blip_bytes):
+                    new_bytes += b"\x00" * (len(blip_bytes) - len(new_bytes))
+                elif len(new_bytes) > len(blip_bytes):
+                    new_bytes = blip_bytes
+
+                patch_positions(wb, pos, filedata_start, new_bytes)
+                patched += 1
+
+            print("[DBG] BLIP 헤더:", blip_bytes[:8].hex())
+            with open(f"debug_img_{images}.bin", "wb") as f:
+                f.write(blip_bytes)
+
+    return {
+        "found": True,
+        "dgg": True,
+        "bstore": True,
+        "images": images,
+        "patched": patched,
+    }
 
 
 def redact_xlucs(text: str, extra_literals: Optional[List[Any]] = None) -> str:
@@ -551,6 +973,7 @@ def redact_xlucs(text: str, extra_literals: Optional[List[Any]] = None) -> str:
     # 0) 리터럴 우선(부분 문자열 충돌 방지)
     if lits:
         for lit in lits:
+                # lit이 tuple이면 (원본, 마스킹) 형태, 아니면 문자열
             if isinstance(lit, tuple):
                 raw_lit, masked = lit
             else:
@@ -579,7 +1002,7 @@ def redact_xlucs(text: str, extra_literals: Optional[List[Any]] = None) -> str:
         e = e + 1
 
         original_seg = text[s:e]
-        masked_seg = mask_except_hypen(original_seg)
+        masked_seg = mask_except_hypen_at(original_seg)
 
         if len(masked_seg) != len(original_seg):
             raise ValueError("마스킹 후 길이 불일치")
@@ -631,13 +1054,91 @@ def redact_hdr_fdr(wb: bytearray, extra_literals: Optional[List[str]] = None) ->
                 wb[text_start:text_end] = raw
 
 
-# OLE 파일 교체 (원본/대체 Workbook 스트림 길이 불변 전제)
+def redact_textbox(wb: bytearray, extra_literals: Optional[List[str]] = None) -> None:
+    records = list(iter_biff_records(wb))
+    txo_indices = collect_textbox_txo_idx(bytes(wb))
+
+    for txo_idx in txo_indices:
+        text, fHigh, positions = read_txo_text_positions(records, txo_idx)
+        if not text:
+            continue
+
+        red = redact_xlucs(text, extra_literals=extra_literals) # NER / literal 기반 레닥션 (추후 필요하면 처리)
+        red = mask_except_hypen_at(red)
+
+        raw = encode_masked_text(red, fHigh)
+
+        for i, p in enumerate(positions):
+            wb[p] = raw[i]
+
+
+
+def extract_text(file_bytes: bytes):
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            if not ole.exists("Workbook"):
+                return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+
+            wb = ole.openstream("Workbook").read()
+
+        blocks = get_sst_blocks(wb)
+        if blocks:
+            xlucs_list = SSTParser(blocks).parse()
+            strings = [x.text for x in xlucs_list]
+        else:
+            strings = []
+        
+        # 본문 텍스트
+        body = extract_sst(wb, strings)
+
+        header_texts: List[str] = []
+        for opcode, _length, payload, _hdr in iter_biff_records(wb):
+            if opcode in (HEADER, FOOTER):
+                text, _cch, _fHigh, _next_off, _raw_len = parse_xlucs(payload, 0)
+                if text:
+                    header_texts.append(text)
+            elif opcode == HEADERFOOTER:
+                items = extract_headerfooter(payload)
+                for item in items:
+                    if item["text"]:
+                        header_texts.append(item["text"])
+        
+        # 텍스트박스 텍스트
+        textbox_texts = extract_textbox(wb)
+
+        # 전체 합치기
+        combined_texts = body + header_texts + textbox_texts
+        full_text = "\n".join(combined_texts)
+
+        md = extract_markdown_tables_from_xls(file_bytes)
+
+        return {
+            "body": body,
+            "header_footer": header_texts,
+            "textbox": textbox_texts,
+
+            "full_text": full_text,
+            "markdown": md if isinstance(md, str) and md.strip() else full_text,
+            "pages": [{"page": 1, "text": full_text}],
+        }
+
+    except Exception as e:
+        print("[ERROR extract]:", e)
+        return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+
+
+# -과 @를 제외한 민감 문자열을 *로 마스킹
+def mask_except_hypen_at(orig_segment: str) -> str:
+    return "".join(ch if ch in "-@" else "*" for ch in orig_segment)
+
+
+#OLE 파일 교체
 def overlay_workbook_stream(file_bytes: bytes, orig_wb: bytes, new_wb: bytes) -> bytes:
     full = bytearray(file_bytes)
 
     pos = full.find(orig_wb)
     if pos == -1:
-        print("[WARN] workbook 스트림을 전체 파일에서 찾기 실패")
+        print("[WARN] OLE 파일에서 Workbook 스트림 위치를 찾지 못함")
         return file_bytes
 
     if len(orig_wb) != len(new_wb):
@@ -704,5 +1205,12 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
 
     redact_hdr_fdr(wb, extra_literals=extra_literals)
     print("[OK] 헤더/푸터 텍스트 레닥션 완료")
+
+    redact_textbox(wb, extra_literals=extra_literals)
+    print("[OK] 텍스트박스 레닥션 완료")
+
+    # 이미지 처리
+    img = parse_images(wb, replace_img=replace_img)
+    print(f"[OK] 이미지 위치: {img}")
 
     return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
