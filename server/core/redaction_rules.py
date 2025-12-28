@@ -59,8 +59,12 @@ PASSPORT_RE = re.compile(
 )
 
 # 운전면허번호
-DRIVER_RE = re.compile(r"\d{2}-?\d{2}-?\d{6}-?\d{2}")
-
+DRIVER_RE = re.compile(
+    r"(?<!\d)"
+    r"(?:11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26)"
+    r"-?\d{2}-?\d{6}-?\d{2}"
+    r"(?!\d)"
+)
 
 # RULES 정의
 RULES = {

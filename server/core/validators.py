@@ -136,18 +136,29 @@ def is_valid_rrn_checksum(rrn: str) -> bool:
 
 # 운전면허번호
 def is_valid_driver_license(lic: str, opts: dict | None = None) -> bool:
-    d = _digits(lic)
+    raw = lic or ""
+    d = _digits(raw)
     if len(d) != 12:
         return False
-    year = d[2:4]
+
+    area = d[:2]
+    if area not in {
+        "11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26"
+    }:
+        return False
+
+    year2 = d[2:4]
     try:
-        y = int(year)
-        this_year = int(str(datetime.today().year)[2:])
-        full_year = 1900 + y if y > this_year else 2000 + y
-        if not (1960 <= full_year <= datetime.today().year):
-            return False
+        y = int(year2)
+        this_y2 = int(str(datetime.today().year)[-2:])
+        full_year = 1900 + y if y > this_y2 else 2000 + y
     except ValueError:
         return False
+
+    min_issue_year = int((opts or {}).get("min_issue_year", 1995))
+    if not (min_issue_year <= full_year <= datetime.today().year):
+        return False
+
     return True
 
 

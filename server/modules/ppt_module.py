@@ -9,17 +9,234 @@ import struct
 import unicodedata
 import zlib
 from io import BytesIO
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Iterator, TypeAlias
 
 from server.core.matching import find_sensitive_spans
 from server.core.normalize import normalization_index
 
-try:
+olefile = None
+try:  # pragma: no cover
     import olefile  # type: ignore
-    from olefile import OleFileIO  # type: ignore
 except Exception:  # pragma: no cover
     olefile = None
-    OleFileIO = Any  # type: ignore
+
+OleLike: TypeAlias = Any
+
+_FREESECT = 0xFFFFFFFF
+_ENDOFCHAIN = 0xFFFFFFFE
+_FATSECT = 0xFFFFFFFD
+_DIFSECT = 0xFFFFFFFC
+
+
+def _u16le(b: bytes, off: int) -> int:
+    return struct.unpack_from("<H", b, off)[0]
+
+
+def _u32le(b: bytes, off: int) -> int:
+    return struct.unpack_from("<I", b, off)[0]
+
+
+def _u64le(b: bytes, off: int) -> int:
+    return struct.unpack_from("<Q", b, off)[0]
+
+
+class _CFBFReader:
+
+    def __init__(self, data: bytes):
+        self._data = data if isinstance(data, (bytes, bytearray, memoryview)) else bytes(data)
+        self._buf = memoryview(self._data)
+        if len(self._buf) < 512:
+            raise ValueError("CFBF header too small")
+        if self._buf[:8].tobytes() != b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1":
+            raise ValueError("Not a CFBF container")
+
+        hdr = self._buf[:512].tobytes()
+        if _u16le(hdr, 0x1C) != 0xFFFE:
+            raise ValueError("Unsupported byte order")
+        sec_shift = _u16le(hdr, 0x1E)
+        mini_shift = _u16le(hdr, 0x20)
+        self.sector_size = 1 << sec_shift
+        self.mini_sector_size = 1 << mini_shift
+
+        self._num_fat_sectors = _u32le(hdr, 0x2C)
+        self._first_dir_sector = _u32le(hdr, 0x30)
+        self._mini_cutoff = _u32le(hdr, 0x38)
+        self._first_minifat_sector = _u32le(hdr, 0x3C)
+        self._num_minifat_sectors = _u32le(hdr, 0x40)
+        self._first_difat_sector = _u32le(hdr, 0x44)
+        self._num_difat_sectors = _u32le(hdr, 0x48)
+
+        self._difat = []
+        for k in range(109):
+            s = _u32le(hdr, 0x4C + 4 * k)
+            if s != _FREESECT:
+                self._difat.append(s)
+
+        # DIFAT extension sectors
+        next_difat = self._first_difat_sector
+        for _ in range(self._num_difat_sectors):
+            if next_difat in (_FREESECT, _ENDOFCHAIN) or next_difat is None:
+                break
+            sec = self._read_sector(next_difat)
+            # last DWORD is next DIFAT sector
+            n_entries = (self.sector_size // 4) - 1
+            for k in range(n_entries):
+                s = _u32le(sec, 4 * k)
+                if s != _FREESECT:
+                    self._difat.append(s)
+            next_difat = _u32le(sec, 4 * n_entries)
+
+        # Build FAT
+        self.fat: List[int] = []
+        for fat_sec in self._difat[: self._num_fat_sectors]:
+            sec = self._read_sector(fat_sec)
+            for k in range(self.sector_size // 4):
+                self.fat.append(_u32le(sec, 4 * k))
+
+        # Directory stream
+        self._dir_stream = self._read_chain_big(self._first_dir_sector)
+        self._dir_entries = self._parse_dir_entries(self._dir_stream)
+
+        # Root entry + mini stream
+        self._root = self._dir_entries.get("Root Entry")
+        self._mini_stream = b""
+        if self._root and self._root.get("start") not in (_FREESECT, _ENDOFCHAIN, None):
+            root_start = int(self._root.get("start", _ENDOFCHAIN))
+            root_size = int(self._root.get("size", 0))
+            self._mini_stream = self._read_chain_big(root_start, root_size)
+
+        # MiniFAT
+        self.minifat: List[int] = []
+        if self._num_minifat_sectors and self._first_minifat_sector not in (_FREESECT, _ENDOFCHAIN):
+            mini_fat_bytes = self._read_chain_big(self._first_minifat_sector)
+            # miniFAT entries are 4 bytes each
+            n = len(mini_fat_bytes) // 4
+            for k in range(n):
+                self.minifat.append(_u32le(mini_fat_bytes, 4 * k))
+
+        # Stream index (root-level by name)
+        self._streams: Dict[str, Dict[str, Any]] = {}
+        for name, ent in self._dir_entries.items():
+            if ent.get("type") == 2:  # stream
+                self._streams[name] = ent
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def _read_sector(self, sec_id: int) -> bytes:
+        off = (sec_id + 1) * self.sector_size
+        end = off + self.sector_size
+        if off < 0 or end > len(self._buf):
+            raise ValueError("Sector out of range")
+        return self._buf[off:end].tobytes()
+
+    def _iter_chain(self, start: int, table: List[int]) -> Iterator[int]:
+        s = start
+        seen = 0
+        # hard safety
+        limit = max(1, len(table) + 16)
+        while s not in (_ENDOFCHAIN, _FREESECT) and 0 <= s < len(table) and seen < limit:
+            yield s
+            s = table[s]
+            seen += 1
+
+    def _read_chain_big(self, start_sector: int, size: Optional[int] = None) -> bytes:
+        if start_sector in (_ENDOFCHAIN, _FREESECT) or start_sector is None:
+            return b""
+        out = bytearray()
+        for s in self._iter_chain(int(start_sector), self.fat):
+            out += self._read_sector(s)
+            if size is not None and len(out) >= size:
+                break
+        if size is not None and size >= 0:
+            return bytes(out[:size])
+        return bytes(out)
+
+    def _read_chain_mini(self, start_mini: int, size: int) -> bytes:
+        if start_mini in (_ENDOFCHAIN, _FREESECT) or start_mini is None:
+            return b""
+        if not self._mini_stream:
+            return b""
+        out = bytearray()
+        for s in self._iter_chain(int(start_mini), self.minifat):
+            off = s * self.mini_sector_size
+            end = off + self.mini_sector_size
+            if end > len(self._mini_stream):
+                break
+            out += self._mini_stream[off:end]
+            if len(out) >= size:
+                break
+        return bytes(out[:size])
+
+    def _parse_dir_entries(self, dir_bytes: bytes) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        if not dir_bytes:
+            return out
+        for i in range(0, len(dir_bytes), 128):
+            chunk = dir_bytes[i : i + 128]
+            if len(chunk) < 128:
+                break
+            name_len = _u16le(chunk, 0x40)
+            if name_len < 2:
+                continue
+            raw_name = chunk[: max(0, name_len - 2)]
+            try:
+                name = raw_name.decode("utf-16le", errors="ignore").rstrip("\x00")
+            except Exception:
+                continue
+            if not name:
+                continue
+            obj_type = chunk[0x42]
+            start = _u32le(chunk, 0x74)
+            size = _u64le(chunk, 0x78)
+            out[name] = {"type": int(obj_type), "start": int(start), "size": int(size)}
+        return out
+
+    # olefile-compatible subset
+    def exists(self, name: str) -> bool:
+        return str(name) in self._streams
+
+    def listdir(self, streams: bool = True, storages: bool = False):
+        if not streams:
+            return []
+        # olefile returns list of lists/tuples for paths. Here: root-level only.
+        return [(k,) for k in self._streams.keys()]
+
+    def openstream(self, entry):
+        # entry can be "name" or ("name",) like olefile.
+        if isinstance(entry, (list, tuple)):
+            name = entry[-1]
+        else:
+            name = entry
+        name = str(name)
+        ent = self._streams.get(name)
+        if not ent:
+            raise FileNotFoundError(name)
+
+        size = int(ent.get("size", 0))
+        start = int(ent.get("start", _ENDOFCHAIN))
+        if size < 0:
+            size = 0
+
+        if size < int(self._mini_cutoff) and self.minifat and self._mini_stream:
+            blob = self._read_chain_mini(start, size)
+        else:
+            blob = self._read_chain_big(start, size)
+
+        return BytesIO(blob)
+
+
+def _open_ppt_container(file_bytes: bytes) -> OleLike:
+    """Return ole-like object with .exists/.openstream/.listdir. Does NOT require olefile."""
+    if olefile is not None:
+        try:
+            return olefile.OleFileIO(BytesIO(file_bytes))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return _CFBFReader(file_bytes)
 
 
 log = logging.getLogger("ppt_module")
@@ -31,19 +248,12 @@ if not log.handlers:
 log.setLevel(logging.INFO)
 
 PPT_DEBUG = os.getenv("PPT_DEBUG", "0") in ("1", "true", "TRUE")
-PPT_DEBUG_IMAGE_LOC = os.getenv("PPT_DEBUG_IMAGE_LOC", "1") in ("1", "true", "TRUE")
-PPT_DUMP_IMAGES = os.getenv("PPT_DUMP_IMAGES", "0") in ("1", "true", "TRUE")
+PPT_DUMP_IMAGES = True  # 항상 Pictures 이미지 스트림 덤프/추출 실행
 PPT_DUMP_DIR = os.getenv("PPT_DUMP_DIR", "./_ppt_dump")
 
 
-def _dbg(msg: str) -> None:
-    if PPT_DEBUG_IMAGE_LOC or PPT_DEBUG:
-        print(f"[DBG] {msg}")
 
 
-def _ok(msg: str) -> None:
-    if PPT_DEBUG_IMAGE_LOC or PPT_DEBUG:
-        print(f"[OK] {msg}")
 
 
 _ZW_CHARS = r"\u200B\u200C\u200D\uFEFF"
@@ -123,7 +333,7 @@ def _walk_records(buf: bytes, base_off: int = 0) -> Iterable[Tuple[int, int, int
         i = i_data_end
 
 
-def _read_stream(ole: OleFileIO, name: str) -> bytes:
+def _read_stream(ole: Any, name: str) -> bytes:
     with ole.openstream(name) as fp:  # type: ignore[attr-defined]
         return fp.read()
 
@@ -160,12 +370,12 @@ PPT_EXTRACT_EMBEDDED = True
 
 
 def _extract_text_from_ole_stream(raw: bytes) -> str:
-    if olefile is None or not raw:
+    if not raw:
         return ""
 
     out: List[str] = []
     try:
-        with olefile.OleFileIO(BytesIO(raw)) as sub:
+        with _open_ppt_container(raw) as sub:
             for entry in sub.listdir(streams=True, storages=False):
                 try:
                     with sub.openstream(entry) as fp:
@@ -188,7 +398,7 @@ def _extract_text_from_ole_stream(raw: bytes) -> str:
     return "\n".join(out)
 
 
-def _extract_embedded_noise_prone(ole: OleFileIO) -> str:
+def _extract_embedded_noise_prone(ole: Any) -> str:
     out: List[str] = []
     for entry in ole.listdir(streams=True, storages=False):
         path = "/".join(entry)
@@ -317,10 +527,7 @@ def extract_images_from_pictures(
     b64_limit: int = 250_000,
     max_images: int = 64,
 ) -> Dict[str, Any]:
-    if olefile is None:
-        raise RuntimeError("olefile 패키지가 필요합니다. pip install olefile")
-
-    with olefile.OleFileIO(BytesIO(file_bytes)) as ole:
+    with _open_ppt_container(file_bytes) as ole:
         pics = _read_stream(ole, "Pictures") if ole.exists("Pictures") else b""
         doc = _read_stream(ole, "PowerPoint Document") if ole.exists("PowerPoint Document") else b""
 
@@ -390,10 +597,7 @@ def extract_images_from_pictures(
 
 
 def build_image_loc_summary(file_bytes: bytes) -> Dict[str, Any]:
-    if olefile is None:
-        return {"found": False, "error": "olefile_missing"}
-
-    with olefile.OleFileIO(BytesIO(file_bytes)) as ole:
+    with _open_ppt_container(file_bytes) as ole:
         has_pics = ole.exists("Pictures")
         has_doc = ole.exists("PowerPoint Document")
         pics_len = len(_read_stream(ole, "Pictures")) if has_pics else 0
@@ -413,7 +617,7 @@ def build_image_loc_summary(file_bytes: bytes) -> Dict[str, Any]:
         return summary
 
     try:
-        with olefile.OleFileIO(BytesIO(file_bytes)) as ole2:
+        with _open_ppt_container(file_bytes) as ole2:
             pics = _read_stream(ole2, "Pictures")
         hits = _scan_image_sigs(pics)
     except Exception:
@@ -432,19 +636,10 @@ def build_image_loc_summary(file_bytes: bytes) -> Dict[str, Any]:
     return summary
 
 
-def debug_print_image_loc(file_bytes: bytes) -> Dict[str, Any]:
-    loc = build_image_loc_summary(file_bytes)
-    _dbg(f"Pictures 이미지 길이: {loc.get('pictures_len', 0)}")
-    _dbg(f"IMAGE_SIG hits: {loc.get('images', 0)} ({loc.get('by_type', {})})")
-    _ok(f"이미지 위치: {loc}")
-    return loc
 
 
 def extract_text(file_bytes: bytes) -> Dict[str, Any]:
-    if olefile is None:
-        raise RuntimeError("olefile 패키지가 필요합니다. pip install olefile")
-
-    with olefile.OleFileIO(BytesIO(file_bytes)) as ole:
+    with _open_ppt_container(file_bytes) as ole:
         if not ole.exists("PowerPoint Document"):
             raise ValueError("PowerPoint Document 스트림이 없습니다(.ppt 형식이 아닐 수 있음).")
         doc = _read_stream(ole, "PowerPoint Document")
@@ -465,20 +660,18 @@ def extract_text(file_bytes: bytes) -> Dict[str, Any]:
     out: Dict[str, Any] = {"full_text": text_main or "", "pages": [{"index": 1, "text": text_main or ""}]}
 
     try:
-        if PPT_DEBUG_IMAGE_LOC:
-            out["image_loc"] = debug_print_image_loc(file_bytes)
-        else:
-            out["image_loc"] = build_image_loc_summary(file_bytes)
+        out["image_loc"] = build_image_loc_summary(file_bytes)
     except Exception as e:
         out["image_loc"] = {"found": False, "error": repr(e)}
 
-    if PPT_DUMP_IMAGES:
-        try:
-            out["images_dump"] = extract_images_from_pictures(
-                file_bytes, dump_dir=PPT_DUMP_DIR, include_b64=False, max_images=64
-            )
-        except Exception as e:
-            out["images_dump"] = {"ok": False, "error": repr(e)}
+    # Pictures 스트림 이미지 덤프/추출은 항상 실행 (디버그 플래그와 무관)
+    try:
+        out["images_dump"] = extract_images_from_pictures(
+            file_bytes, dump_dir=PPT_DUMP_DIR, include_b64=False, max_images=64
+        )
+    except Exception as e:
+        out["images_dump"] = {"ok": False, "error": repr(e)}
+
 
     return out
 
