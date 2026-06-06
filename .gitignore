@@ -1,3 +1,4 @@
+ner/
 .venv/
 venv/
 __pycache__/
@@ -9,3 +10,4 @@ test.doc
 
 # NER 모듈 ignore
 ner/
+test/

@@ -9,6 +9,7 @@ import struct
 import unicodedata
 import zlib
 from io import BytesIO
+from typing import TYPE_CHECKING
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from server.core.matching import find_sensitive_spans
@@ -16,10 +17,13 @@ from server.core.normalize import normalization_index
 
 try:
     import olefile  # type: ignore
-    from olefile import OleFileIO  # type: ignore
 except Exception:  # pragma: no cover
     olefile = None
-    OleFileIO = Any  # type: ignore
+
+if TYPE_CHECKING:
+    from olefile import OleFileIO as OleFileIOType  # type: ignore
+else:
+    OleFileIOType = Any
 
 
 log = logging.getLogger("ppt_module")
@@ -129,7 +133,7 @@ def _walk_records(buf: bytes, base_off: int = 0) -> Iterable[Tuple[int, int, int
         i = i_data_end
 
 
-def _read_stream(ole: OleFileIO, name: str) -> bytes:
+def _read_stream(ole: OleFileIOType, name: str) -> bytes:
     with ole.openstream(name) as fp:  # type: ignore[attr-defined]
         return fp.read()
 
@@ -194,7 +198,7 @@ def _extract_text_from_ole_stream(raw: bytes) -> str:
     return "\n".join(out)
 
 
-def _extract_embedded_noise_prone(ole: OleFileIO) -> str:
+def _extract_embedded_noise_prone(ole: OleFileIOType) -> str:
     out: List[str] = []
     for entry in ole.listdir(streams=True, storages=False):
         path = "/".join(entry)
