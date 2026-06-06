@@ -31,7 +31,7 @@ if not log.handlers:
 log.setLevel(logging.INFO)
 
 PPT_DEBUG = os.getenv("PPT_DEBUG", "0") in ("1", "true", "TRUE")
-PPT_DEBUG_IMAGE_LOC = os.getenv("PPT_DEBUG_IMAGE_LOC", "1") in ("1", "true", "TRUE")
+PPT_DEBUG_IMAGE_LOC = os.getenv("PPT_DEBUG_IMAGE_LOC", "0") in ("1", "true", "TRUE")
 PPT_DUMP_IMAGES = os.getenv("PPT_DUMP_IMAGES", "0") in ("1", "true", "TRUE")
 PPT_DUMP_DIR = os.getenv("PPT_DUMP_DIR", "./_ppt_dump")
 

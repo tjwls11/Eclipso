@@ -845,7 +845,6 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
     plain_targets = sorted(set(plain_targets), key=lambda x: (-len(x), x))
     rep_items = sorted(rep_map.items(), key=lambda kv: (-len(kv[0]), kv[0]))
 
-    print(f"[DBG] sensitive targets = {targets}")
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         streams = ole.listdir(streams=True, storages=False)

@@ -122,10 +122,8 @@ def extract_text(file_bytes: bytes) -> dict:
 
         # Chart 텍스트 합치기 (탐지/리포트용)
         chart_texts = extract_chart_text(file_bytes)
-        print("=== [DEBUG] chart_texts ===", chart_texts)
 
         if chart_texts:
-            print(f"[INFO] extracted {len(chart_texts)} chart texts")
             raw_text = raw_word_text + "\n" + "\n".join(chart_texts)
         else:
             raw_text = raw_word_text

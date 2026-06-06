@@ -910,10 +910,6 @@ def parse_images(wb: bytearray, replace_img=None) -> Dict[str, Any]:
                 patch_positions(wb, pos, filedata_start, new_bytes)
                 patched += 1
 
-            print("[DBG] BLIP 헤더:", blip_bytes[:8].hex())
-            with open(f"debug_img_{images}.bin", "wb") as f:
-                f.write(blip_bytes)
-
     return {
         "found": True,
         "dgg": True,
@@ -1063,8 +1059,7 @@ def redact_textbox(wb: bytearray, extra_literals: Optional[List[str]] = None) ->
         if not text:
             continue
 
-        red = redact_xlucs(text, extra_literals=extra_literals) # NER / literal 기반 레닥션 (추후 필요하면 처리)
-        red = mask_except_hypen_at(red)
+        red = redact_xlucs(text, extra_literals=extra_literals)
 
         raw = encode_masked_text(red, fHigh)
 

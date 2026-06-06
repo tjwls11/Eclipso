@@ -4,7 +4,7 @@ import re
 import zipfile
 import unicodedata
 import xml.etree.ElementTree as ET
-from typing import List, Tuple, Optional, Callable
+from typing import List, Tuple, Optional, Callable, Dict, Any
 
 try:
     from ..core.redaction_rules import PRESET_PATTERNS, RULES

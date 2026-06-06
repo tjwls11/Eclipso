@@ -250,7 +250,7 @@ async def detect(
     pdf_bytes = _read_pdf(file)
 
     # 패턴 로드
-    patterns = _load_patterns_json(patterns_json)   
+    patterns = _parse_patterns_json(patterns_json)
 
     # 기본 구현은 PRESET_PATTERNS 그대로 사용
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)

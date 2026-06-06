@@ -330,7 +330,8 @@ async def redact_file(
     src_name = file.filename or f"redacted{ext or ''}"
     stem = Path(src_name).stem or "redacted"
     out_name = f"{stem}_redacted{ext or ''}"
-    encoded_fileName = out_name.encode("utf-8", "ignore").decode("latin-1", "ignore")
+    from urllib.parse import quote as _url_quote
+    encoded_fileName = _url_quote(out_name, safe="")
 
     rules: Optional[List[str]] = None
     ner_allowed: Optional[List[str]] = None
@@ -469,7 +470,7 @@ async def redact_file(
                             return Response(
                                 content=out,
                                 media_type=mime,
-                                headers={"Content-Disposition": f'attachment; filename="{encoded_fileName}"'},
+                                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_fileName}"},
                             )
                     except Exception as e:
                         if _MASK_DEBUG:
@@ -1016,7 +1017,13 @@ async def redact_file(
                 )
                 with open(dst, "rb") as f:
                     out = f.read()
-            mime = "application/zip"
+            _xml_mime_map = {
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ".hwpx": "application/hwp+zip",
+            }
+            mime = _xml_mime_map.get(ext, "application/octet-stream")
 
         else:
             raise HTTPException(400, f"지원하지 않는 포맷: {ext}")
@@ -1033,5 +1040,5 @@ async def redact_file(
     return Response(
         content=out,
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{encoded_fileName}"'},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_fileName}"},
     )
