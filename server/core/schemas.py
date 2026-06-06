@@ -16,8 +16,9 @@ class Box(BaseModel):
     x0: float
     y0: float
     x1: float
+
     y1: float
-    matched_text: Optional[str] = None
+    matched_text: Optional[str] = None 
     pattern_name: Optional[str] = None
 
 class DetectResponse(BaseModel):

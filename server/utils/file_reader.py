@@ -1,16 +1,28 @@
 from fastapi import UploadFile, HTTPException
-from server.modules import doc_module, docx_module, ppt_module, pptx_module, xls_module, xlsx_module, hwp_module, hwpx_module, pdf_module
+from server.modules import (
+    doc_module,
+    docx_module,
+    ppt_module,
+    pptx_module,
+    xls_module,
+    xlsx_module,
+    hwp_module,
+    hwpx_module,
+    pdf_module,
+    xml_module,
+)
 
 MODULE_MAP = {
     ".doc": doc_module,
-    ".docx": docx_module,  # 추가
+    ".docx": docx_module,  
     ".ppt": ppt_module,
-    ".pptx": pptx_module,  # 추가
+    ".pptx": pptx_module,  
     ".xls": xls_module,
-    ".xlsx": xlsx_module,  # 추가
+    ".xlsx": xlsx_module,  
     ".hwp": hwp_module,
-    ".hwpx": hwpx_module,  # 추가
+    ".hwpx": hwpx_module,  
     ".pdf": pdf_module,
+    ".xml": xml_module,
 }
 
 async def extract_from_file(file: UploadFile):

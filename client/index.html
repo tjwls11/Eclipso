@@ -5,100 +5,693 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
 
+    <!-- Tailwind & PDF-->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
+    <!-- Markdown renderer + sanitizer -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.3.1/dist/purify.min.js"></script>
+
     <script>
-      /* PDF.js worker */
+      // API_BASE 자동 설정
+      const origin = window.location.origin
+      window.API_BASE =
+        origin.includes('127.0.0.1') || origin.includes('localhost')
+          ? 'http://127.0.0.1:8000'
+          : origin.replace(/\/$/, '')
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
 
     <style>
-      .mono {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-          "Liberation Mono", "Courier New", monospace;
-      }
-      .pill {
-        display: inline-block;
-        padding: 0.15rem 0.5rem;
-        border-radius: 9999px;
-        font-size: 12px;
-        line-height: 1.2;
-        white-space: nowrap;
+      /* 선택된 매칭 항목 스타일 */
+      .pii-box[data-selected='1'] {
+        outline: 3px solid #ef4444;
+        outline-offset: 2px;
+        background-color: rgba(239, 68, 68, 0.15);
+        box-shadow: 0 0 12px rgba(239, 68, 68, 0.5);
       }
     </style>
   </head>
 
 
   <body class="bg-gray-50 text-gray-900">
-    <div class="max-w-7xl mx-auto p-6">
-      <h1 class="text-2xl font-bold mb-4">Eclipso</h1>
-
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <!-- 좌측 -->
-        <div class="bg-white rounded-2xl shadow p-5 space-y-4">
-          <div>
-            <label class="block text-sm font-semibold mb-1">파일 업로드</label>
-            <input
-              id="file"
-              type="file"
-              accept=".pdf,.docx,.xlsx,.pptx,.hwpx,.txt,text/plain"
-              class="block w-full border rounded p-2 bg-white"
-            />
-            <p class="text-[12px] text-gray-500 mt-1">
-              PDF / DOCX / XLSX / PPTX / HWPX / TXT 지원
-            </p>
-          </div>
-
-          <fieldset class="border rounded p-3">
-            <legend class="text-sm font-semibold">규칙 선택</legend>
-
-            <label class="block"><input type="checkbox" name="rule" value="rrn" checked /> 주민등록번호</label>
-            <label class="block"><input type="checkbox" name="rule" value="fgn" checked /> 외국인등록번호</label>
-            <label class="block"><input type="checkbox" name="rule" value="phone_mobile" checked /> 휴대전화(010)</label>
-            <label class="block"><input type="checkbox" name="rule" value="phone_city" checked /> 지역전화(02/031~064)</label>
-            <label class="block"><input type="checkbox" name="rule" value="email" checked /> 이메일</label>
-            <label class="block"><input type="checkbox" name="rule" value="card" checked /> 카드번호</label>
-            <label class="block"><input type="checkbox" name="rule" value="passport" checked /> 여권번호</label>
-            <label class="block"><input type="checkbox" name="rule" value="driver_license" checked /> 운전면허번호</label>
-
-            <p class="text-[12px] text-gray-500 mt-2">* 선택 안 하면 서버 PRESET 전체가 사용됩니다.</p>
-          </fieldset>
-
-          <div class="space-y-2">
-            <button id="btn-scan" class="w-full px-4 py-2 rounded bg-blue-600 text-white">
-              스캔 실행
-            </button>
-            <button id="btn-save-redacted" class="w-full px-4 py-2 rounded border hidden" disabled>
-              레닥션 파일 저장
-            </button>
-            <span id="status" class="block text-sm text-gray-600"></span>
-          </div>
+    <!-- 상단바 -->
+    <header class="border-b border-gray-200 bg-white/70 backdrop-blur">
+      <div class="w-full px-0 py-4 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <h1 class="text-xl font-semibold tracking-tight ml-10">Eclipso</h1>
         </div>
+        <div class="text-sm text-gray-500 mr-10">
+          문서 개인정보 스캔 · 레닥션
+        </div>
+      </div>
+    </header>
 
-        <!-- 우측 -->
-        <div class="lg:col-span-2 space-y-6">
-          <!-- 레닥션 미리보기(카테고리별 칩) -->
-          <div class="bg-white rounded-2xl shadow p-5">
-            <div class="flex items-center justify-between">
-              <h2 class="font-semibold mb-2">레닥션 미리보기</h2>
-              <div id="file-info" class="text-sm text-gray-600"></div>
+    <main class="w-full px-6 py-8">
+      <div
+        id="layout-grid"
+        class="grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr_520px] lg:grid-rows-[auto_auto]"
+      >
+        <!-- 왼쪽: 업로드·옵션 -->
+        <aside class="lg:sticky lg:top-6 self-start space-y-6 lg:row-span-2">
+          <section
+            class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 space-y-5"
+          >
+            <!-- 파일 업로드 -->
+            <div>
+              <label class="block text-sm font-medium mb-2">파일 업로드</label>
+              <label
+                id="dropzone"
+                for="file"
+                class="block cursor-pointer rounded-xl border-2 border-dashed border-gray-300 hover:border-gray-400 bg-gray-50 px-4 py-6 text-center transition"
+                role="button"
+                tabindex="0"
+              >
+                <div class="text-sm text-gray-500">
+                  <img
+                    class="w-10 h-10 mx-auto mb-2"
+                    src="https://images.icon-icons.com/1875/PNG/512/fileupload_120150.png"
+                    alt="파일 선택"
+                  />
+                  <p class="text-sm font-medium ml-2 mt-2">
+                    파일을 선택하거나<br />이 영역에 드래그해 주세요
+                  </p>
+                </div>
+
+                <div id="file-name" class="mt-2 text-xs text-gray-400"></div>
+              </label>
+              <input
+                id="file"
+                type="file"
+                accept=".pdf,.doc,.ppt,.xls,.hwp,.txt,.docx,.pptx,.xlsx,.hwpx"
+                class="sr-only"
+              />
             </div>
-            <div id="redacted-preview" class="mono whitespace-pre-wrap border rounded p-3 text-sm min-h-[12rem]"></div>
+
+            <!-- 규칙(정규식) -->
+            <fieldset class="rounded-xl border border-gray-200 p-4">
+              <legend class="px-1 text-sm font-medium">규칙 선택</legend>
+              <div id="rules-container" class="mt-2 space-y-2 text-sm">
+                <!-- /text/rules 실패 시 기본값(유지) -->
+                <label class="flex items-center gap-2">
+                  <input type="checkbox" name="rule" value="rrn" checked />
+                  <span>주민등록번호</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input type="checkbox" name="rule" value="fgn" checked />
+                  <span>외국인등록번호</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    name="rule"
+                    value="phone_mobile"
+                    checked
+                  />
+                  <span>휴대전화</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    name="rule"
+                    value="phone_city"
+                    checked
+                  />
+                  <span>지역전화</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input type="checkbox" name="rule" value="email" checked />
+                  <span>이메일</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input type="checkbox" name="rule" value="card" checked />
+                  <span>카드번호</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input type="checkbox" name="rule" value="passport" checked />
+                  <span>여권번호</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    name="rule"
+                    value="driver_license"
+                    checked
+                  />
+                  <span>운전면허번호</span>
+                </label>
+              </div>
+            </fieldset>
+
+            <!-- NER 표시(필터) -->
+            <fieldset class="rounded-xl border border-gray-200 p-4">
+              <legend class="px-1 text-sm font-medium">NER</legend>
+              <div class="mt-2 space-y-2 text-sm">
+                <label class="flex items-center gap-2">
+                  <input id="ner-show-ps" type="checkbox" checked />
+                  <span>이름(PS)</span>
+                  <button
+                    id="btn-ps-mask-mode"
+                    type="button"
+                    class="ml-auto text-[11px] px-2 py-0.5 rounded-full border border-gray-200 bg-gray-50 text-gray-600 hover:bg-gray-100 transition"
+                    title="이름(PS) 마스킹 방식 (전체/부분)"
+                  >
+                    전체
+                  </button>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input id="ner-show-lc" type="checkbox" checked />
+                  <span>주소·지명(LC)</span>
+                </label>
+                <label class="flex items-center gap-2">
+                  <input id="ner-show-og" type="checkbox" checked />
+                  <span>기관(OG)</span>
+                </label>
+              </div>
+            </fieldset>
+
+            <!-- 실행/다운로드 -->
+            <div class="space-y-2">
+              <button
+                id="btn-scan"
+                class="w-full px-4 py-2.5 rounded-lg text-white transition"
+                style="background-color: oklch(65.802% 0.05764 310.975)"
+              >
+                스캔 실행
+              </button>
+              <button
+                id="btn-save-redacted"
+                class="w-full px-4 py-2.5 rounded-lg border border-gray-300 hover:bg-gray-50 transition hidden"
+                disabled
+              >
+                레닥션 결과 다운로드
+              </button>
+            </div>
+
+            <!-- 상태표시 -->
+            <div class="rounded-lg bg-gray-50 px-3 py-2 text-sm space-y-2">
+              <div class="flex items-center justify-between gap-3">
+                <span id="status" class="text-gray-500 whitespace-pre-line"
+                  >대기 중</span
+                >
+                <span id="status-sub" class="text-xs text-gray-400"></span>
+              </div>
+
+              <!-- 진행바 -->
+              <div id="progress-wrap" class="w-full hidden">
+                <div
+                  class="h-2 w-full rounded-full bg-gray-200 overflow-hidden"
+                >
+                  <div
+                    id="progress-bar"
+                    class="h-2 rounded-full transition-[width] duration-300"
+                    style="
+                      width: 0%;
+                      background-color: oklch(65.802% 0.05764 310.975);
+                    "
+                  ></div>
+                </div>
+                <div
+                  class="mt-1 flex items-center justify-between text-[11px] text-gray-500"
+                >
+                  <span id="progress-label">-</span>
+                  <span id="progress-pct">0%</span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </aside>
+
+        <!-- 가운데/오른쪽/하단:  -->
+        <section class="contents">
+          <!-- 문서뷰어 -->
+          <div
+            id="doc-viewer-block"
+            class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 hidden min-w-0 lg:col-start-2 lg:row-start-1"
+          >
+            <div class="flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <h2 class="font-semibold">문서뷰어</h2>
+                <div
+                  id="doc-meta"
+                  class="text-sm text-gray-500 mt-1 break-words"
+                >
+                  -
+                </div>
+              </div>
+              <span
+                id="doc-detect-count"
+                class="text-xs bg-gray-900 text-white px-2 py-0.5 rounded"
+                >0</span
+              >
+            </div>
+
+            <div class="mt-4">
+              <div id="doc-stage">
+                <div id="doc-page">
+                  <div
+                    id="doc-viewer"
+                    class="font-sans text-[13px] leading-[1.6] text-gray-900 break-words"
+                  ></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 페이지 네비게이션 -->
+            <div
+              id="doc-page-nav"
+              class="mt-4 flex items-center justify-center gap-3 border-t border-gray-100 pt-4 sticky bottom-0 bg-white"
+            >
+              <button
+                id="btn-page-prev"
+                type="button"
+                class="h-8 w-8 flex items-center justify-center rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                aria-label="이전 페이지"
+              >
+                <svg
+                  class="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M15 19l-7-7 7-7"
+                  />
+                </svg>
+              </button>
+              <div
+                id="doc-page-indicator"
+                class="text-sm text-gray-600 font-medium min-w-[60px] text-center"
+              >
+                1 / 1
+              </div>
+              <button
+                id="btn-page-next"
+                type="button"
+                class="h-8 w-8 flex items-center justify-center rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                aria-label="다음 페이지"
+              >
+                <svg
+                  class="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M9 5l7 7-7 7"
+                  />
+                </svg>
+              </button>
+            </div>
           </div>
 
-          <!-- 원본 텍스트(룰별 묶음 목록) -->
-          <div class="bg-white rounded-2xl shadow p-5">
-            <h2 class="font-semibold mb-2">원본 추출 텍스트</h2>
-            <textarea id="txt-raw" class="w-full h-48 border rounded p-2 mono" readonly></textarea>
+          <!-- 리스크 평가 리포트(통계) : prev2 그대로 -->
+          <div
+            id="stats-report-block"
+            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden min-w-0 lg:col-start-2 lg:col-span-2 lg:row-start-2"
+          >
+            <div class="px-5 py-4 flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <h2 class="font-semibold">평가 리포트</h2>
+                <div
+                  id="stats-subtitle"
+                  class="text-sm text-gray-500 mt-1 break-words"
+                >
+                  -
+                </div>
+              </div>
+              <!-- 리포트 다운로드 / JSON 제거 -->
+            </div>
+
+            <div class="border-t p-5 space-y-6">
+              <!-- 상단 KPI -->
+              <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <!-- 민감정보 비율 -->
+                <div class="rounded-2xl border border-gray-200 p-4 bg-gray-50">
+                  <div class="text-xs text-gray-500">민감정보 비율</div>
+                  <div class="mt-1 flex items-end gap-1">
+                    <div
+                      id="stats-exposure-ratio"
+                      class="text-3xl font-semibold tracking-tight"
+                    >
+                      0.00
+                    </div>
+                    <div class="text-lg text-gray-500 mb-0.5">%</div>
+                  </div>
+                  <div class="mt-3 h-2 rounded bg-gray-200 overflow-hidden">
+                    <div
+                      id="stats-exposure-meter"
+                      class="h-2 bg-violet-500 transition-all duration-300"
+                      style="width: 0%"
+                    ></div>
+                  </div>
+                  <div
+                    id="stats-exposure-note"
+                    class="mt-2 text-[11px] text-gray-500"
+                  >
+                    전체 문서 대비 민감정보 글자 수
+                  </div>
+                </div>
+
+                <!-- Unique detections -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">총 탐지 (Unique)</div>
+                  <div
+                    id="stats-total-unique"
+                    class="mt-1 text-3xl font-semibold tracking-tight"
+                  >
+                    0
+                  </div>
+                  <div class="mt-2 text-[11px] text-gray-500">
+                    <span class="text-gray-400">Raw:</span>
+                    <span id="stats-total-raw">0</span>
+                    <span class="mx-1 text-gray-300">|</span>
+                    <span class="text-gray-400">Overlap:</span>
+                    <span id="stats-overlap-rate">0%</span>
+                  </div>
+                  <div class="mt-3 pt-3 border-t border-gray-100">
+                    <div class="flex items-center gap-4 text-[11px]">
+                      <div>
+                        <span class="text-gray-400">정규식:</span>
+                        <span
+                          id="stats-regex-unique"
+                          class="ml-1 font-semibold text-gray-900"
+                          >0</span
+                        >
+                      </div>
+                      <div>
+                        <span class="text-gray-400">NER:</span>
+                        <span
+                          id="stats-ner-unique"
+                          class="ml-1 font-semibold text-gray-900"
+                          >0</span
+                        >
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Regex OK/FAIL + FAIL 분석 -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">정규식 검증</div>
+
+                  <div class="mt-2 flex items-center gap-2">
+                    <span
+                      class="text-[11px] px-2 py-1 rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700"
+                    >
+                      OK <span id="stats-regex-ok" class="font-mono">0</span>
+                    </span>
+                    <span
+                      class="text-[11px] px-2 py-1 rounded-full border border-rose-200 bg-rose-50 text-rose-700"
+                    >
+                      FAIL
+                      <span id="stats-regex-fail" class="font-mono">0</span>
+                    </span>
+                  </div>
+
+                  <div class="mt-3 text-[11px] text-gray-500">FAIL 원인</div>
+                  <div
+                    id="stats-fail-top"
+                    class="mt-1 text-[12px] text-gray-900 leading-relaxed"
+                  >
+                    -
+                  </div>
+
+                  <div class="mt-2 text-[11px] text-gray-500">
+                    valid=false 항목만 집계
+                  </div>
+                </div>
+
+                <!-- NER Avg -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">NER 평균 Score</div>
+                  <div
+                    id="stats-ner-avg"
+                    class="mt-1 text-sm font-medium text-gray-900"
+                  >
+                    PS - / LC - / OG -
+                  </div>
+                  <div class="mt-2 text-[11px] text-gray-500">
+                    선택된 라벨만 반영
+                  </div>
+                </div>
+              </div>
+
+              <!-- 정책/처리시간 -->
+              <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <!-- 정책: 칩 -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">정책</div>
+
+                  <div class="mt-2">
+                    <div class="text-[12px] text-gray-500 mb-1">
+                      정규식 규칙
+                    </div>
+                    <div
+                      id="stats-policy-rules"
+                      class="flex flex-wrap gap-1"
+                    ></div>
+                  </div>
+
+                  <div class="mt-3">
+                    <div class="text-[12px] text-gray-500 mb-1">NER 라벨</div>
+                    <div
+                      id="stats-policy-nerlabels"
+                      class="flex flex-wrap gap-1"
+                    ></div>
+                  </div>
+                </div>
+
+                <!-- 처리시간: 표 -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">처리 시간</div>
+
+                  <div
+                    class="mt-2 overflow-auto rounded-xl border border-gray-200"
+                  >
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-3">Step</th>
+                          <th class="text-right py-2 px-3">Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">extract</td>
+                          <td
+                            id="t-extract"
+                            class="py-2 px-3 text-right font-mono"
+                          >
+                            -
+                          </td>
+                        </tr>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">match</td>
+                          <td
+                            id="t-match"
+                            class="py-2 px-3 text-right font-mono"
+                          >
+                            -
+                          </td>
+                        </tr>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">ner</td>
+                          <td id="t-ner" class="py-2 px-3 text-right font-mono">
+                            -
+                          </td>
+                        </tr>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">redact</td>
+                          <td
+                            id="t-redact"
+                            class="py-2 px-3 text-right font-mono"
+                          >
+                            -
+                          </td>
+                        </tr>
+                        <tr>
+                          <td class="py-2 px-3 font-semibold">total</td>
+                          <td
+                            id="t-total"
+                            class="py-2 px-3 text-right font-mono font-semibold"
+                          >
+                            -
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 표: by_kind / by_label -->
+              <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <div>
+                  <div class="text-sm font-semibold mb-2">유형별 건수</div>
+                  <div class="overflow-auto rounded-xl border border-gray-200">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-3">Type</th>
+                          <th class="text-right py-2 px-3">Count</th>
+                        </tr>
+                      </thead>
+                      <tbody id="stats-by-kind-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+                <div>
+                  <div class="text-sm font-semibold mb-2">라벨별 건수</div>
+                  <div class="overflow-auto rounded-xl border border-gray-200">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-3">Label</th>
+                          <th class="text-right py-2 px-3">Count</th>
+                        </tr>
+                      </thead>
+                      <tbody id="stats-by-label-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <!-- JSON 섹션 제거 -->
+            </div>
           </div>
 
-          <!-- 감지된 항목 (OK/NG 분리) -->
-          <div class="bg-white rounded-2xl shadow p-5">
-            <div class="flex items-center justify-between">
-              <h2 class="font-semibold mb-2">감지된 항목 (원본)</h2>
-              <div id="summary" class="text-sm text-gray-700"></div>
+          <!-- 오른쪽: 매칭결과-->
+          <div class="min-w-0 lg:col-start-3 lg:row-start-1">
+            <div
+              id="match-tabs-block"
+              class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden max-h-[calc(100vh-160px)] overflow-hidden flex flex-col"
+            >
+              <div class="px-5 py-3 flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2 min-w-0">
+                  <h2 class="font-semibold truncate">매칭 결과</h2>
+                  <span
+                    id="match-tab-label"
+                    class="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-700"
+                    >정규식</span
+                  >
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                  <span
+                    id="match-badge"
+                    class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
+                    >0</span
+                  >
+                  <button
+                    id="btn-match-prev"
+                    type="button"
+                    class="h-7 w-7 rounded-lg border border-gray-200 hover:bg-gray-50"
+                    aria-label="이전(정규식/NER)"
+                  >
+                    &lt;
+                  </button>
+                  <button
+                    id="btn-match-next"
+                    type="button"
+                    class="h-7 w-7 rounded-lg border border-gray-200 hover:bg-gray-50"
+                    aria-label="다음(정규식/NER)"
+                  >
+                    &gt;
+                  </button>
+                </div>
+              </div>
+
+              <!-- 정규식 pane -->
+              <div
+                id="match-pane-regex"
+                class="border-t flex-1 min-h-0 flex flex-col"
+              >
+                <div
+                  id="match-body"
+                  class="p-5 flex-1 min-h-0 overflow-hidden flex flex-col"
+                >
+                  <div class="flex flex-wrap items-center gap-3 mb-4">
+                    <div id="summary" class="text-sm text-gray-500"></div>
+                    <span class="mx-2 text-gray-300">|</span>
+                    <div
+                      class="inline-flex rounded-lg border border-gray-200 overflow-hidden"
+                    >
+                      <button
+                        id="seg-all"
+                        data-seg="all"
+                        type="button"
+                        class="px-3 py-1.5 text-xs bg-gray-900 text-white"
+                      >
+                        All
+                      </button>
+                      <button
+                        id="seg-ok"
+                        data-seg="ok"
+                        type="button"
+                        class="px-3 py-1.5 text-xs text-emerald-700 hover:bg-emerald-50"
+                      >
+                        OK
+                      </button>
+                      <button
+                        id="seg-fail"
+                        data-seg="fail"
+                        type="button"
+                        class="px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50"
+                      >
+                        FAIL
+                      </button>
+                    </div>
+                    <input
+                      id="filter-search"
+                      type="text"
+                      placeholder="텍스트 검색"
+                      class="text-sm border rounded px-2 py-1 min-w-[220px]"
+                    />
+                  </div>
+
+                  <div
+                    id="match-groups"
+                    class="flex-1 min-h-0 overflow-auto space-y-3 pr-1"
+                  ></div>
+                </div>
+              </div>
+
+              <!-- NER pane -->
+              <div
+                id="match-pane-ner"
+                class="border-t hidden flex-1 min-h-0 flex flex-col"
+              >
+                <div
+                  id="ner-body"
+                  class="p-5 flex-1 min-h-0 overflow-hidden flex flex-col"
+                >
+                  <div
+                    id="ner-summary"
+                    class="text-sm text-gray-500 mb-3"
+                  ></div>
+                  <div class="flex-1 min-h-0 overflow-auto pr-1">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-2">Label</th>
+                          <th class="text-left py-2 px-2">Text</th>
+                          <th class="text-left py-2 px-2">Score</th>
+                          <th class="text-left py-2 px-2">Pos</th>
+                        </tr>
+                      </thead>
+                      <tbody id="ner-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <h3 class="text-sm font-semibold mb-2 text-emerald-700">유효(OK)</h3>

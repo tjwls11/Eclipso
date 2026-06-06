@@ -6,3 +6,7 @@ __pycache__/
 # 문서파일 ignore
 근희함.doc
 test.doc
+
+# NER 모듈 ignore
+ner/
+test/
