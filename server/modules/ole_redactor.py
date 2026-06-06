@@ -1,5 +1,10 @@
 from __future__ import annotations
-import io, os, time, struct, logging
+
+import io
+import os
+import time
+import struct
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 
@@ -28,6 +33,7 @@ DEBUG_IMAGES = os.getenv("OLE_DEBUG_IMAGES", "0") in ("1", "true", "TRUE")
 
 def _hexdump(b: bytes, width: int = 16) -> str:
     return " ".join(f"{x:02X}" for x in b[:width])
+
 
 def _dump_text(b: bytes, n: int) -> str:
     s = b.decode("utf-8", "ignore").replace("\r", " ").replace("\n", " ")
@@ -76,34 +82,46 @@ def utf16_same_len_replace_with_logs(data: bytes, old: str):
 
 def visible_replace_keep_len_with_logs(data: bytes, old: str):
     changed, direct = utf16_same_len_replace_with_logs(data, old)
-    if direct: return changed, direct
-    if len(data) < 2 or (len(data) % 2): return data, 0
+    if direct:
+        return changed, direct
+    if len(data) < 2 or (len(data) % 2):
+        return data, 0
     try:
-        u16 = list(struct.unpack("<" + "H"*(len(data)//2), data))
+        u16 = list(struct.unpack("<" + "H" * (len(data) // 2), data))
     except struct.error:
         return data, 0
-    target = list(struct.unpack("<" + "H"*len(old), old.encode("utf-16le")))
+    target = list(struct.unpack("<" + "H" * len(old), old.encode("utf-16le")))
     m = len(target)
-    if m == 0: return data, 0
-    total = 0; i = 0
+    if m == 0:
+        return data, 0
+    total = 0
+    i = 0
     while i < len(u16):
-        j = 0; k = i
+        j = 0
+        k = i
         while j < m and k < len(u16):
-            if u16[k] < 0x20: k += 1; continue
-            if u16[k] == target[j]: j += 1; k += 1
-            else: break
+            if u16[k] < 0x20:
+                k += 1
+                continue
+            if u16[k] == target[j]:
+                j += 1
+                k += 1
+            else:
+                break
         if j == m:
-            p = i; filled = 0
+            p = i
+            filled = 0
             while p < k and filled < m:
                 if u16[p] >= 0x20:
                     if u16[p] not in (0x002D, 0x0040):  # '-' / '@'
                         u16[p] = 0x002A
                     filled += 1
                 p += 1
-            total += 1; i = k
+            total += 1
+            i = k
         else:
             i += 1
-    return struct.pack("<" + "H"*len(u16), *u16), total
+    return struct.pack("<" + "H" * len(u16), *u16), total
 
 
 
@@ -191,15 +209,23 @@ def _scan_image_signatures(raw: bytes, max_hits: int = 32):
 
 
 def _mask_emails_ascii_same_len(b: bytes) -> Tuple[bytes, int]:
-    ba = bytearray(b); hits = 0; i = 0; n = len(ba)
+    ba = bytearray(b)
+    hits = 0
+    i = 0
+    n = len(ba)
     while i < n:
-        if ba[i] != 0x40: i += 1; continue  # '@'
-        L = i-1
-        while L >= 0 and ba[L] in _ASCII_EMAIL_CHARS: L -= 1
+        if ba[i] != 0x40:  # '@'
+            i += 1
+            continue
+        L = i - 1
+        while L >= 0 and ba[L] in _ASCII_EMAIL_CHARS:
+            L -= 1
         L += 1
-        R = i+1; had_dot = False
+        R = i + 1
+        had_dot = False
         while R < n and (ba[R] in _ASCII_EMAIL_DOTOK or ba[R] == 0x2E):
-            if ba[R] == 0x2E: had_dot = True
+            if ba[R] == 0x2E:
+                had_dot = True
             R += 1
         if L < i and R > i + 1 and had_dot:
             for p in range(L, R):
@@ -214,9 +240,12 @@ def _mask_emails_ascii_same_len(b: bytes) -> Tuple[bytes, int]:
     return bytes(ba), hits
 
 def _mask_emails_utf16le_same_len(b: bytes) -> Tuple[bytes, int]:
-    if len(b) < 4 or (len(b) % 2): return b, 0
-    u = list(struct.unpack("<" + "H"*(len(b)//2), b))
-    hits = 0; i = 0
+    if len(b) < 4 or (len(b) % 2):
+        return b, 0
+    u = list(struct.unpack("<" + "H" * (len(b) // 2), b))
+    hits = 0
+    i = 0
+
     def _is_name(ch):  # name 파트 허용
         return (
             (48 <= ch <= 57)
@@ -234,13 +263,18 @@ def _mask_emails_utf16le_same_len(b: bytes) -> Tuple[bytes, int]:
         )
 
     while i < len(u):
-        if u[i] != 0x0040: i += 1; continue  # '@'
-        L = i-1
-        while L >= 0 and _is_name(u[L]): L -= 1
+        if u[i] != 0x0040:  # '@'
+            i += 1
+            continue
+        L = i - 1
+        while L >= 0 and _is_name(u[L]):
+            L -= 1
         L += 1
-        R = i+1; had_dot = False
+        R = i + 1
+        had_dot = False
         while R < len(u) and _is_dom(u[R]):
-            if u[R] == 0x002E: had_dot = True
+            if u[R] == 0x002E:
+                had_dot = True
             R += 1
         if L < i and R > i + 1 and had_dot:
             for p in range(L, R):
@@ -252,21 +286,30 @@ def _mask_emails_utf16le_same_len(b: bytes) -> Tuple[bytes, int]:
             i = R
         else:
             i += 1
-    return struct.pack("<" + "H"*len(u), *u), hits
+    return struct.pack("<" + "H" * len(u), *u), hits
 
 def get_root_entry(ole):
     for e in ole.direntries:
-        if e and e.name == "Root Entry": return e
+        if e and e.name == "Root Entry":
+            return e
     return None
 
+
 def overwrite_bigfat(ole, container: bytearray, start_sector: int, new_raw: bytes) -> int:
-    s = start_sector; pos = 0; sec = ole.sector_size; fat = ole.fat; w = 0
+    s = start_sector
+    pos = 0
+    sec = ole.sector_size
+    fat = ole.fat
+    w = 0
     while s != ENDOFCHAIN and s != -1 and pos < len(new_raw):
-        if s >= len(fat): break
+        if s >= len(fat):
+            break
         off = (s + 1) * sec
-        chunk = new_raw[pos:pos + sec]
-        container[off:off + len(chunk)] = chunk
-        pos += sec; s = fat[s]; w += 1
+        chunk = new_raw[pos : pos + sec]
+        container[off : off + len(chunk)] = chunk
+        pos += sec
+        s = fat[s]
+        w += 1
     return w
 
 
@@ -276,9 +319,11 @@ def big_sector_from_minioffset(
     sector = ole.sector_size
     block_idx = mini_offset // sector
     within = mini_offset % sector
-    s = root_start_sector; fat = ole.fat
+    s = root_start_sector
+    fat = ole.fat
     for _ in range(block_idx):
-        if s in (-1, ENDOFCHAIN) or s >= len(fat): return None, None
+        if s in (-1, ENDOFCHAIN) or s >= len(fat):
+            return None, None
         s = fat[s]
     return s, within
 
@@ -289,32 +334,27 @@ def overwrite_minifat_chain(
     minisize = ole.mini_sector_size
     minifat = ole.minifat
     root = get_root_entry(ole)
-    if root is None: return 0
+    if root is None:
+        return 0
     root_big_start = root.isectStart
-    s = mini_start; pos = 0; w = 0
+    s = mini_start
+    pos = 0
+    w = 0
     while s != ENDOFCHAIN and s != -1 and pos < len(new_raw):
         mini_off = s * minisize
         big_sector, within = big_sector_from_minioffset(ole, root_big_start, mini_off)
+        if big_sector is None:
+            break
         file_off = (big_sector + 1) * ole.sector_size + within
-        chunk = new_raw[pos:pos + minisize]
-        container[file_off:file_off + len(chunk)] = chunk
+        chunk = new_raw[pos : pos + minisize]
+        container[file_off : file_off + len(chunk)] = chunk
         pos += minisize
-        if s >= len(minifat): break
-        s = minifat[s]; w += 1
+        if s >= len(minifat):
+            break
+        s = minifat[s]
+        w += 1
     return w
 
-# ── 디버그 덤프 ───────────────────────────────────────────────────────────
-def _prepare_dump_dir() -> Optional[Path]:
-    if os.getenv("OLE_DEBUG_DUMP", "0") not in ("1","true","TRUE"): return None
-    p = Path("./_ole_debug") / str(int(time.time()*1000))
-    p.mkdir(parents=True, exist_ok=True); return p
-
-def _safe_name(name: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
-
-# ── 시그니처/브루트포스 ──────────────────────────────────────────────────
-def _is_cfbf(h: bytes) -> bool:
-    return h.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")
 
 def _brute_bigfat_aligned(
     container: bytes, sig: bytes, sector: int, max_k: int
@@ -356,20 +396,23 @@ def _brute_ministream(
     steps = 0
     while s not in (-1, ENDOFCHAIN) and s < len(fat) and len(mini_stream) < cap:
         off = (s + 1) * sec_size
-        mini_stream += container[off:off+sec_size]
-        s = fat[s]; steps += 1
-        if steps > 65536: break
-    sig = stream_bytes[:min(64, len(stream_bytes))]
+        mini_stream += container[off : off + sec_size]
+        s = fat[s]
+        steps += 1
+        if steps > 65536:
+            break
+    sig = stream_bytes[: min(64, len(stream_bytes))]
     idx = mini_stream.find(sig)
     if idx == -1:
         return None
     mini_start = idx // ole.mini_sector_size
     return mini_start
 
+
 def _probe_set(secrets: List[str]) -> Dict[str, List[bytes]]:
     return {
         "utf8": [s.encode("utf-8", "ignore") for s in (secrets or []) if s],
-        "u16":  [s.encode("utf-16le", "ignore") for s in (secrets or []) if s],
+        "u16": [s.encode("utf-16le", "ignore") for s in (secrets or []) if s],
     }
 
 
@@ -390,10 +433,12 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
     container = bytearray(bin_bytes) 
     base = memoryview(container)[prefix_off:]
     dump_dir = _prepare_dump_dir()
-    if dump_dir: (dump_dir / "ole_before.bin").write_bytes(base.tobytes())
+    if dump_dir:
+        (dump_dir / "ole_before.bin").write_bytes(base.tobytes())
 
-    with olefile.OleFileIO(io.BytesIO(base)) as ole:
-        sector = ole.sector_size; mini = ole.mini_sector_size
+    with olefile.OleFileIO(io.BytesIO(base.tobytes())) as ole:
+        sector = ole.sector_size
+        mini = ole.mini_sector_size
         cutoff = getattr(ole, "minisector_cutoff", MINI_CUTOFF_DEFAULT)
         streams = ole.listdir(streams=True, storages=False)
 
@@ -419,12 +464,20 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
         probes = _probe_set(secrets_only)
         changed_any = False
 
+        def _need_force_blank(name: str) -> bool:
+            n = name.lower()
+            if "olepres" in n:  # OlePres000 등
+                return True if force_blank_preview else False
+            bare = name.split("/")[-1]
+            return bare in ("Contents", "OOXMLChartContents")
+
         for path in streams:
             sname = "/".join(path)
             try:
                 raw = ole.openstream(path).read()
             except Exception as e:
-                log.warning("  · %s open 실패: %s", sname, e); continue
+                log.warning("  · %s open 실패: %s", sname, e)
+                continue
 
             de_start = -1
             de_size = len(raw)
@@ -462,6 +515,7 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
             # 강제 제로필 대상
             if _need_force_blank(sname):
                 changed = b"\x00" * len(raw)
+                did_force_blank = True
             else:
                 # 일반 파이프라인: 시크릿/이메일 동일 길이 마스킹
                 u16_hits = 0
@@ -496,13 +550,14 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
             if changed == orig:
                 continue
 
-            # 길이 유지
+            # 길이 유지 보정
             if len(changed) < len(orig):
                 changed += b"\x00" * (len(orig) - len(changed))
             elif len(changed) > len(orig):
-                changed = changed[:len(orig)]
+                changed = changed[: len(orig)]
 
-            wrote = 0; start_used = None
+            wrote = 0
+            start_used: Optional[str] = None
 
             # direntry 기반 쓰기
             if de_start is not None and de_start >= 0:
@@ -515,11 +570,11 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
 
             # 정렬 브루트포스
             if wrote <= 0:
-                sig = orig[:min(64, len(orig))]
+                sig = orig[: min(64, len(orig))]
                 bf = _brute_bigfat_aligned(base.obj, sig, sector, max_k=8192)
                 if bf is not None:
                     wrote = overwrite_bigfat(ole, base.obj, bf, changed)
-                    start_used = f"BigFAT(brute-unaligned:{bf})"
+                    start_used = f"BigFAT(brute-aligned:{bf})"
 
             # 비정렬 근사
             if wrote <= 0:
@@ -545,7 +600,7 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
 
             # 재검증
             try:
-                with olefile.OleFileIO(io.BytesIO(base)) as ole2:
+                with olefile.OleFileIO(io.BytesIO(base.tobytes())) as ole2:
                     try:
                         rb2 = ole2.openstream(path).read()
                     except Exception:
@@ -581,7 +636,8 @@ def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[Any], *, mask_p
             except Exception as e:
                 log.warning("  · %s VERIFY 예외: %s", sname, e)
 
-    if dump_dir: (dump_dir / "ole_after.bin").write_bytes(base.tobytes())
+    if dump_dir:
+        (dump_dir / "ole_after.bin").write_bytes(base.tobytes())
 
     return bytes(container)
 

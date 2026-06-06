@@ -225,8 +225,7 @@ def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
                 parts.append(xlsx_text_from_zip(xzf))
         except zipfile.BadZipFile:
             continue
-        except KeyError:
-            pass
+
     return cleanup_text("\n".join(p for p in parts if p))
 
 

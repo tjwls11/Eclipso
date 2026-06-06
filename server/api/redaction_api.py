@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -179,7 +178,6 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
     if not s or s.lower() in ("null", "none"):
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
-
     try:
         obj = json.loads(patterns_json)
     except json.JSONDecodeError as e:
@@ -190,11 +188,17 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
         if "patterns" in obj and isinstance(obj["patterns"], list):
             arr = obj["patterns"]
         else:
-            raise HTTPException(status_code=400, detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요")
+            raise HTTPException(
+                status_code=400,
+                detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요",
+            )
     elif isinstance(obj, list):
         arr = obj
     else:
-        raise HTTPException(status_code=400, detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태")
+        raise HTTPException(
+            status_code=400,
+            detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태",
+        )
 
     try:
         return [PatternItem(**p) for p in arr]

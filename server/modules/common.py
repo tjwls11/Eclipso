@@ -29,7 +29,7 @@ __all__ = [
 
 HWPX_STRIP_PREVIEW = False
 HWPX_DISABLE_CACHE = True
-HWPX_BLANK_PREVIEW = False
+HWPX_BLANK_PREVIEW = True
 
 # 텍스트 정리(개행/공백 + 유니코드 NFKC)
 def cleanup_text(text: str) -> str:
@@ -61,7 +61,6 @@ def cleanup_text_keep_tabs(text: str) -> str:
 _RULE_PRIORITY = {
     "card": 100, "email": 90, "rrn": 80, "fgn": 80,
     "phone_mobile": 60, "phone_city": 60,
-    "phone_mobile": 60, "phone_city": 60,
     "driver_license": 40, "passport": 30,
 }
 
@@ -85,12 +84,15 @@ def compile_rules() -> List[Tuple[str, re.Pattern, bool, int, Optional[Callable]
 
 # validator 호출 래퍼
 def _is_valid(value: str, validator: Optional[Callable]) -> bool:
-    if validator is None:
+    if not validator:
         return True
     try:
-        return bool(validator(value))
-    except TypeError:
-        return bool(validator(value, None))
+        try:
+            return bool(validator(value))
+        except TypeError:
+            return bool(validator(value, None))
+    except Exception:
+        return False
 
 # 마스킹 유틸(HTML 엔티티 보존)
 _ENTITY_RE = re.compile(r"&(#\d+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);")
@@ -528,9 +530,6 @@ def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
     with zipfile.ZipFile(bio_in, "r") as zin, \
         zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
-            name = it.filename
-            data = zin.read(name)
-            low = name.lower()
             name = it.filename
             data = zin.read(name)
             low = name.lower()

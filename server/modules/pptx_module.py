@@ -315,7 +315,7 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
 def extract_text(file_bytes: bytes) -> dict:
     
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
-        return pptx_text(zipf)
+        txt = pptx_text(zipf)
 
     return {
         "full_text": txt,

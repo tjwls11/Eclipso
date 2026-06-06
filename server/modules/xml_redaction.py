@@ -68,7 +68,6 @@ def detect_xml_type(filename: str) -> str:
     if l.endswith(".pptx"): return "pptx"
     if l.endswith(".hwpx"): return "hwpx"
     raise HTTPException(400, f"Unsupported XML type for: {filename}")
-    raise HTTPException(400, f"Unsupported XML type for: {filename}")
 
 
 def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:

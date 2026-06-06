@@ -297,7 +297,7 @@ def hwpx_text(zipf: zipfile.ZipFile) -> str:
 
 def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
-        return hwpx_text(zipf)
+        raw = hwpx_text(zipf)
 
     txt = re.sub(r"<[^>\n]+>", "", raw)
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from fastapi import APIRouter, UploadFile, HTTPException
@@ -57,9 +56,6 @@ def _is_valid_span(span: Dict[str, Any]) -> bool:
 
 @router.post("/extract")
 async def extract_text(file: UploadFile):
-    """
-    업로드 문서에서 텍스트를 추출해 { full_text }로 반환.
-    """
     try:
         filename = (file.filename or "").lower()
         raw_bytes = await file.read()
@@ -561,7 +557,6 @@ async def set_policy(policy: dict):
 
 @router.get("/rules")
 async def list_rules():
-    """정의된 정규식 룰 이름 배열 반환"""
     return [r["name"] for r in PRESET_PATTERNS]
 
 
