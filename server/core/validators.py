@@ -1,21 +1,26 @@
 import re
 from datetime import datetime
 
+
 # 숫자만 추출(공통)
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
+
 
 # 지역번호 형식 유효성 검증
 def is_valid_phone_city(number: str, options=None) -> bool:
     if not number:
         return False
 
+
     # 하이픈 개수 제한
     hyphen_cnt = number.count("-")
     if hyphen_cnt not in (0, 2):
         return False
 
+
     d = _digits(number)
+
 
     # 서울 (02)
     if d.startswith("02"):
@@ -25,32 +30,42 @@ def is_valid_phone_city(number: str, options=None) -> bool:
         # 021234567 / 0212345678
         return len(d) in (9, 10)
 
+
     # 기타 지역번호
     if d[:3] in {f"0{x}" for x in range(31, 65)}:
         if hyphen_cnt == 2:
             return bool(re.fullmatch(r"0\d{2}-\d{3,4}-\d{4}", number))
         return len(d) in (10, 11)
 
+
     return False
+
 
 # 휴대폰 유효성 검증
 def is_valid_phone_mobile(number: str, options=None) -> bool:
     if not number:
         return False
 
+
     hyphen_cnt = number.count("-")
     if hyphen_cnt not in (0, 2):
         return False
+
 
     d = _digits(number)
     if not d.startswith("010") or len(d) != 11:
         return False
 
+
     if hyphen_cnt == 2:
         return bool(re.fullmatch(r"010-\d{3,4}-\d{4}", number))
 
+
     # 하이픈 없는 경우
     return True
+
+
+
 
 
 
@@ -61,6 +76,7 @@ def is_valid_date6(digits: str) -> bool:
         return dt.date() <= datetime.today().date()  # 오늘 이후면 False
     except ValueError:
         return False
+
 
 # 주민등록번호 발급연도 계산
 def _full_year_from_rrn(d13: str) -> int:
@@ -74,6 +90,7 @@ def _full_year_from_rrn(d13: str) -> int:
         return 1800 + yy
     return (1900 + yy) if yy > this_yy else (2000 + yy)
 
+
 # 주민등록번호 (내국인)
 def is_valid_rrn(rrn: str, opts: dict | None = None) -> bool:
     d = _digits(rrn)
@@ -82,7 +99,9 @@ def is_valid_rrn(rrn: str, opts: dict | None = None) -> bool:
     if not is_valid_date6(d[:6]):
         return False
 
+
     use_checksum = (opts or {}).get("rrn_checksum", True)
+
 
     try:
         full_year = _full_year_from_rrn(d)
@@ -91,9 +110,11 @@ def is_valid_rrn(rrn: str, opts: dict | None = None) -> bool:
     except Exception:
         pass  # 계산 실패 시 기존 로직 유지
 
+
     if use_checksum and not is_valid_rrn_checksum(d):
         return False
     return True
+
 
 # 외국인등록번호 checksum 검증
 def is_valid_fgn_checksum(fgn: str) -> bool:
@@ -105,6 +126,7 @@ def is_valid_fgn_checksum(fgn: str) -> bool:
     chk = (11 - (total % 11)) % 10
     chk = (chk + 2) % 10
     return chk == int(d[-1])
+
 
 # 외국인등록번호
 def is_valid_fgn(fgn: str, opts: dict | None = None) -> bool:
@@ -123,6 +145,7 @@ def is_valid_fgn(fgn: str, opts: dict | None = None) -> bool:
             return False
     return True
 
+
 # 주민등록번호 checksum 검증
 def is_valid_rrn_checksum(rrn: str) -> bool:
     d = _digits(rrn)
@@ -134,21 +157,40 @@ def is_valid_rrn_checksum(rrn: str) -> bool:
     return chk == int(d[-1])
 
 
+
+
 # 운전면허번호
 def is_valid_driver_license(lic: str, opts: dict | None = None) -> bool:
-    d = _digits(lic)
+    raw = lic or ""
+    d = _digits(raw)
     if len(d) != 12:
         return False
-    year = d[2:4]
+
+
+    area = d[:2]
+    if area not in {
+        "11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26"
+    }:
+        return False
+
+
+    year2 = d[2:4]
     try:
-        y = int(year)
-        this_year = int(str(datetime.today().year)[2:])
-        full_year = 1900 + y if y > this_year else 2000 + y
-        if not (1960 <= full_year <= datetime.today().year):
-            return False
+        y = int(year2)
+        this_y2 = int(str(datetime.today().year)[-2:])
+        full_year = 1900 + y if y > this_y2 else 2000 + y
     except ValueError:
         return False
+
+
+    min_issue_year = int((opts or {}).get("min_issue_year", 1995))
+    if not (min_issue_year <= full_year <= datetime.today().year):
+        return False
+
+
     return True
+
+
 
 
 # 카드번호
@@ -166,20 +208,25 @@ def _luhn_ok(d: str) -> bool:
     return (s % 10) == 0
 
 
+
+
 #신용카드 번호
 def is_valid_card(number: str, options: dict | None = None) -> bool:
     opts = {"luhn": True, "iin": True}
     if options:
         opts.update(options)
 
+
     d = _digits(number)
     if len(d) not in (15, 16):
         return False
+
 
     if opts["iin"]:
         if len(d) == 16:
             prefix2 = int(d[:2]) if d[:2].isdigit() else None
             prefix4 = int(d[:4]) if d[:4].isdigit() else None
+
 
             if d[0] == "4":        # Visa
                 pass
@@ -199,9 +246,11 @@ def is_valid_card(number: str, options: dict | None = None) -> bool:
             if not (d.startswith("34") or d.startswith("37")):
                 return False
 
+
     if opts["luhn"] and not _luhn_ok(d):
         return False
     return True
+
 
 # 이메일
 def is_valid_email(addr: str, options: dict | None = None) -> bool:

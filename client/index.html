@@ -23,6 +23,16 @@
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
+
+    <style>
+      /* 선택된 매칭 항목 스타일 */
+      .pii-box[data-selected='1'] {
+        outline: 3px solid #ef4444;
+        outline-offset: 2px;
+        background-color: rgba(239, 68, 68, 0.15);
+        box-shadow: 0 0 12px rgba(239, 68, 68, 0.5);
+      }
+    </style>
   </head>
 
   <body class="bg-gray-50 text-gray-900">
@@ -248,22 +258,58 @@
               </div>
             </div>
 
-            <!-- app.js 호환용(숨김) -->
+            <!-- 페이지 네비게이션 -->
             <div
-              id="doc-page-indicator"
-              class="hidden"
-              aria-hidden="true"
-            ></div>
-            <button
-              id="btn-page-prev"
-              class="hidden"
-              aria-hidden="true"
-            ></button>
-            <button
-              id="btn-page-next"
-              class="hidden"
-              aria-hidden="true"
-            ></button>
+              id="doc-page-nav"
+              class="mt-4 flex items-center justify-center gap-3 border-t border-gray-100 pt-4 sticky bottom-0 bg-white"
+            >
+              <button
+                id="btn-page-prev"
+                type="button"
+                class="h-8 w-8 flex items-center justify-center rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                aria-label="이전 페이지"
+              >
+                <svg
+                  class="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M15 19l-7-7 7-7"
+                  />
+                </svg>
+              </button>
+              <div
+                id="doc-page-indicator"
+                class="text-sm text-gray-600 font-medium min-w-[60px] text-center"
+              >
+                1 / 1
+              </div>
+              <button
+                id="btn-page-next"
+                type="button"
+                class="h-8 w-8 flex items-center justify-center rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                aria-label="다음 페이지"
+              >
+                <svg
+                  class="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M9 5l7 7-7 7"
+                  />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <!-- 리스크 평가 리포트(통계) : prev2 그대로 -->
@@ -281,54 +327,36 @@
                   -
                 </div>
               </div>
-              <div class="shrink-0 flex items-center gap-2">
-                <button
-                  id="btn-stats-download"
-                  type="button"
-                  class="text-xs px-2 py-1 rounded-lg bg-gray-900 text-white hover:bg-gray-800 transition"
-                >
-                  리포트 다운로드
-                </button>
-                <button
-                  id="btn-stats-json-toggle"
-                  type="button"
-                  class="text-xs px-2 py-1 rounded-lg border border-gray-300 hover:bg-gray-50 transition"
-                >
-                  JSON
-                </button>
-              </div>
+              <!-- 리포트 다운로드 / JSON 제거 -->
             </div>
 
             <div class="border-t p-5 space-y-6">
               <!-- 상단 KPI -->
               <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-                <!-- Risk Score -->
+                <!-- 민감정보 비율 -->
                 <div class="rounded-2xl border border-gray-200 p-4 bg-gray-50">
                   <div class="text-xs text-gray-500">민감정보 비율</div>
-                  <div class="mt-1 flex items-end justify-between gap-3">
+                  <div class="mt-1 flex items-end gap-1">
                     <div
-                      id="stats-risk-score"
+                      id="stats-exposure-ratio"
                       class="text-3xl font-semibold tracking-tight"
                     >
-                      0
+                      0.00
                     </div>
-                    <div class="text-xs text-gray-500">/ 100</div>
+                    <div class="text-lg text-gray-500 mb-0.5">%</div>
                   </div>
                   <div class="mt-3 h-2 rounded bg-gray-200 overflow-hidden">
                     <div
-                      id="stats-risk-meter"
-                      class="h-2"
-                      style="
-                        width: 0%;
-                        background-color: oklch(62.7% 0.265 303.9);
-                      "
+                      id="stats-exposure-meter"
+                      class="h-2 bg-violet-500 transition-all duration-300"
+                      style="width: 0%"
                     ></div>
                   </div>
                   <div
-                    id="stats-risk-note"
+                    id="stats-exposure-note"
                     class="mt-2 text-[11px] text-gray-500"
                   >
-                    -
+                    전체 문서 대비 민감정보 글자 수
                   </div>
                 </div>
 
@@ -536,10 +564,7 @@
                 </div>
               </div>
 
-              <pre
-                id="stats-json"
-                class="hidden text-xs bg-gray-50 border border-gray-200 rounded-xl p-3 overflow-auto"
-              ></pre>
+              <!-- JSON 섹션 제거 -->
             </div>
           </div>
 

@@ -19,7 +19,6 @@ OLLAMA_HOST = "http://localhost:11434"
 
 _client: Client | None = None
 
-
 def _get_client() -> Client:
     global _client
     if Client is None:

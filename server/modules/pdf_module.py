@@ -1569,7 +1569,7 @@ def apply_text_redaction(pdf_bytes: bytes, extra_spans: List[dict] | None = None
 
     return apply_redaction(pdf_bytes, boxes)
 
-def extract_text_indexed(pdf_bytes: bytes) -> dict:
+def extract_text_indexed(pdf_bytes: bytes, *, row_tol: float = 8.0) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         full_parts: List[str] = []
@@ -1580,48 +1580,108 @@ def extract_text_indexed(pdf_bytes: bytes) -> dict:
 
         for pno, page in enumerate(doc):
             words = page.get_text("words") or []
-            words = sorted(words, key=lambda w: (float(w[1]), float(w[0])))
+            if not words:
+                pages_out.append({
+                    "page": pno + 1,
+                    "text": "",
+                    "start": offset,
+                    "end": offset,
+                })
+                continue
 
-            page_start = offset
-            page_text_parts: List[str] = []
-
+            # 단어들을 Y좌표 기준으로 그룹화하여 줄(row)로 분리
+            word_data: List[Tuple[float, float, float, float, str]] = []
             for w in words:
                 try:
                     x0, y0, x1, y1, txt = float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])
+                    if txt:
+                        word_data.append((x0, y0, x1, y1, txt))
                 except Exception:
                     continue
-                if not txt:
-                    continue
 
-                if page_text_parts:
-                    page_text_parts.append(" ")
+            if not word_data:
+                pages_out.append({
+                    "page": pno + 1,
+                    "text": "",
+                    "start": offset,
+                    "end": offset,
+                })
+                continue
+
+            # Y좌표 (중심) 기준으로 정렬
+            word_data.sort(key=lambda wd: (0.5 * (wd[1] + wd[3]), wd[0]))
+
+            # 줄(row)로 그룹화
+            rows: List[List[Tuple[float, float, float, float, str]]] = []
+            current_row: List[Tuple[float, float, float, float, str]] = []
+            last_cy: Optional[float] = None
+
+            for wd in word_data:
+                x0, y0, x1, y1, txt = wd
+                cy = 0.5 * (y0 + y1)
+                if last_cy is None or abs(cy - last_cy) <= row_tol:
+                    current_row.append(wd)
+                else:
+                    if current_row:
+                        rows.append(current_row)
+                    current_row = [wd]
+                last_cy = cy
+
+            if current_row:
+                rows.append(current_row)
+
+            # 각 줄 내에서 X좌표로 정렬
+            for row in rows:
+                row.sort(key=lambda wd: wd[0])
+
+            page_start = offset
+            page_text_parts: List[str] = []
+            is_first_word_in_page = True
+
+            for row_idx, row in enumerate(rows):
+                # 줄 사이에 줄바꿈 삽입
+                if row_idx > 0:
+                    page_text_parts.append("\n")
                     char_index.append({"page": pno, "bbox": None})
-
-                    full_parts.append(" ")
+                    full_parts.append("\n")
                     offset += 1
 
-                bbox = (x0, y0, x1, y1)
+                is_first_word_in_row = True
 
-                page_text_parts.append(txt)
-                full_parts.append(txt)
+                for wd in row:
+                    x0, y0, x1, y1, txt = wd
 
-                # 부분 마스킹을 위해 "단어 bbox"를 문자 단위로 x축 분할하여 저장한다.
-                try:
-                    n = len(txt)
-                    wpx = max(0.0, float(x1) - float(x0))
-                    if n > 1 and wpx > 0.0 and n <= 128:
-                        cw = wpx / float(n)
-                        for i in range(n):
-                            bx0 = float(x0) + cw * i
-                            bx1 = float(x0) + cw * (i + 1)
-                            char_index.append({"page": pno, "bbox": (bx0, y0, bx1, y1)})
-                    else:
+                    # 같은 줄의 단어 사이에 공백 삽입
+                    if not is_first_word_in_row:
+                        page_text_parts.append(" ")
+                        char_index.append({"page": pno, "bbox": None})
+                        full_parts.append(" ")
+                        offset += 1
+
+                    bbox = (x0, y0, x1, y1)
+                    page_text_parts.append(txt)
+                    full_parts.append(txt)
+
+                    # 부분 마스킹을 위해 "단어 bbox"를 문자 단위로 x축 분할하여 저장한다.
+                    try:
+                        n = len(txt)
+                        wpx = max(0.0, float(x1) - float(x0))
+                        if n > 1 and wpx > 0.0 and n <= 128:
+                            cw = wpx / float(n)
+                            for i in range(n):
+                                bx0 = float(x0) + cw * i
+                                bx1 = float(x0) + cw * (i + 1)
+                                char_index.append({"page": pno, "bbox": (bx0, y0, bx1, y1)})
+                        else:
+                            for _ch in txt:
+                                char_index.append({"page": pno, "bbox": bbox})
+                    except Exception:
                         for _ch in txt:
                             char_index.append({"page": pno, "bbox": bbox})
-                except Exception:
-                    for _ch in txt:
-                        char_index.append({"page": pno, "bbox": bbox})
-                offset += len(txt)
+                    offset += len(txt)
+
+                    is_first_word_in_row = False
+                    is_first_word_in_page = False
 
             page_text = "".join(page_text_parts)
 
@@ -1634,6 +1694,7 @@ def extract_text_indexed(pdf_bytes: bytes) -> dict:
                 }
             )
 
+            # 페이지 사이에 줄바꿈 삽입
             full_parts.append("\n")
             char_index.append({"page": pno, "bbox": None})
             offset += 1

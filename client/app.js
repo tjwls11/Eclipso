@@ -241,17 +241,25 @@ function buildPagesFromExtractData(extractData, fallbackMd) {
       .filter((x) => x.trim().length > 0)
   }
 
-  // 2) 모듈이 pages를 여러 개 제공하는 경우
+  // 2) 모듈이 pages를 여러 개 제공하는 경우 (PDF의 경우 페이지별 텍스트)
   const p = Array.isArray(ed.pages) ? ed.pages : []
-  if (p.length > 1) {
+  if (p.length >= 1) {
     const pages = p
       .slice()
       .sort((a, b) => Number(a?.page || 0) - Number(b?.page || 0))
-      .map((it) => String(it?.text || ''))
-    // viewer는 markdown 렌더링이므로, 텍스트를 그대로 markdown으로 사용
-    return pages
-      .map((t) => (t.trim() ? t : ''))
-      .filter((x) => x.trim().length > 0)
+      .map((it) => {
+        const text = String(it?.text || '')
+        // 페이지 헤더 추가 (페이지 번호 표시)
+        const pageNum = it?.page || 0
+        if (text.trim()) {
+          return `**📄 페이지 ${pageNum}**\n\n${text}`
+        }
+        return ''
+      })
+    const filtered = pages.filter((x) => x.trim().length > 0)
+    if (filtered.length > 0) {
+      return filtered
+    }
   }
 
   // 3) 그 외(대부분 OLE/XML): markdown/full_text를 "가상 페이지"로 분할
@@ -277,13 +285,68 @@ function clearViewerSelection() {
   if (!viewer) return
   viewer.querySelectorAll('.pii-box[data-selected="1"]').forEach((el) => {
     el.removeAttribute('data-selected')
-    el.classList.remove(
-      'ring-4',
-      'ring-indigo-500/20',
-      'ring-offset-2',
-      'ring-offset-white'
-    )
+    // 빨간색 강조 스타일 제거
+    el.style.outline = ''
+    el.style.outlineOffset = ''
+    el.style.backgroundColor = ''
+    el.style.boxShadow = ''
   })
+}
+
+/**
+ * detection이 포함된 페이지 인덱스를 찾아 반환 (없으면 -1)
+ */
+function findPageForDetection(detection) {
+  if (!detection || !state.pages || state.pages.length <= 1) return -1
+
+  const text = String(detection.text || '').trim()
+  if (!text || text.length < 2) return -1
+
+  // 각 페이지에서 텍스트 검색
+  for (let i = 0; i < state.pages.length; i++) {
+    const pageContent = String(state.pages[i] || '')
+    if (pageContent.includes(text)) {
+      return i
+    }
+  }
+
+  // 정확한 매칭 실패 시 부분 매칭 시도 (공백/줄바꿈 무시)
+  const normalizedText = text.replace(/\s+/g, '')
+  for (let i = 0; i < state.pages.length; i++) {
+    const normalizedPage = String(state.pages[i] || '').replace(/\s+/g, '')
+    if (normalizedPage.includes(normalizedText)) {
+      return i
+    }
+  }
+
+  return -1
+}
+
+/**
+ * detection이 있는 페이지로 이동 후 선택 적용
+ */
+function navigateToAndSelectDetection(id) {
+  const detection = state.detectionById?.get(id)
+  if (!detection) return
+
+  const pageIdx = findPageForDetection(detection)
+
+  if (pageIdx >= 0 && pageIdx !== state.pageIndex) {
+    // 다른 페이지에 있으면 이동
+    state.pageIndex = pageIdx
+    state.selectedId = id
+    renderCurrentPage()
+
+    // 페이지 렌더링 후 선택 적용 (약간의 딜레이)
+    setTimeout(() => {
+      clearViewerSelection()
+      applyViewerSelection(id)
+    }, 50)
+  } else {
+    // 같은 페이지면 바로 선택
+    clearViewerSelection()
+    applyViewerSelection(id)
+  }
 }
 
 function applyViewerSelection(id) {
@@ -292,12 +355,12 @@ function applyViewerSelection(id) {
   const spans = viewer.querySelectorAll(`.pii-box[data-id="${CSS.escape(id)}"]`)
   spans.forEach((el) => {
     el.setAttribute('data-selected', '1')
-    el.classList.add(
-      'ring-4',
-      'ring-indigo-500/20',
-      'ring-offset-2',
-      'ring-offset-white'
-    )
+    // 빨간색 강조 + 애니메이션 효과
+    el.style.outline = '3px solid #ef4444'
+    el.style.outlineOffset = '2px'
+    el.style.backgroundColor = 'rgba(239, 68, 68, 0.15)'
+    el.style.boxShadow = '0 0 12px rgba(239, 68, 68, 0.5)'
+    el.style.borderRadius = '4px'
     el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   })
 }
@@ -514,7 +577,7 @@ function setupPsMaskModeButton() {
     const ps = String(state.maskingPolicy?.ps || '')
     const two = String(state.maskingPolicy?.ps_twochar || '')
     if (ps !== 'keep_first_char') return 'full'
-    if (two === 'mask_full') return 'keep_first_char_strict'
+    if (two === 'mask_full') return 'keep_first_char'
     return 'keep_first_char'
   }
 
@@ -526,7 +589,7 @@ function setupPsMaskModeButton() {
         ? '이름(PS) 마스킹: 전체'
         : m === 'keep_first_char'
         ? '이름(PS) 마스킹: 성만 남김'
-        : '이름(PS) 마스킹: 성만 남김(2글자 이름은 전체 마스킹)'
+        : '이름(PS) 마스킹: 성만 남김'
     btn.className =
       'ml-auto text-[11px] px-2 py-0.5 rounded-full border transition ' +
       (m !== 'full'
@@ -541,9 +604,6 @@ function setupPsMaskModeButton() {
     if (m === 'full') {
       state.maskingPolicy.ps = 'keep_first_char'
       delete state.maskingPolicy.ps_twochar
-    } else if (m === 'keep_first_char') {
-      state.maskingPolicy.ps = 'keep_first_char'
-      state.maskingPolicy.ps_twochar = 'mask_full'
     } else {
       delete state.maskingPolicy.ps
       delete state.maskingPolicy.ps_twochar
@@ -557,9 +617,15 @@ function setupPsMaskModeButton() {
 
 /** ---------- Markdown fallback ---------- */
 function fallbackMarkdownFromText(text) {
-  return escHtml(String(text || ''))
+  // NOTE:
+  // marked는 "라인 시작 공백 4개"를 코드블록으로 렌더링한다.
+  // 텍스트 추출 결과(특히 HWP)는 들여쓰기가 많아서, 하이라이트용 <span>이
+  // 코드블록 내부 "문자"로 보이는 문제가 생긴다.
+  // 따라서 라인 시작 공백은 &nbsp;로 바꿔 코드블록 해석을 막는다.
+  const s = escHtml(String(text || ''))
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
+  return s.replace(/^( +)/gm, (m, sp) => '&nbsp;'.repeat(sp.length))
 }
 
 /** ---------- Match / NER ---------- */
@@ -634,8 +700,9 @@ function ruleToKind(rule) {
   if (r.includes('email')) return '이메일'
   if (r.includes('passport')) return '여권번호'
   if (r.includes('driver')) return '운전면허번호'
-  if (r.includes('phone') || r.includes('tel') || r.includes('mobile'))
-    return '전화번호'
+  if (r.includes('phone_mobile') || r.includes('mobile')) return '휴대전화'
+  if (r.includes('phone_city') || r.includes('city')) return '지역전화'
+  if (r.includes('phone') || r.includes('tel')) return '전화번호'
   return String(rule)
 }
 
@@ -646,13 +713,15 @@ function makeId() {
   )
 }
 
-function buildDetections(matchData, nerItems, nerAllowLabels) {
+function buildDetections(matchData, nerItems, nerAllowLabels, fullText) {
   const out = []
   const allow = new Set(
     (nerAllowLabels || []).map((x) => String(x).toUpperCase())
   )
   const mdItems = Array.isArray(matchData?.items) ? matchData.items : []
   const ner = Array.isArray(nerItems) ? nerItems : []
+
+  const isHangul = (ch) => /[가-힣]/.test(String(ch || ''))
 
   for (const it of mdItems) {
     const id = makeId()
@@ -668,6 +737,7 @@ function buildDetections(matchData, nerItems, nerAllowLabels) {
       start: Number.isFinite(+it?.start) ? +it.start : null,
       end: Number.isFinite(+it?.end) ? +it.end : null,
       valid: it?.valid !== false,
+      fail_reason: it?.fail_reason || null,
       score: null,
     })
   }
@@ -676,15 +746,50 @@ function buildDetections(matchData, nerItems, nerAllowLabels) {
     const lab = String(it?.label || '').toUpperCase()
     if (!allow.has(lab)) continue
     const id = makeId()
+
+    let s0 = Number.isFinite(+it?.start) ? +it.start : null
+    let e0 = Number.isFinite(+it?.end) ? +it.end : null
+    let txt = String(it?.text ?? '')
+
+    // PS는 NER가 1글자(예: "남")만 찍는 경우가 있어,
+    // full_text에서 주변 한글 토큰으로 확장해 "실제 레닥션 범위"와 맞춘다.
+    if (
+      lab === 'PS' &&
+      typeof fullText === 'string' &&
+      fullText &&
+      Number.isFinite(s0) &&
+      Number.isFinite(e0) &&
+      e0 > s0
+    ) {
+      const n = fullText.length
+      let a = Math.max(0, Math.min(n, s0))
+      let b = Math.max(0, Math.min(n, e0))
+
+      // 왼쪽 확장
+      while (a > 0 && isHangul(fullText[a - 1])) a--
+      // 오른쪽 확장
+      while (b < n && isHangul(fullText[b])) b++
+
+      // 너무 길게 확장되는 경우는 오탐 가능성이 있어 제한
+      if (b > a && b - a <= 12) {
+        const ext = fullText.slice(a, b)
+        if (ext && ext.length >= txt.length) {
+          txt = ext
+          s0 = a
+          e0 = b
+        }
+      }
+    }
+
     out.push({
       id,
       source: 'ner',
       kind: null,
       label: lab,
       rule: null,
-      text: String(it?.text ?? ''),
-      start: Number.isFinite(+it?.start) ? +it.start : null,
-      end: Number.isFinite(+it?.end) ? +it.end : null,
+      text: txt,
+      start: s0,
+      end: e0,
       valid: true,
       score: typeof it?.score === 'number' ? it.score : null,
     })
@@ -705,7 +810,7 @@ function buildDetections(matchData, nerItems, nerAllowLabels) {
 function injectBoxesIntoMarkdown(md, detections) {
   let s = String(md || '')
   if (!s.trim() || !detections?.length) return s
-  if (s.includes('class="pii-box"')) return s
+  if (s.includes('<!--ECLIPSO_PII-->')) return s
 
   const escapeRegExp = (str) =>
     String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -776,7 +881,14 @@ function injectBoxesIntoMarkdown(md, detections) {
 
   for (const d of dets) {
     const needle = String(d?.text || '').trim()
-    if (!needle || needle.length < 2) continue
+    if (!needle) continue
+    if (needle.length < 2) {
+      // PS는 1글자(예: "남")도 표시되게 허용
+      if (
+        !(d?.source === 'ner' && String(d?.label || '').toUpperCase() === 'PS')
+      )
+        continue
+    }
     if (/^[A-Za-z]$/.test(needle)) continue
 
     let startAt = 0
@@ -846,7 +958,7 @@ function injectBoxesIntoMarkdown(md, detections) {
     s = s.replace(`__TAG_${i}__`, tag)
   })
 
-  return s
+  return `<!--ECLIPSO_PII-->${s}`
 }
 
 function filterDetectionsForViewer(detections) {
@@ -1491,8 +1603,7 @@ function renderMatchResults() {
       btn.addEventListener('click', () => {
         state.selectedId = d.id
         setActiveResultItem(d.id)
-        clearViewerSelection()
-        applyViewerSelection(d.id)
+        navigateToAndSelectDetection(d.id)
       })
       body.appendChild(btn)
     }
@@ -1532,8 +1643,7 @@ function renderNerResults() {
     tr.addEventListener('click', () => {
       state.selectedId = d.id
       setActiveResultItem(d.id)
-      clearViewerSelection()
-      applyViewerSelection(d.id)
+      navigateToAndSelectDetection(d.id)
     })
     rows.appendChild(tr)
   }
@@ -1618,42 +1728,140 @@ function computeScanStats({ matchData, nerItems, nerLabels, timings }) {
   let regex_ok = 0,
     regex_fail = 0
   const by_kind = {}
+  // FAIL 원인 집계: { "규칙명: 원인": count }
+  const fail_reasons = {}
+
+  // 민감정보 span 수집 (노출 비율 계산용)
+  const sensitiveSpans = []
+
   for (const it of mdItems) {
-    if (it?.valid) {
+    const isOk = it?.valid !== false
+    if (isOk) {
       regex_ok++
       const k = ruleToKind(it.rule)
       by_kind[k] = (by_kind[k] || 0) + 1
-    } else regex_fail++
+      // 유효한 span 수집
+      const s = Number(it?.start ?? -1)
+      const e = Number(it?.end ?? -1)
+      if (e > s && s >= 0) {
+        sensitiveSpans.push({ start: s, end: e })
+      }
+    } else {
+      regex_fail++
+      // FAIL 원인 집계
+      const rule = ruleToKind(it?.rule) || it?.rule || 'UNKNOWN'
+      const reason = it?.fail_reason || '검증 실패'
+      const key = `${rule}: ${reason}`
+      fail_reasons[key] = (fail_reasons[key] || 0) + 1
+    }
   }
 
   const by_label = {}
   const scores = []
   let nerAllowedCount = 0
+  let nerAllowedSpanCount = 0
   for (const it of ner) {
     const lab = String(it?.label || '').toUpperCase()
     if (!allow.has(lab)) continue
     nerAllowedCount++
     by_label[lab] = (by_label[lab] || 0) + 1
     if (typeof it?.score === 'number') scores.push(it.score)
+    // NER span도 수집
+    const s = Number(it?.start ?? -1)
+    const e = Number(it?.end ?? -1)
+    if (e > s && s >= 0) {
+      nerAllowedSpanCount++
+      sensitiveSpans.push({ start: s, end: e })
+    }
   }
 
-  // (기존 로직 유지) 점수는 지표일 뿐이니 대충: 정규식 OK 가중 + NER 허용 라벨 수 가중
-  const risk = Math.min(100, Math.round(regex_ok * 10 + nerAllowedCount * 2))
+  // ─────────────────────────────────────────────────────
+  // 전체 문서 대비 민감정보 노출 비율 계산
+  // ─────────────────────────────────────────────────────
+  const docText = state.extractedText || ''
+  const totalChars = docText.length
+
+  // span 병합 (겹치는 영역 제거)
+  const mergedSpans = mergeOverlappingSpans(sensitiveSpans)
+
+  // 민감정보가 차지하는 총 글자 수
+  let sensitiveChars = 0
+  for (const sp of mergedSpans) {
+    sensitiveChars += Math.min(sp.end, totalChars) - Math.max(sp.start, 0)
+  }
+
+  // 노출 비율 (%)
+  const exposureRatio = totalChars > 0 ? (sensitiveChars / totalChars) * 100 : 0
+
   const nerAvg = scores.length
     ? scores.reduce((a, b) => a + b, 0) / scores.length
     : null
 
+  // Unique(실제 표시/레닥션 가능한 span 기준): valid!=false + start/end 유효
+  const dets = Array.isArray(state.detections) ? state.detections : []
+  const detsSpan = dets.filter((d) => {
+    if (!d) return false
+    if (d.valid === false) return false
+    const s = Number(d.start ?? -1)
+    const e = Number(d.end ?? -1)
+    return e > s && s >= 0
+  })
+  const regexUnique = detsSpan.filter((d) => d.source === 'regex').length
+  const nerUnique = detsSpan.filter((d) => d.source === 'ner').length
+  const totalUnique = detsSpan.length
+
+  // Raw(중복 제거 전): 정규식 OK span + 허용된 NER span
+  const regexRawSpan = mdItems.filter((it) => {
+    if (it?.valid === false) return false
+    const s = Number(it?.start ?? -1)
+    const e = Number(it?.end ?? -1)
+    return e > s && s >= 0
+  }).length
+  const totalRaw = regexRawSpan + nerAllowedSpanCount
+
+  const overlapRate =
+    totalRaw > 0 ? Math.max(0, Math.min(100, ((totalRaw - totalUnique) / totalRaw) * 100)) : 0
+
   return {
-    risk_score: risk,
-    total_raw: mdItems.length + nerAllowedCount,
-    total_unique: Array.isArray(state.detections) ? state.detections.length : 0,
+    exposure_ratio: exposureRatio,
+    total_chars: totalChars,
+    sensitive_chars: sensitiveChars,
+    total_raw: totalRaw,
+    total_unique: totalUnique,
+    regex_unique: regexUnique,
+    ner_unique: nerUnique,
+    overlap_rate: overlapRate,
     regex_ok,
     regex_fail,
+    fail_reasons,
     by_kind,
     by_label,
     ner_avg: Score(nerAvg),
     timings: timings || {},
   }
+}
+
+// 겹치는 span 병합
+function mergeOverlappingSpans(spans) {
+  if (!spans || spans.length === 0) return []
+
+  // 시작점 기준 정렬
+  const sorted = [...spans].sort((a, b) => a.start - b.start)
+  const merged = [sorted[0]]
+
+  for (let i = 1; i < sorted.length; i++) {
+    const last = merged[merged.length - 1]
+    const curr = sorted[i]
+
+    if (curr.start <= last.end) {
+      // 겹치거나 붙어있으면 병합
+      last.end = Math.max(last.end, curr.end)
+    } else {
+      merged.push({ start: curr.start, end: curr.end })
+    }
+  }
+
+  return merged
 }
 
 function renderScanReport(stats) {
@@ -1662,13 +1870,55 @@ function renderScanReport(stats) {
   // stats 블록은 있어도 되고 없어도 됨(없으면 그냥 스킵)
   safeShow('stats-report-block', true)
 
-  safeText('stats-risk-score', stats.risk_score)
-  safeWidthPct('stats-risk-meter', `${stats.risk_score}%`)
+  // 민감정보 비율 표시
+  const ratio = stats.exposure_ratio || 0
+  safeText('stats-exposure-ratio', ratio.toFixed(2))
+
+  // 미터 (최대 10%를 100%로 스케일링)
+  const meterPct = Math.min(100, ratio * 10)
+  safeWidthPct('stats-exposure-meter', `${meterPct}%`)
+
+  // 노트 표시
+  const noteEl = byId('stats-exposure-note')
+  if (noteEl) {
+    const totalChars = stats.total_chars || 0
+    const sensitiveChars = stats.sensitive_chars || 0
+    if (totalChars > 0) {
+      noteEl.textContent = `${sensitiveChars.toLocaleString()}자 / ${totalChars.toLocaleString()}자`
+    } else {
+      noteEl.textContent = '전체 문서 대비 민감정보 글자 수'
+    }
+  }
+
   safeText('stats-total-unique', stats.total_unique)
   safeText('stats-total-raw', stats.total_raw)
+  safeText('stats-regex-unique', stats.regex_unique)
+  safeText('stats-ner-unique', stats.ner_unique)
+  safeText('stats-overlap-rate', `${Math.round(stats.overlap_rate || 0)}%`)
   safeText('stats-regex-ok', stats.regex_ok)
   safeText('stats-regex-fail', stats.regex_fail)
   safeText('stats-ner-avg', stats.ner_avg)
+
+  // FAIL 원인 표시
+  const failTopEl = byId('stats-fail-top')
+  if (failTopEl) {
+    const reasons = stats.fail_reasons || {}
+    const entries = Object.entries(reasons).sort((a, b) => b[1] - a[1])
+
+    if (entries.length === 0) {
+      failTopEl.innerHTML = '<span class="text-gray-400">-</span>'
+    } else {
+      failTopEl.innerHTML = entries
+        .map(
+          ([reason, count]) =>
+            `<div class="flex justify-between items-center py-1 border-b border-gray-100 last:border-0">
+              <span class="text-rose-600 text-[11px]">${escHtml(reason)}</span>
+              <span class="text-gray-500 font-mono text-[11px] ml-2">${count}</span>
+            </div>`
+        )
+        .join('')
+    }
+  }
 
   const kindBody = byId('stats-by-kind-rows')
   if (kindBody) {
@@ -1770,7 +2020,7 @@ function renderScanReport(stats) {
     }
   }
 
-  safeText('stats-json', JSON.stringify(stats, null, 2))
+  // JSON 패널 제거됨
 }
 
 /** ---------- Main: Scan ---------- */
@@ -1862,7 +2112,8 @@ async function doScan() {
     state.detections = buildDetections(
       state.matchData,
       state.nerItems,
-      state.nerLabels
+      state.nerLabels,
+      state.extractedText
     )
     state.detectionById = new Map(state.detections.map((d) => [d.id, d]))
 
@@ -1947,7 +2198,23 @@ async function doRedactAndDownload() {
 
     const rulesJson = safeJson(state.rules || [])
     const labelsJson = safeJson(state.nerLabels || [])
-    const entsJson = safeJson(state.nerItems || [])
+    const uiNerEntities = (
+      Array.isArray(state.detections) ? state.detections : []
+    )
+      .filter(
+        (d) =>
+          d?.source === 'ner' &&
+          Number.isFinite(+d?.start) &&
+          Number.isFinite(+d?.end)
+      )
+      .map((d) => ({
+        label: String(d?.label || '').toUpperCase(),
+        start: +d.start,
+        end: +d.end,
+        score: typeof d?.score === 'number' ? d.score : null,
+        text: String(d?.text ?? ''),
+      }))
+    const entsJson = safeJson(uiNerEntities)
     const maskingJson = safeJson(state.maskingPolicy || {})
 
     rulesJson && fd.append('rules_json', rulesJson)
@@ -2087,9 +2354,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $('#btn-scan')?.addEventListener('click', doScan)
   $('#btn-save-redacted')?.addEventListener('click', doRedactAndDownload)
-  $('#btn-stats-json-toggle')?.addEventListener('click', () =>
-    safeToggleHidden('stats-json')
-  )
+  // stats JSON 토글 제거됨
 
   // 문서 페이지 이동
   $('#btn-page-prev')?.addEventListener('click', () => {

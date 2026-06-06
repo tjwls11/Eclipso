@@ -18,7 +18,6 @@ from server.modules.xml_redaction import xml_redact_to_file
 router = APIRouter(prefix="/redact", tags=["redact"])
 
 _HANGUL_RE = re.compile(r"^[\uAC00-\uD7A3]+$")
-# 기본 ON (원하면 ECLIPSO_MASK_DEBUG=0 으로 끌 수 있음)
 _MASK_DEBUG = os.getenv("ECLIPSO_MASK_DEBUG", "1") not in ("0", "false", "FALSE", "off", "OFF")
 
 
@@ -150,6 +149,12 @@ def _apply_masking_policy_spans(
         if not m:
             return []
         cut = m.end()
+        # 하이픈/공백이 없는 번호(예: 01012345678, 021234567) 케이스
+        if re.fullmatch(r"\d+", seg or ""):
+            if (seg or "").startswith("02"):
+                cut = 2
+            elif (seg or "").startswith("0"):
+                cut = 3
         idxs: List[int] = []
         for i, ch in enumerate(seg or ""):
             if i >= cut and ch.isdigit():
@@ -176,18 +181,11 @@ def _apply_masking_policy_spans(
         seg = str(sp.get("text") or full_text[s:e])
 
         lab = str(sp.get("label") or "").upper()
-        # 일부 포맷(HWP 등)은 rule 필드가 없을 수 있어 label을 fallback으로 사용
         rule = str(sp.get("rule") or sp.get("label") or "").lower()
-        # NOTE: 부분 마스킹은 span을 "쪼개서" 필요한 부분만 레닥션하는 방식
 
         # --- PS: 성만 남기기 ---
         if lab == "PS" and ps_mode == "keep_first_char":
-            # 한글 글자 중 첫 글자만 남기고 나머지 한글만 마스킹(공백/구분자 유지)
             hangul_idxs = [i for i, ch in enumerate(seg) if _HANGUL_RE.fullmatch(ch or "")]
-            # 2글자 이름 정책(보수적 옵션): 2글자면 전체 마스킹
-            if len(hangul_idxs) == 2 and ps_twochar == "mask_full":
-                out.append(sp)
-                continue
             if len(hangul_idxs) <= 1:
                 out.append(sp)
                 continue
@@ -275,6 +273,11 @@ def _mask_text_for_hwp(rule_key: str, text: str, masking_policy: Optional[Dict[s
         if not m:
             return None
         cut = m.end()
+        if re.fullmatch(r"\d+", s):
+            if s.startswith("02"):
+                cut = 2
+            elif s.startswith("0"):
+                cut = 3
         out = []
         for i, ch in enumerate(s):
             if i >= cut and ch.isdigit():
@@ -297,11 +300,9 @@ def _mask_text_for_hwp(rule_key: str, text: str, masking_policy: Optional[Dict[s
                 out.append(ch)
         return "".join(out)
 
-    # 이름(PS): 첫 한글 글자만 유지(2글자 strict 옵션은 전체 마스킹)
+    # 이름(PS): 첫 한글 글자만 유지
     if rk == "ps" and str(pol.get("ps") or "") == "keep_first_char":
         hangul_pos = [i for i, ch in enumerate(s) if _HANGUL_RE.fullmatch(ch or "")]
-        if len(hangul_pos) == 2 and str(pol.get("ps_twochar") or "") == "mask_full":
-            return "".join("*" if ch != " " else " " for ch in s)
         if len(hangul_pos) <= 1:
             return None
         keep_i = hangul_pos[0]
@@ -814,8 +815,6 @@ async def redact_file(
                         print(f"[MASK][DEBUG] before_policy spans={len(enriched)} sample={enriched[:3]}")
                     except Exception:
                         pass
-                # HWP는 "문자열 치환" 방식이라 subspan(예: '1234')로 쪼개면 문서 전체 과마스킹이 발생할 수 있음.
-                # 따라서 전체 텍스트(old)를 기준으로 "부분 마스킹된 동일 길이 문자열(replace_text)"로 교체한다.
                 for sp in enriched:
                     if not isinstance(sp, dict):
                         continue
@@ -833,7 +832,11 @@ async def redact_file(
                     except Exception:
                         pass
 
-            out = hwp_module.redact(file_bytes, spans=enriched, masking_policy=masking_policy)
+            # hwp_module 구현 버전에 따라 masking_policy 인자를 받지 않을 수 있다.
+            try:
+                out = hwp_module.redact(file_bytes, spans=enriched, masking_policy=masking_policy)
+            except TypeError:
+                out = hwp_module.redact(file_bytes, spans=enriched)
             mime = "application/x-hwp"
 
         elif ext in (".doc", ".ppt", ".xls"):

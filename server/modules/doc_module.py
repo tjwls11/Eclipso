@@ -100,7 +100,6 @@ def decode_piece(chunk: bytes, fCompressed: bool) -> str:
         return ""
 
 
-
 # Word 텍스트 추출
 def extract_text(file_bytes: bytes) -> dict:
     try:
@@ -108,7 +107,6 @@ def extract_text(file_bytes: bytes) -> dict:
         if not word_data or not table_data:
             return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
 
-        # Word 본문
         clx = get_clx_data(word_data, table_data)
         plcpcd = extract_plcpcd(clx or b"")
         pieces = parse_plcpcd(plcpcd)
@@ -122,10 +120,9 @@ def extract_text(file_bytes: bytes) -> dict:
 
         raw_word_text = "".join(texts)
 
-
-        # Chart 텍스트 합치기
+        # Chart 텍스트 합치기 (탐지/리포트용)
         chart_texts = extract_chart_text(file_bytes)
-        print("=== [DEBUG] chart_texts ===", chart_texts)  #디버깅용
+        print("=== [DEBUG] chart_texts ===", chart_texts)
 
         if chart_texts:
             print(f"[INFO] extracted {len(chart_texts)} chart texts")
@@ -146,8 +143,6 @@ def extract_text(file_bytes: bytes) -> dict:
         return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
-
-
 # 탐지 span 보정(분리)
 def split_matches(matches, text):
     new_matches = []
@@ -165,7 +160,6 @@ def split_matches(matches, text):
         else:
             new_matches.append((s, e, val, meta))
     return new_matches
-
 
 
 def _mask_keep_rules(v: str) -> str:
@@ -210,7 +204,6 @@ def _mask_value(rule: str, v: str) -> str:
 
 # Word 본문 레닥션
 def replace_text(file_bytes: bytes, targets: list[tuple[int, int, str]], replacement_char: str = "*") -> bytes:
-
     try:
         word_data, table_data = read_streams(file_bytes)
         if not word_data or not table_data:
@@ -242,7 +235,6 @@ def replace_text(file_bytes: bytes, targets: list[tuple[int, int, str]], replace
                 byte_start = fc_base + (local_start - text_start) * bpc
                 byte_len = (local_end - local_start) * bpc
 
-                # repl_or_rule이 이미 마스킹된 텍스트인지 확인
                 seg = None
                 if isinstance(repl_or_rule, str) and len(repl_or_rule) >= (e - s):
                     try:
@@ -310,7 +302,6 @@ def _u64(buf: bytes, off: int) -> int:
 
 
 def _sect_off(sector: int, sector_size: int) -> int:
-    # OLE: sector 0 starts right after 512-byte header
     return (sector + 1) * sector_size
 
 
@@ -323,13 +314,12 @@ def _read_sector(data: bytes, sector: int, sector_size: int) -> bytes:
 
 
 def _iter_fat_chain(start_sector: int, fat: List[int], *, max_steps: int = 2_000_000):
-    # generator of sectors in the chain
     seen = set()
     s = int(start_sector)
     steps = 0
     while s not in (_ENDOFCHAIN, _FREESECT) and s >= 0 and s < len(fat):
         if s in seen:
-            break  # loop guard
+            break
         seen.add(s)
         yield s
         s = int(fat[s])
@@ -339,7 +329,6 @@ def _iter_fat_chain(start_sector: int, fat: List[int], *, max_steps: int = 2_000
 
 
 def _collect_fat_sectors(data: bytes, sector_size: int) -> List[int]:
-    # DIFAT header entries: 109 * 4 bytes starting at 0x4C
     fat_sectors: List[int] = []
     for i in range(109):
         v = _u32(data, 0x4C + i * 4)
@@ -395,7 +384,6 @@ def _read_stream_from_chain(data: bytes, sector_size: int, fat: List[int], start
 
 
 def _find_dir_entry(data: bytes, sector_size: int, fat: List[int], name: str) -> Optional[Tuple[int, int]]:
-    # returns (start_sector, size) for a stream
     dir_start = _u32(data, 0x30)
     if dir_start in (_FREESECT, _ENDOFCHAIN):
         return None
@@ -414,7 +402,6 @@ def _find_dir_entry(data: bytes, sector_size: int, fat: List[int], name: str) ->
             nm = ent[: name_len - 2].decode("utf-16le", errors="ignore").rstrip("\x00")
             if nm != target:
                 continue
-            # stream start sector + size
             start_sector = _u32(ent, 116)
             size = _u64(ent, 120)
             return int(start_sector), int(size)
@@ -458,20 +445,64 @@ def _overwrite_stream_in_ole(original_file_bytes: bytes, stream_name: str, new_s
         pos += take
 
     if pos != stream_size:
-        # chain shorter than expected
         return original_file_bytes
 
     return bytes(out)
 
 
 def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
-
     try:
         return _overwrite_stream_in_ole(original_file_bytes, "WordDocument", new_word_data)
     except Exception as e:
         print(f"[ERR] OLE overwrite 중 오류: {e}")
         return original_file_bytes
 
+
+def _normalize_spans_no_overlap(spans: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    """
+    spans를 (start asc, end desc)로 정렬 후,
+    앞에서부터 겹치는 구간은 잘라내서(clipping) 중복 치환/교차 치환을 방지한다.
+    """
+    clean: List[Dict[str, Any]] = []
+    tmp: List[Dict[str, Any]] = []
+    for sp in spans or []:
+        if not isinstance(sp, dict):
+            continue
+        s = sp.get("start")
+        e = sp.get("end")
+        if s is None or e is None:
+            continue
+        try:
+            s = int(s)
+            e = int(e)
+        except Exception:
+            continue
+        s = max(0, min(n, s))
+        e = max(0, min(n, e))
+        if e <= s:
+            continue
+        d = dict(sp)
+        d["start"] = s
+        d["end"] = e
+        tmp.append(d)
+
+    tmp.sort(key=lambda x: (int(x["start"]), -int(x["end"])))
+
+    last_end = 0
+    for sp in tmp:
+        s = int(sp["start"])
+        e = int(sp["end"])
+        if s < last_end:
+            s = last_end
+        if e <= s:
+            continue
+        sp2 = dict(sp)
+        sp2["start"] = s
+        sp2["end"] = e
+        clean.append(sp2)
+        last_end = max(last_end, e)
+
+    return clean
 
 
 def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
@@ -482,41 +513,15 @@ def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]
             return file_bytes
 
         norm_text, index_map = normalization_index(raw_text)
+
         def _mask_except_hyphen(seg: str) -> str:
             return "".join("-" if ch == "-" else "*" for ch in (seg or ""))
 
-        matches = []
-        
-        # 1) spans가 있으면 파싱해서 사용
-        if spans and isinstance(spans, list):
-            n = len(norm_text)
-            for sp in spans:
-                if not isinstance(sp, dict):
-                    continue
-                s = sp.get("start")
-                e = sp.get("end")
-                if s is None or e is None:
-                    continue
-                try:
-                    s = int(s)
-                    e = int(e)
-                except Exception:
-                    continue
-                s = max(0, min(n, s))
-                e = max(0, min(n, e))
-                if e <= s:
-                    continue
-                matches.append((s, e, norm_text[s:e], "SPAN"))
-        
-        # 2) spans가 없으면 내부 탐지
-        if not matches:
-            matches = find_sensitive_spans(norm_text)
-            matches = split_matches(matches, norm_text)
-
-        targets = []
+        # index_map: norm_idx -> raw_idx
         def _map_pos(idx: int) -> Optional[int]:
             if idx in index_map:
                 return index_map[idx]
+            # fallback: 가까운 매핑(근사) - 없으면 None
             j = idx
             while j >= 0 and j not in index_map:
                 j -= 1
@@ -529,55 +534,130 @@ def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]
                 return index_map[j]
             return None
 
-        for s, e, val, _ in matches:
-            if not isinstance(s, int) or not isinstance(e, int) or e <= s:
-                continue
-            start = _map_pos(s)
-            end0 = _map_pos(e - 1)
-            if start is None or end0 is None:
-                continue
-            end = end0 + 1
-            if end <= start:
-                end = start + max(1, (e - s))
-            # 내부 탐지는 전체 마스킹(하이픈 보존)
-            repl = _mask_except_hyphen(val)
-            targets.append((start, end, repl))
+        targets: List[Tuple[int, int, str]] = []
 
-        # spans가 주어지면(= file_redact_api에서 선택된 항목만 전달) 그 범위만 레닥션한다.
+        def _targets_from_norm_span(s: int, e: int, repl_norm: str) -> List[Tuple[int, int, str]]:
+            """
+            normalized span [s,e) -> raw index targets.
+            normalization 과정에서 제거/압축된 문자(예: 연속 공백, trailing space 등)가 raw에 존재하면
+            단순히 start/end를 endpoint로 매핑하면 raw 범위가 과도하게 넓어질 수 있다.
+            따라서 norm 인덱스를 raw 인덱스로 하나씩 매핑해 '연속 raw 구간'으로 쪼개서 targets를 만든다.
+            """
+            if e <= s:
+                return []
+            out: List[Tuple[int, int, str]] = []
+
+            run_raw_start: Optional[int] = None
+            run_raw_last: Optional[int] = None
+            run_norm_start: Optional[int] = None
+            run_norm_last: Optional[int] = None  # inclusive
+
+            for p in range(s, e):
+                raw_p = index_map.get(p)
+                if raw_p is None:
+                    # 매핑이 없으면 run을 끊는다.
+                    if run_raw_start is not None and run_raw_last is not None and run_norm_start is not None and run_norm_last is not None:
+                        rs = run_raw_start
+                        re = run_raw_last + 1
+                        ns0 = run_norm_start - s
+                        ns1 = run_norm_last - s + 1
+                        seg = repl_norm[ns0:ns1]
+                        if seg and (re > rs) and (len(seg) == (re - rs)):
+                            out.append((rs, re, seg))
+                    run_raw_start = run_raw_last = run_norm_start = run_norm_last = None
+                    continue
+
+                if run_raw_start is None:
+                    run_raw_start = raw_p
+                    run_raw_last = raw_p
+                    run_norm_start = p
+                    run_norm_last = p
+                    continue
+
+                # NFKC 등으로 여러 norm idx가 같은 raw idx로 매핑될 수 있음 → 중복은 스킵
+                if run_raw_last is not None and raw_p <= run_raw_last:
+                    # run을 끊고 새로 시작 (같은 raw를 두 번 마스킹할 수는 없음)
+                    if run_raw_start is not None and run_raw_last is not None and run_norm_start is not None and run_norm_last is not None:
+                        rs = run_raw_start
+                        re = run_raw_last + 1
+                        ns0 = run_norm_start - s
+                        ns1 = run_norm_last - s + 1
+                        seg = repl_norm[ns0:ns1]
+                        if seg and (re > rs) and (len(seg) == (re - rs)):
+                            out.append((rs, re, seg))
+                    run_raw_start = raw_p
+                    run_raw_last = raw_p
+                    run_norm_start = p
+                    run_norm_last = p
+                    continue
+
+                if raw_p == (run_raw_last + 1):
+                    run_raw_last = raw_p
+                    run_norm_last = p
+                else:
+                    # raw가 끊긴다(= normalization에서 제거된 문자가 raw에 끼어있는 케이스)
+                    if run_raw_start is not None and run_raw_last is not None and run_norm_start is not None and run_norm_last is not None:
+                        rs = run_raw_start
+                        re = run_raw_last + 1
+                        ns0 = run_norm_start - s
+                        ns1 = run_norm_last - s + 1
+                        seg = repl_norm[ns0:ns1]
+                        if seg and (re > rs) and (len(seg) == (re - rs)):
+                            out.append((rs, re, seg))
+                    run_raw_start = raw_p
+                    run_raw_last = raw_p
+                    run_norm_start = p
+                    run_norm_last = p
+
+            # flush
+            if run_raw_start is not None and run_raw_last is not None and run_norm_start is not None and run_norm_last is not None:
+                rs = run_raw_start
+                re = run_raw_last + 1
+                ns0 = run_norm_start - s
+                ns1 = run_norm_last - s + 1
+                seg = repl_norm[ns0:ns1]
+                if seg and (re > rs) and (len(seg) == (re - rs)):
+                    out.append((rs, re, seg))
+
+            return out
+
+        #  spans가 주어지면: "그 spans만" 딱 1번만 처리 (중복 targets 제거)
         if spans and isinstance(spans, list):
-            n = len(norm_text)
-            for sp in spans:
-                if not isinstance(sp, dict):
-                    continue
-                s = sp.get("start")
-                e = sp.get("end")
-                if s is None or e is None:
-                    continue
-                try:
-                    s = int(s)
-                    e = int(e)
-                except Exception:
-                    continue
-                s = max(0, min(n, s))
-                e = max(0, min(n, e))
+            ss = _normalize_spans_no_overlap(spans, n=len(norm_text))
+
+            for sp in ss:
+                s = int(sp["start"])
+                e = int(sp["end"])
                 if e <= s:
                     continue
 
-                start = _map_pos(s)
-                end0 = _map_pos(e - 1)
-                if start is None or end0 is None:
-                    continue
-                end = end0 + 1
-
                 seg = norm_text[s:e]
                 rt = sp.get("replace_text")
-                if isinstance(rt, str) and rt and len(rt) == len(seg):
-                    repl = rt
-                else:
-                    repl = _mask_except_hyphen(seg)
 
-                targets.append((start, end, repl))
-        return replace_text(file_bytes, targets)
+                if isinstance(rt, str) and rt and len(rt) == len(seg):
+                    repl_norm = rt
+                else:
+                    repl_norm = _mask_except_hyphen(seg)
+
+                targets.extend(_targets_from_norm_span(s, e, repl_norm))
+
+            if targets:
+                return replace_text(file_bytes, targets)
+            return file_bytes
+
+        #  spans가 없으면: 내부 탐지(기존 동작)
+        matches = find_sensitive_spans(norm_text)
+        matches = split_matches(matches, norm_text)
+
+        for s, e, val, _meta in matches:
+            if not isinstance(s, int) or not isinstance(e, int) or e <= s:
+                continue
+            repl_norm = _mask_except_hyphen(val)
+            targets.extend(_targets_from_norm_span(s, e, repl_norm))
+
+        if targets:
+            return replace_text(file_bytes, targets)
+        return file_bytes
 
     except Exception as e:
         print(f"[ERR] WordDocument 레닥션 중 예외: {e}")

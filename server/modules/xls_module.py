@@ -978,7 +978,7 @@ def redact_xlucs(text: str, extra_literals: Optional[List[Any]] = None) -> str:
                 raw_lit, masked = lit
             else:
                 raw_lit = lit
-                masked = mask_except_hypen(raw_lit)
+                masked = mask_except_hypen_at(raw_lit)
             if not raw_lit or raw_lit not in text:
                 continue
             # 뒤에서부터 치환(인덱스 안정)

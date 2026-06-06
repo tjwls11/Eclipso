@@ -50,7 +50,11 @@ _ZW_CHARS = r"\u200B\u200C\u200D\uFEFF"
 
 _RE_MASTER_LEVEL = re.compile(
     r"^(?:[•·\*\-\–\—◦●○◆◇▪▫▶▷■□]+\s*)?"
-    r"(?:첫|두|둘|세|셋|네|넷|다섯|여섯|일곱|여덟|아홉|열|[0-9]+)\s*(?:번째)?\s*수준\s*$",
+    r"(?:"
+    r"(?:첫째|둘째|셋째|넷째|다섯째|여섯째|일곱째|여덟째|아홉째|열째)"
+    r"|"
+    r"(?:첫|두|둘|세|셋|네|넷|다섯|여섯|일곱|여덟|아홉|열|[0-9]+)\s*(?:번째)?"
+    r")\s*수준\s*$",
     re.IGNORECASE,
 )
 _RE_BULLET_ONLY = re.compile(r"^[\*\u2022•·\-\–\—○●◦■□]+$", re.IGNORECASE)
@@ -76,6 +80,8 @@ def _is_noise_line(line: str) -> bool:
     if _RE_MASTER_LEVEL.match(line):
         return True
     if _RE_BULLET_ONLY.match(line):
+        return True
+    if line in ("‹#›", "<#>", "〈#〉", "《#》", "【#】"):
         return True
 
     return False
@@ -401,9 +407,9 @@ def build_image_loc_summary(file_bytes: bytes) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "found": bool(has_pics and pics_len > 0),
         "dgg": bool(has_doc),
-        "dgg_note": "(정확하지 않음) 스트림 존재 기반",
+        "dgg_note": "스트림 존재 기반",
         "bstore": bool(has_pics),
-        "bstore_note": "(정확하지 않음) 스트림 존재 기반",
+        "bstore_note": "스트림 존재 기반",
         "images": 0,
         "patched": 0,
         "pictures_len": pics_len,

@@ -487,40 +487,49 @@ async def extract_text(file: UploadFile):
                             )
 
             else:
-                imgs = extract_images_any(raw_bytes, filename, max_images=max_images)
+                # HWP/PPTX 파일은 이미지 추출/OCR 처리 생략 (텍스트만 표시)
+                skip_image_exts = (".hwp", ".hwpx", ".pptx", ".ppt")
+                skip_images = filename.endswith(skip_image_exts)
+                
                 base_md = str((data or {}).get("markdown") or "")
                 if base_md.strip():
                     pages_view.append(base_md)
-                for i, it in enumerate(imgs, start=1):
-                    uri = it.get("data_uri")
-                    if not uri:
-                        continue
-                    name = str(it.get("name") or f"image_{i}")
-                    anns = ""
-                    dbg = ""
-                    try:
-                        b = it.get("_bytes")
-                        if isinstance(b, (bytes, bytearray)):
-                            anns, dbg = _anns_for_image_bytes(bytes(b))
-                        else:
-                            raw = _bytes_from_data_uri(uri)
-                            if raw:
-                                anns, dbg = _anns_for_image_bytes(raw)
-                            else:
-                                dbg = "no-bytes"
-                    except Exception as e:
+                
+                # 이미지 추출 제외 대상이 아닌 경우에만 이미지 추출/표시
+                if not skip_images:
+                    imgs = extract_images_any(raw_bytes, filename, max_images=max_images)
+                    for i, it in enumerate(imgs, start=1):
+                        uri = it.get("data_uri")
+                        if not uri:
+                            continue
+                        name = str(it.get("name") or f"image_{i}")
                         anns = ""
-                        dbg = f"exc:{repr(e)}"
-                    pages_view.append(
-                        (
-                            f'**Image {i} · {name}**\n\n<img src="{uri}" alt="{name}" loading="lazy" '
-                            f'data-eclipso="image" data-eclipso-name="{name}" data-eclipso-anns="{anns}" data-eclipso-anns-debug="{dbg}" />'
+                        dbg = ""
+                        try:
+                            b = it.get("_bytes")
+                            if isinstance(b, (bytes, bytearray)):
+                                anns, dbg = _anns_for_image_bytes(bytes(b))
+                            else:
+                                raw = _bytes_from_data_uri(uri)
+                                if raw:
+                                    anns, dbg = _anns_for_image_bytes(raw)
+                                else:
+                                    dbg = "no-bytes"
+                        except Exception as e:
+                            anns = ""
+                            dbg = f"exc:{repr(e)}"
+                        pages_view.append(
+                            (
+                                f'**Image {i} · {name}**\n\n<img src="{uri}" alt="{name}" loading="lazy" '
+                                f'data-eclipso="image" data-eclipso-name="{name}" data-eclipso-anns="{anns}" data-eclipso-anns-debug="{dbg}" />'
+                            )
                         )
-                    )
 
             if isinstance(data, dict) and pages_view:
                 data["pages_view"] = pages_view
-                data["has_images"] = True
+                # HWP/PPTX 파일은 이미지가 없으므로 has_images = False
+                skip_image_exts_check = (".hwp", ".hwpx", ".pptx", ".ppt")
+                data["has_images"] = not filename.endswith(skip_image_exts_check)
             elif isinstance(data, dict):
                 data["pages_view"] = [str(data.get("markdown") or "")]
                 data["has_images"] = False
