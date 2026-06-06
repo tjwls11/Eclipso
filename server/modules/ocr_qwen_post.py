@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, TYPE_CHECKING
 import json
 import logging
 
 try:
-    from ollama import Client  # type: ignore
-    from ollama._types import ResponseError  # type: ignore
+    from ollama import Client as OllamaClient  # type: ignore
+    from ollama._types import ResponseError as OllamaResponseError  # type: ignore
 except Exception:  # pragma: no cover
-    Client = None  # type: ignore
-    ResponseError = Exception  # type: ignore
+    OllamaClient = None  # type: ignore
+    OllamaResponseError = Exception  # type: ignore
+
+if TYPE_CHECKING:
+    from ollama import Client as OllamaClientType  # type: ignore
+else:
+    OllamaClientType = Any
 
 
 log = logging.getLogger(__name__)
@@ -17,14 +22,14 @@ log = logging.getLogger(__name__)
 QWEN_MODEL = "qwen2.5vl:3b"
 OLLAMA_HOST = "http://localhost:11434"
 
-_client: Client | None = None
+_client: OllamaClientType | None = None
 
-def _get_client() -> Client:
+def _get_client() -> OllamaClientType:
     global _client
-    if Client is None:
+    if OllamaClient is None:
         raise RuntimeError("ollama is not installed")
     if _client is None:
-        _client = Client(host=OLLAMA_HOST)
+        _client = OllamaClient(host=OLLAMA_HOST)
     return _client
 
 
@@ -71,7 +76,7 @@ def classify_blocks_with_qwen(
         print("[OCR_QWEN] start blocks=0 -> return []", flush=True)
         return []
 
-    if Client is None:
+    if OllamaClient is None:
         # LLM 미설치 환경: 그대로 반환(서버 import 실패 방지)
         enriched: List[Dict[str, Any]] = []
         for blk in blocks:
@@ -139,7 +144,7 @@ def classify_blocks_with_qwen(
             messages=[{"role": "user", "content": prompt}],
             format="json",
         )
-    except ResponseError as e:
+    except OllamaResponseError as e:
         print(f"[OCR_QWEN] classify failed (ResponseError): {e}", flush=True)
         enriched: List[Dict[str, Any]] = []
         for blk in blocks:
