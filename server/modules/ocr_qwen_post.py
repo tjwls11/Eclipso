@@ -4,8 +4,12 @@ from typing import List, Dict, Any
 import json
 import logging
 
-from ollama import Client
-from ollama._types import ResponseError
+try:
+    from ollama import Client  # type: ignore
+    from ollama._types import ResponseError  # type: ignore
+except Exception:  # pragma: no cover
+    Client = None  # type: ignore
+    ResponseError = Exception  # type: ignore
 
 
 log = logging.getLogger(__name__)
@@ -15,17 +19,16 @@ OLLAMA_HOST = "http://localhost:11434"
 
 _client: Client | None = None
 
-
 def _get_client() -> Client:
-    # Ollama Client 1개 재사용
     global _client
+    if Client is None:
+        raise RuntimeError("ollama is not installed")
     if _client is None:
         _client = Client(host=OLLAMA_HOST)
     return _client
 
 
 def _select_candidates_for_llm(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # LLM 분류 대상으로 보낼 후보 블록만 필터링
     candidates: List[Dict[str, Any]] = []
 
     for idx, blk in enumerate(blocks):
@@ -46,6 +49,7 @@ def _select_candidates_for_llm(blocks: List[Dict[str, Any]]) -> List[Dict[str, A
         candidates.append(item)
 
     if len(candidates) > 40:
+
         def score(b: Dict[str, Any]) -> float:
             t = b["_llm_text"]
             digits = sum(ch.isdigit() for ch in t)
@@ -60,9 +64,22 @@ def _select_candidates_for_llm(blocks: List[Dict[str, Any]]) -> List[Dict[str, A
 def classify_blocks_with_qwen(
     blocks: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    # OCR blocks를 kind/normalized로 분류해 붙여서 반환
+    import time
+    from collections import Counter
+
     if not blocks:
+        print("[OCR_QWEN] start blocks=0 -> return []", flush=True)
         return []
+
+    if Client is None:
+        # LLM 미설치 환경: 그대로 반환(서버 import 실패 방지)
+        enriched: List[Dict[str, Any]] = []
+        for blk in blocks:
+            merged = dict(blk)
+            merged.setdefault("kind", "none")
+            merged.setdefault("normalized", merged.get("text", ""))
+            enriched.append(merged)
+        return enriched
 
     candidates = _select_candidates_for_llm(blocks)
     if not candidates:
@@ -72,6 +89,8 @@ def classify_blocks_with_qwen(
             merged.setdefault("kind", "none")
             merged.setdefault("normalized", merged.get("text", ""))
             enriched.append(merged)
+
+        print(f"[OCR_QWEN] no candidates -> return enriched blocks={len(enriched)}", flush=True)
         return enriched
 
     prompt_lines = [
@@ -105,6 +124,13 @@ def classify_blocks_with_qwen(
 
     prompt = "\n".join(prompt_lines)
 
+    t0 = time.perf_counter()
+    print(
+        f"[OCR_QWEN] start host={OLLAMA_HOST} model={QWEN_MODEL} "
+        f"blocks={len(blocks)} candidates={len(candidates)}",
+        flush=True,
+    )
+
     client = _get_client()
 
     try:
@@ -114,8 +140,16 @@ def classify_blocks_with_qwen(
             format="json",
         )
     except ResponseError as e:
-        log.error("Qwen classify failed: %s", e)
-        print(f"[OCR_QWEN] classify failed: {e}")
+        print(f"[OCR_QWEN] classify failed (ResponseError): {e}", flush=True)
+        enriched: List[Dict[str, Any]] = []
+        for blk in blocks:
+            merged = dict(blk)
+            merged.setdefault("kind", "none")
+            merged.setdefault("normalized", merged.get("text", ""))
+            enriched.append(merged)
+        return enriched
+    except Exception as e:
+        print(f"[OCR_QWEN] classify failed (Exception): {e}", flush=True)
         enriched: List[Dict[str, Any]] = []
         for blk in blocks:
             merged = dict(blk)
@@ -124,11 +158,16 @@ def classify_blocks_with_qwen(
             enriched.append(merged)
         return enriched
 
-    content = response["message"]["content"]
-    data = json.loads(content) if isinstance(content, str) else content
-    items = data.get("items", []) or []
+    content = response.get("message", {}).get("content")
+    try:
+        data = json.loads(content) if isinstance(content, str) else content
+    except Exception as e:
+        print(f"[OCR_QWEN] invalid json from model: {e}", flush=True)
+        data = {"items": []}
 
+    items = data.get("items", []) if isinstance(data, dict) else []
     tmp_map: Dict[int, Dict[str, Any]] = {}
+
     for it in items:
         try:
             idx = int(it.get("index", -1))
@@ -160,5 +199,9 @@ def classify_blocks_with_qwen(
         merged["kind"] = kind
         merged["normalized"] = normalized
         enriched.append(merged)
+
+    dt_ms = int((time.perf_counter() - t0) * 1000)
+    kinds = Counter((b.get("kind") or "none") for b in enriched)
+    print(f"[OCR_QWEN] done ms={dt_ms} kind_counts={dict(kinds)}", flush=True)
 
     return enriched

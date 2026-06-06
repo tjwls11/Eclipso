@@ -1,6 +1,6 @@
 from __future__ import annotations
 import io, zipfile
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 import logging
 import inspect
 import os
@@ -31,6 +31,241 @@ from server.core.schemas import XmlMatch, XmlLocation
 log = logging.getLogger("xml_redaction")
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
+
+def _escape_html(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _cell_to_html(cell: str) -> str:
+    s = (cell or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _escape_html(s).replace("\n", "<br/>")
+
+
+def _rows_to_html_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    w = max((len(r) for r in rows), default=0)
+    rect = [list(r) + [""] * (w - len(r)) for r in rows]
+    out: List[str] = []
+    out.append("<table>")
+    out.append("<tbody>")
+    for r in rect:
+        out.append("<tr>")
+        for c in r:
+            out.append(f"<td>{_cell_to_html(c)}</td>")
+        out.append("</tr>")
+    out.append("</tbody>")
+    out.append("</table>")
+    return "\n".join(out)
+
+
+def _col_letters_to_index(col: str) -> int:
+    # A->1, B->2, ..., Z->26, AA->27 ...
+    col = (col or "").strip().upper()
+    n = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+_CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _parse_cell_ref(a1: str) -> Optional[Tuple[int, int]]:
+    m = _CELL_REF_RE.match((a1 or "").strip())
+    if not m:
+        return None
+    c = _col_letters_to_index(m.group(1))
+    try:
+        r = int(m.group(2))
+    except Exception:
+        return None
+    if r <= 0 or c <= 0:
+        return None
+    return r, c
+
+
+def _read_shared_strings(zipf: zipfile.ZipFile) -> List[str]:
+    # sharedStrings.xml은 inline richtext를 포함할 수 있으므로 <si> 단위로 안전하게 파싱
+    try:
+        xml_bytes = zipf.read("xl/sharedStrings.xml")
+    except KeyError:
+        return []
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        try:
+            root = ET.fromstring(xml_bytes.decode("utf-8", "ignore").encode("utf-8"))
+        except Exception:
+            return []
+
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}", 1)[0] + "}"
+
+    out: List[str] = []
+    for si in root.findall(f".//{ns}si"):
+        # si 안의 모든 t를 이어 붙임 (rich text 대응)
+        parts: List[str] = []
+        for t in si.findall(f".//{ns}t"):
+            if t.text:
+                parts.append(t.text)
+        out.append("".join(parts))
+    return out
+
+
+def _parse_sheet_name_map(zipf: zipfile.ZipFile) -> Dict[str, str]:
+    """
+    worksheet 파일명(sheet1.xml 등) -> 표시용 시트명 매핑을 만든다.
+    실패해도 최소한 sheetN.xml 자체를 이름으로 사용 가능.
+    """
+    # rId -> Target(worksheets/sheet1.xml) 매핑
+    rid_to_target: Dict[str, str] = {}
+    try:
+        rel_bytes = zipf.read("xl/_rels/workbook.xml.rels")
+        rel_root = ET.fromstring(rel_bytes)
+        for rel in rel_root.findall(".//{*}Relationship"):
+            rid = rel.attrib.get("Id") or rel.attrib.get("id")
+            target = rel.attrib.get("Target") or rel.attrib.get("target")
+            if not rid or not target:
+                continue
+            rid_to_target[str(rid)] = str(target).replace("\\", "/")
+    except Exception:
+        rid_to_target = {}
+
+    sheetfile_to_name: Dict[str, str] = {}
+    try:
+        wb_bytes = zipf.read("xl/workbook.xml")
+        wb_root = ET.fromstring(wb_bytes)
+        sheets = wb_root.findall(".//{*}sheet")
+        for sh in sheets:
+            name = sh.attrib.get("name") or sh.attrib.get("Name") or ""
+            rid = sh.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id") or sh.attrib.get("r:id")
+            target = rid_to_target.get(str(rid)) if rid else None
+            if not target:
+                continue
+            # target은 보통 "worksheets/sheet1.xml"
+            if target.startswith("/"):
+                target = target[1:]
+            if not target.startswith("xl/"):
+                target = "xl/" + target
+            # 파일명만 뽑아서 key로 둠
+            sheetfile = target.split("/")[-1]
+            if sheetfile:
+                sheetfile_to_name[sheetfile] = name or sheetfile
+    except Exception:
+        return sheetfile_to_name
+
+    return sheetfile_to_name
+
+
+def extract_markdown_tables_from_xlsx(
+    file_bytes: bytes,
+    *,
+    max_rows: int = 200,
+    max_cols: int = 50,
+) -> str:
+    """
+    XLSX를 (Sheet별) HTML <table>로 만든 문자열을 반환.
+    UI는 markdown을 그대로 렌더링하므로, XLS 모듈과 동일한 방식(HTML table)을 쓴다.
+    """
+    try:
+        zipf = zipfile.ZipFile(io.BytesIO(file_bytes), "r")
+    except Exception:
+        return ""
+
+    with zipf:
+        sst = _read_shared_strings(zipf)
+        name_map = _parse_sheet_name_map(zipf)
+
+        sheet_files = sorted(
+            [n for n in zipf.namelist() if n.startswith("xl/worksheets/") and n.endswith(".xml")]
+        )
+
+        out_blocks: List[str] = []
+        for path in sheet_files:
+            fname = path.split("/")[-1]
+            sheet_name = name_map.get(fname, fname)
+
+            try:
+                xml_bytes = zipf.read(path)
+                root = ET.fromstring(xml_bytes)
+            except Exception:
+                continue
+
+            cells: Dict[int, Dict[int, str]] = {}
+            max_r = 0
+            max_c = 0
+
+            for c in root.findall(".//{*}c"):
+                a1 = c.attrib.get("r") or c.attrib.get("R")
+                pos = _parse_cell_ref(a1 or "")
+                if not pos:
+                    continue
+                r, col = pos
+                if r > max_rows or col > max_cols:
+                    continue
+
+                t = (c.attrib.get("t") or "").strip().lower()
+
+                # 값 추출: <v>, inlineStr(<is><t>)
+                v_text = ""
+                v_el = c.find("{*}v")
+                if v_el is not None and v_el.text is not None:
+                    v_text = v_el.text
+
+                if t == "s":
+                    # shared string
+                    try:
+                        idx = int((v_text or "").strip() or "-1")
+                    except Exception:
+                        idx = -1
+                    val = sst[idx] if 0 <= idx < len(sst) else ""
+                elif t == "inlineStr":
+                    parts: List[str] = []
+                    for t_el in c.findall(".//{*}is/{*}t"):
+                        if t_el.text:
+                            parts.append(t_el.text)
+                    val = "".join(parts)
+                elif t == "b":
+                    val = "TRUE" if (v_text or "").strip() == "1" else "FALSE"
+                else:
+                    val = (v_text or "").strip()
+
+                val = cleanup_text_keep_tabs(val) if "cleanup_text_keep_tabs" in globals() else cleanup_text(val)
+                if not val:
+                    continue
+
+                cells.setdefault(r, {})[col] = val
+                max_r = max(max_r, r)
+                max_c = max(max_c, col)
+
+            if not cells:
+                continue
+
+            rows: List[List[str]] = []
+            for rr in range(1, max_r + 1):
+                row = [cells.get(rr, {}).get(cc, "") for cc in range(1, max_c + 1)]
+                if any(x.strip() for x in row):
+                    rows.append(row)
+
+            if not rows:
+                continue
+
+            out_blocks.append(f"**Sheet: {_escape_html(sheet_name)}**")
+            out_blocks.append(_rows_to_html_table(rows))
+            out_blocks.append("")
+
+        return "\n\n".join(out_blocks).strip()
 
 try:
     from .ocr_image_redactor import redact_image_bytes  # type: ignore
@@ -179,8 +414,10 @@ def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
 
         txt = xlsx_text(zipf)
+    md = extract_markdown_tables_from_xlsx(file_bytes)
     return {
         "full_text": txt,
+        "markdown": md if isinstance(md, str) and md.strip() else txt,
         "pages": [
             {"page": 1, "text": txt},
         ],
@@ -252,12 +489,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "xlsx", text
 
 
-def redact_item(filename: str, data: bytes, comp):
+def redact_item(filename: str, data: bytes, comp, masking_policy=None):
     low = filename.lower()
     log.info("[XLSX][RED] filename=%s low=%s size=%d", filename, low, len(data))
 
     if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
-        b, _ = sub_text_nodes(data, comp)
+        b, _ = sub_text_nodes(data, comp, masking_policy=masking_policy)
         return b
 
     if low.startswith("xl/charts/") and low.endswith(".xml"):

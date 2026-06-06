@@ -14,13 +14,13 @@ from server.modules import (
 
 MODULE_MAP = {
     ".doc": doc_module,
-    ".docx": docx_module,  # 추가
+    ".docx": docx_module,  
     ".ppt": ppt_module,
-    ".pptx": pptx_module,  # 추가
+    ".pptx": pptx_module,  
     ".xls": xls_module,
-    ".xlsx": xlsx_module,  # 추가
+    ".xlsx": xlsx_module,  
     ".hwp": hwp_module,
-    ".hwpx": hwpx_module,  # 추가
+    ".hwpx": hwpx_module,  
     ".pdf": pdf_module,
     ".xml": xml_module,
 }

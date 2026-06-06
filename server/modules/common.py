@@ -4,7 +4,7 @@ import re
 import zipfile
 import unicodedata
 import xml.etree.ElementTree as ET
-from typing import List, Tuple, Optional, Callable
+from typing import List, Tuple, Optional, Callable, Dict, Any
 
 try:
     from ..core.redaction_rules import PRESET_PATTERNS, RULES
@@ -160,14 +160,109 @@ def _filter_allowed_by_forbidden(allowed, forbidden):
         out.append((s, e, nm, pr))
     return out
 
-def _apply_spans(src: str, allowed) -> tuple[str, int]:
+def _mask_digits_keep_first_n(v: str, keep_n: int) -> str:
+    dcnt = 0
+    out = []
+    for ch in (v or ""):
+        if ch.isdigit():
+            dcnt += 1
+            out.append(ch if dcnt <= keep_n else "*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_digits_keep_last_n(v: str, keep_last_n: int) -> str:
+    s = v or ""
+    digit_pos = [i for i, ch in enumerate(s) if ch.isdigit()]
+    if len(digit_pos) <= keep_last_n:
+        return s
+    keep = set(digit_pos[-keep_last_n:])
+    out = []
+    for i, ch in enumerate(s):
+        if ch.isdigit() and i not in keep:
+            out.append("*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_phone_keep_first_group(v: str) -> str:
+    s = v or ""
+    m = re.search(r"\d+", s)
+    if not m:
+        return s
+    cut = m.end()
+    out = []
+    for i, ch in enumerate(s):
+        if i >= cut and ch.isdigit():
+            out.append("*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_card_keep_first4_last4(v: str) -> str:
+    s = v or ""
+    digit_pos = [i for i, ch in enumerate(s) if ch.isdigit()]
+    if len(digit_pos) <= 8:
+        return s
+    keep = set(digit_pos[:4] + digit_pos[-4:])
+    out = []
+    for i, ch in enumerate(s):
+        if ch.isdigit() and i not in keep:
+            out.append("*")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _mask_value_with_policy(rule: str, v: str, masking_policy: Optional[dict]) -> str:
+    # 기본: 기존 전체 마스킹
+    r = (rule or "").lower()
+    pol = masking_policy or {}
+
+    # 이메일은 기존 로직 유지(형식 보존)
+    if r == "email":
+        return _mask_email(v)
+
+    # 부분 마스킹 규칙
+    if r == "rrn" and str(pol.get("rrn") or "") == "keep_birth6":
+        return _mask_digits_keep_first_n(v, 6)
+    if r == "fgn" and str(pol.get("fgn") or "") == "keep_birth6":
+        return _mask_digits_keep_first_n(v, 6)
+
+    if r in ("phone_mobile", "phone_city") and str(pol.get("phone") or "") == "keep_first_group":
+        return _mask_phone_keep_first_group(v)
+
+    if r == "card" and str(pol.get("card") or "") == "keep_first4_last4":
+        return _mask_card_keep_first4_last4(v)
+
+    if r in ("ps", "name") and str(pol.get("ps") or "") == "keep_first_char":
+        s = v or ""
+        hangul_pos = [i for i, ch in enumerate(s) if re.fullmatch(r"[가-힣]", ch or "")]
+        if len(hangul_pos) <= 1:
+            return s
+        keep_i = hangul_pos[0]
+        out = []
+        for i, ch in enumerate(s):
+            if re.fullmatch(r"[가-힣]", ch or "") and i != keep_i:
+                out.append("*")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    return _mask_keep_rules(v)
+
+
+def _apply_spans(src: str, allowed, masking_policy: Optional[dict] = None) -> tuple[str, int]:
     if not allowed:
         return src, 0
     allowed.sort(key=lambda t: (t[0], -t[3], -(t[1] - t[0])))
     out = list(src)
     hits = 0
     for s, e, nm, _pr in sorted(allowed, key=lambda t: t[0], reverse=True):
-        out[s:e] = list(_mask_value(nm, src[s:e]))
+        out[s:e] = list(_mask_value_with_policy(nm, src[s:e], masking_policy))
         hits += 1
     return "".join(out), hits
 
@@ -235,7 +330,7 @@ def _xml_text_to_bytes(text: str, enc: str, bom: bytes) -> bytes:
     except Exception:
         return (text or "").encode("utf-8", "ignore")
 
-def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
+def sub_text_nodes(xml_bytes: bytes, comp, masking_policy: Optional[Dict[str, Any]] = None) -> Tuple[bytes, int]:
     s, enc, bom = _xml_bytes_to_text(xml_bytes)
     all_allowed: List[tuple] = []
     all_forbidden: List[tuple] = []
@@ -250,8 +345,77 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
         for f_s, f_e in forbidden:
             all_forbidden.append((base + f_s, base + f_e))
     all_allowed = _filter_allowed_by_forbidden(all_allowed, all_forbidden)
-    masked, hits = _apply_spans(s, all_allowed)
+    masked, hits = _apply_spans(s, all_allowed, masking_policy=masking_policy)
     return _xml_text_to_bytes(masked, enc, bom), hits
+
+def mask_entities_in_xml_text_nodes(
+    xml_bytes: bytes,
+    entities: List[Dict[str, Any]],
+    masking_policy: Optional[Dict[str, Any]] = None,
+) -> bytes:
+    if not xml_bytes or not entities:
+        return xml_bytes
+
+    s, enc, bom = _xml_bytes_to_text(xml_bytes)
+
+    items: List[Tuple[str, str]] = []
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        lab = str(ent.get("label") or ent.get("entity_group") or ent.get("entity") or "").upper()
+        t = ent.get("text") or ent.get("value")
+        if t is None:
+            continue
+        v = str(t).strip()
+        if not v:
+            continue
+        if len(v) < 2 and lab != "PS":
+            continue
+        items.append((lab, v))
+
+    if not items:
+        return xml_bytes
+
+    # dedupe + 긴 문자열 우선
+    seen = set()
+    norm_items: List[Tuple[str, str]] = []
+    for lab, v in sorted(items, key=lambda x: (-len(x[1]), x[0], x[1])):
+        k = (lab, v)
+        if k in seen:
+            continue
+        seen.add(k)
+        norm_items.append((lab, v))
+
+    def _mask_for_label(lab: str, v: str) -> str:
+        ll = (lab or "").upper()
+        if ll == "PS":
+            return _mask_value_with_policy("ps", v, masking_policy)
+        if "@" in v and "." in v.split("@", 1)[-1]:
+            return _mask_email(v)
+        return _mask_keep_rules(v)
+
+    def _apply_to_segment(seg: str) -> str:
+        out = seg
+        for lab, lit in norm_items:
+            if not lit:
+                continue
+            if lit in out:
+                out = out.replace(lit, _mask_for_label(lab, lit))
+        return out
+
+    pieces: List[str] = []
+    last = 0
+    for m in _TEXT_NODE_RE.finditer(s):
+        pieces.append(s[last:m.start(1)])
+        pieces.append(_apply_to_segment(m.group(1)))
+        last = m.end(1)
+    pieces.append(s[last:])
+
+    out_s = "".join(pieces)
+    if out_s == s:
+        return xml_bytes
+    return _xml_text_to_bytes(out_s, enc, bom)
+
 
 def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
     if not xml_bytes or not literals:
@@ -293,48 +457,7 @@ def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> by
         return xml_bytes
     return _xml_text_to_bytes(out_s, enc, bom)
 
-def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
-    if not xml_bytes or not literals:
-        return xml_bytes
-
-    try:
-        s = xml_bytes.decode("utf-8", "ignore")
-    except Exception:
-        return xml_bytes
-
-    lits = [str(x) for x in literals if isinstance(x, str) and x.strip()]
-    if not lits:
-        return xml_bytes
-    lits = sorted(set(lits), key=lambda x: (-len(x), x))
-
-    def _mask_literal(v: str) -> str:
-        vv = (v or "").strip()
-        if "@" in vv and "." in vv.split("@", 1)[-1]:
-            return _mask_email(vv)
-        return _mask_keep_rules(vv)
-
-    def _apply_to_segment(seg: str) -> str:
-        out = seg
-        for lit in lits:
-            if not lit or len(lit) < 2:
-                continue
-            if lit in out:
-                out = out.replace(lit, _mask_literal(lit))
-        return out
-
-    # 텍스트 노드 영역만 치환
-    pieces: List[str] = []
-    last = 0
-    for m in _TEXT_NODE_RE.finditer(s):
-        pieces.append(s[last:m.start(1)])
-        pieces.append(_apply_to_segment(m.group(1)))
-        last = m.end(1)
-    pieces.append(s[last:])
-
-    out_s = "".join(pieces)
-    if out_s == s:
-        return xml_bytes
-    return out_s.encode("utf-8", "ignore")
+ # (중복 구현 제거: 위의 encoding-aware 버전만 사용)
 
 # 차트 라벨/값 마스킹(XML)
 def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:

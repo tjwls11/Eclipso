@@ -52,6 +52,10 @@ try:
     from .common import mask_literals_in_xml_text_nodes
 except Exception:
     from server.modules.common import mask_literals_in_xml_text_nodes  # type: ignore
+try:
+    from .common import mask_entities_in_xml_text_nodes
+except Exception:
+    from server.modules.common import mask_entities_in_xml_text_nodes  # type: ignore
 
 log = logging.getLogger("xml_redaction")
 
@@ -206,10 +210,11 @@ def xml_redact_to_file(
     comp = compile_rules()
     kind = detect_xml_type(filename)
     log.info("XML redact: file=%s kind=%s", filename, kind)
-    _ = (ner_entities, ner_allowed, masking_policy)
+    # masking_policy는 module.redact_item/sub_text_nodes에서 부분 마스킹에 사용될 수 있음
 
     allowed_set = {str(x).upper() for x in (ner_allowed or []) if str(x).strip()} if ner_allowed else None
 
+    ner_entities_norm: List[Dict[str, Any]] = []
     ner_literals: List[str] = []
     if ner_entities and isinstance(ner_entities, list):
         for ent in ner_entities:
@@ -222,6 +227,8 @@ def xml_redact_to_file(
             if t is None:
                 continue
             v = str(t).strip()
+            if v:
+                ner_entities_norm.append({"label": lab, "text": v})
             if len(v) >= 2:
                 ner_literals.append(v)
 
@@ -271,22 +278,25 @@ def xml_redact_to_file(
                     continue
 
                 if kind == "docx":
-                    red = docx.redact_item(name, data, comp)
+                    red = docx.redact_item(name, data, comp, masking_policy=masking_policy)
                 elif kind == "xlsx":
-                    red = xlsx.redact_item(name, data, comp)
+                    red = xlsx.redact_item(name, data, comp, masking_policy=masking_policy)
                 elif kind == "pptx":
-                    red = pptx.redact_item(name, data, comp)
+                    red = pptx.redact_item(name, data, comp, masking_policy=masking_policy)
                 elif kind == "hwpx":
-                    red = hwpx.redact_item(name, data, comp)
+                    red = hwpx.redact_item(name, data, comp, masking_policy=masking_policy)
                 else:
                     red = None
 
     
                 try:
-                    if ner_literals and isinstance(red, (bytes, bytearray, type(None))):
+                    if (ner_entities_norm or ner_literals) and isinstance(red, (bytes, bytearray, type(None))):
                         base = data if red is None else bytes(red)
                         if base and low.endswith((".xml",)):
-                            base2 = mask_literals_in_xml_text_nodes(base, ner_literals)
+                            if ner_entities_norm:
+                                base2 = mask_entities_in_xml_text_nodes(base, ner_entities_norm, masking_policy=masking_policy)
+                            else:
+                                base2 = mask_literals_in_xml_text_nodes(base, ner_literals)
                             if red is None:
                                 red = base2 if base2 != base else None
                             else:

@@ -380,7 +380,7 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "pptx", text
 
 
-def redact_item(filename: str, data: bytes, comp):
+def redact_item(filename: str, data: bytes, comp, masking_policy=None):
     # PPTX entry 단위 레닥션(슬라이드/차트/임베디드/이미지 OCR)
     low = filename.lower()
     log.info(
@@ -391,12 +391,12 @@ def redact_item(filename: str, data: bytes, comp):
     )
 
     if low.startswith("ppt/slides/") and low.endswith(".xml"):
-        b, _ = sub_text_nodes(data, comp)
+        b, _ = sub_text_nodes(data, comp, masking_policy=masking_policy)
         return b
 
     if low.startswith("ppt/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
-        b3, _ = sub_text_nodes(b2, comp)
+        b3, _ = sub_text_nodes(b2, comp, masking_policy=masking_policy)
         return b3
 
     if low.startswith("ppt/embeddings/") and low.endswith(".xlsx"):

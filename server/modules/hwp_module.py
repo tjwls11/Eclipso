@@ -370,7 +370,16 @@ def extract_text(file_bytes: bytes) -> dict:
     texts: List[str] = []
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-        for path in ole.listdir(streams=True, storages=False):
+        paths = [p for p in ole.listdir(streams=True, storages=False)]
+        def _sec_key(p):
+            try:
+                if len(p) >= 2 and p[0] == "BodyText" and str(p[1]).startswith("Section"):
+                    return int(re.sub(r"\D+", "", str(p[1])) or "0")
+            except Exception:
+                pass
+            return 10**9
+        paths.sort(key=_sec_key)
+        for path in paths:
             if len(path) < 2 or path[0] != "BodyText" or not path[1].startswith("Section"):
                 continue
 
@@ -380,7 +389,7 @@ def extract_text(file_bytes: bytes) -> dict:
                     texts.append(_clean_hwp_text(payload.decode("utf-16le", "ignore")))
 
     # TAG_PARA_TEXT는 문단 단위 텍스트 조각이므로, 문단 경계를 '\n'으로 보존한다.
-    # (그대로 이어붙이면 NER 입력에서 레이아웃/문맥이 사라져 탐지 품질이 떨어질 수 있음)
+
     full = "\n".join(t for t in texts if t is not None)
     return {"full_text": full, "pages": [{"page": 1, "text": full}]}
 
@@ -401,8 +410,139 @@ def _collect_targets_by_regex(text: str) -> List[str]:
 def _except_hyphen(text: str) -> str:
     return "".join(ch if ch in "-@" else "*" for ch in text)
 
+def _clean_hwp_text_with_map(s: str) -> Tuple[str, List[int]]:
+    if not s:
+        return "", []
+
+    s0 = s.replace("\r", "\n")
+
+    s1_chars: List[str] = []
+    s1_map: List[int] = []
+    for i, ch in enumerate(s0):
+        if _CTRL_CHARS.match(ch):
+            continue
+        s1_chars.append(ch)
+        s1_map.append(i)
+
+    out_chars: List[str] = []
+    out_map: List[int] = []
+    for ch, ri in zip(s1_chars, s1_map):
+        out_chars.append(ch if _is_allowed_hwp_char(ch) else " ")
+        out_map.append(ri)
+
+    s2 = "".join(out_chars)
+
+    lines: List[str] = []
+    maps: List[List[int]] = []
+
+    cur_line: List[str] = []
+    cur_map: List[int] = []
+    for ch, ri in zip(s2, out_map):
+        if ch == "\n":
+            lines.append("".join(cur_line))
+            maps.append(cur_map[:])
+            cur_line = []
+            cur_map = []
+            continue
+        cur_line.append(ch)
+        cur_map.append(ri)
+    lines.append("".join(cur_line))
+    maps.append(cur_map[:])
+
+    cleaned_lines: List[str] = []
+    cleaned_maps: List[List[int]] = []
+
+    prev_blank = False
+    for raw, rmap in zip(lines, maps):
+        buf: List[str] = []
+        bmap: List[int] = []
+        prev_space = False
+        for ch, ri in zip(raw, rmap):
+            if ch in (" ", "\u00A0", "\u2007", "\u202F"):
+                if prev_space:
+                    continue
+                prev_space = True
+                buf.append(" ")
+                bmap.append(ri)
+            else:
+                prev_space = False
+                buf.append(ch)
+                bmap.append(ri)
+
+        while buf and (buf[-1] == " " or buf[-1] == "\t"):
+            buf.pop()
+            bmap.pop()
+
+        l = 0
+        while l < len(buf) and (buf[l] == " " or buf[l] == "\t"):
+            l += 1
+        r = len(buf)
+        while r > l and (buf[r - 1] == " " or buf[r - 1] == "\t"):
+            r -= 1
+        buf = buf[l:r]
+        bmap = bmap[l:r]
+
+        stripped = "".join(buf)
+        if not stripped:
+            if prev_blank:
+                continue
+            cleaned_lines.append("")
+            cleaned_maps.append([])
+            prev_blank = True
+            continue
+
+        has_signal = any(
+            ("0" <= c <= "9")
+            or ("A" <= c <= "Z")
+            or ("a" <= c <= "z")
+            or (c == "@")
+            or ("\uAC00" <= c <= "\uD7A3")
+            for c in stripped
+        )
+        if not has_signal:
+            if prev_blank:
+                continue
+            cleaned_lines.append("")
+            cleaned_maps.append([])
+            prev_blank = True
+            continue
+
+        cleaned_lines.append(stripped)
+        cleaned_maps.append(bmap)
+        prev_blank = False
+
+    text_parts: List[str] = []
+    map_parts: List[int] = []
+    for i, (ln, lm) in enumerate(zip(cleaned_lines, cleaned_maps)):
+        if i > 0:
+            text_parts.append("\n")
+            map_parts.append(-1)
+        text_parts.append(ln)
+        map_parts.extend(lm)
+
+    joined = "".join(text_parts).strip()
+    if not joined:
+        return "", []
+
+    full = "".join(text_parts)
+    # strip과 동일한 양쪽 트림을 map에도 반영
+    left = 0
+    while left < len(full) and full[left].isspace():
+        left += 1
+    right = len(full)
+    while right > left and full[right - 1].isspace():
+        right -= 1
+
+    return full[left:right], map_parts[left:right]
+
 # 특정 인코딩 기준 동일 길이 마스킹
-def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
+def replace_bytes_with_enc(
+    data: bytes,
+    old: str,
+    enc: str,
+    max_log: int = 0,
+    replace_text: Optional[str] = None,
+):
     try:
         needle = old.encode(enc, "ignore")
     except Exception:
@@ -411,7 +551,8 @@ def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
     if not needle:
         return data, 0, []
 
-    masked_text = _except_hyphen(old)
+    # 부분 마스킹(replace_text)이 들어오면 동일 길이일 때만 사용
+    masked_text = str(replace_text) if isinstance(replace_text, str) and replace_text else _except_hyphen(old)
 
     if enc == "utf-16le":
         repl = masked_text.encode("utf-16le")
@@ -432,7 +573,73 @@ def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
         cnt += 1
         i = j + len(needle)
 
-    return bytes(ba), cnt, []
+    if cnt > 0 or enc != "utf-16le":
+        return bytes(ba), cnt, []
+
+    try:
+        s = ba.decode("utf-16le", "ignore")
+    except Exception:
+        return bytes(ba), 0, []
+
+    o = str(old or "")
+    r = str(masked_text or "")
+    if not o or not r or len(o) != len(r):
+        return bytes(ba), 0, []
+
+    if sum(ch.isdigit() for ch in o) < 8:
+        return bytes(ba), 0, []
+
+    n = len(s)
+    L = len(o)
+    slack = 48
+
+    def _try_from(start: int) -> Optional[List[int]]:
+        pos = [-1] * L
+        hi = start
+        last = -1
+        for k in range(L):
+            ch = o[k]
+            j2 = s.find(ch, hi)
+            if j2 == -1:
+                return None
+            pos[k] = j2
+            last = j2
+            hi = j2 + 1
+            if last - start > L + slack:
+                return None
+        return pos
+
+    best = None
+    for st in range(0, n):
+        if s[st] != o[0]:
+            continue
+        pos = _try_from(st)
+        if not pos:
+            continue
+        span = pos[-1] - pos[0]
+        if best is None or span < best[0]:
+            best = (span, pos)
+            if span <= L + 8:
+                break
+
+    if not best:
+        return bytes(ba), 0, []
+
+    pos = best[1]
+    for k in range(L):
+        pj = pos[k]
+        if pj < 0:
+            continue
+        rc = r[k]
+        if rc == o[k]:
+            continue
+        b0 = pj * 2
+        b1 = b0 + 2
+        if b1 > len(ba):
+            continue
+        ba[b0:b1] = rc.encode("utf-16le", "ignore")
+
+    return bytes(ba), 1, []
 
 
 # 여러 인코딩으로 치환 시도
@@ -591,34 +798,74 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
     full_norm = normalization_text(full_raw)
     targets = _collect_targets_by_regex(full_norm)
 
-    # NER spans에서 텍스트 추출하여 targets에 추가
+    # spans(정규식+NER)에서 텍스트 추출하여 targets에 추가
     if spans:
         for span in spans:
             if not isinstance(span, dict):
                 continue
             s = span.get("start")
             e = span.get("end")
-            if s is None or e is None:
-                continue
             try:
-                s = int(s)
-                e = int(e)
+                s_i = int(s) if s is not None else None
+                e_i = int(e) if e is not None else None
             except Exception:
-                continue
-            if e <= s or s < 0 or e > len(full_raw):
-                continue
-            target_text = full_raw[s:e]
+                s_i = None
+                e_i = None
+
+            # 1) 우선 span.text 사용
+            target_text = span.get("text")
+            if not isinstance(target_text, str) or not target_text:
+                # 2) fallback: range가 유효할 때만 slice
+                if s_i is None or e_i is None:
+                    continue
+                if e_i <= s_i or s_i < 0 or e_i > len(full_raw):
+                    continue
+                target_text = full_raw[s_i:e_i]
+
             if target_text and target_text.strip():
-                targets.append(target_text)
+                # replace_text가 있으면 (old -> replace_text) 치환에 사용
+                rt = span.get("replace_text")
+                if isinstance(rt, str) and rt and len(rt) == len(target_text):
+                    targets.append((target_text, rt))
+                else:
+                    targets.append(target_text)
     
     # 중복 제거 및 정렬
-    targets = sorted(set(targets), key=lambda x: (-len(x), x))
+    # targets: str 또는 (old,repl) tuple
+    plain_targets: List[str] = []
+    rep_map: Dict[str, str] = {}
+    for t in targets:
+        if isinstance(t, tuple) and len(t) == 2:
+            a, b = t
+            if isinstance(a, str) and isinstance(b, str) and a and (len(a) == len(b)):
+                rep_map[a] = b
+        elif isinstance(t, str) and t:
+            plain_targets.append(t)
 
-    print(f"[DBG] sensitive targets = {targets}")
+    plain_targets = sorted(set(plain_targets), key=lambda x: (-len(x), x))
+    rep_items = sorted(rep_map.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         streams = ole.listdir(streams=True, storages=False)
         cutoff = getattr(ole, "minisector_cutoff", 4096)
+
+        spans_sorted: List[Dict[str, Any]] = []
+        if spans and isinstance(spans, list):
+            for sp in spans:
+                if not isinstance(sp, dict):
+                    continue
+                try:
+                    s0 = int(sp.get("start"))
+                    e0 = int(sp.get("end"))
+                except Exception:
+                    continue
+                if e0 <= s0:
+                    continue
+                spans_sorted.append(sp)
+            spans_sorted.sort(key=lambda x: (int(x.get("start", 0)), int(x.get("end", 0))))
+
+        g_off = 0
 
         # ─────────────────────────────
         # BodyText 레닥션 (문단 텍스트)
@@ -640,8 +887,64 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
                     break
                 if tag == TAG_PARA_TEXT and size > 0:
                     seg = bytes(buf[off:off + size])
-                    for t in targets:
-                        seg, _, _ = replace_bytes_with_enc(seg, t, "utf-16le")
+                    if spans_sorted:
+                        try:
+                            raw_txt = seg.decode("utf-16le", "ignore")
+                        except Exception:
+                            raw_txt = ""
+                        cleaned_txt, idx_map = _clean_hwp_text_with_map(raw_txt)
+                        seg_len = len(cleaned_txt)
+
+                        if seg_len > 0:
+                            seg_ba = bytearray(seg)
+                            para_s = g_off
+                            para_e = g_off + seg_len
+
+                            for sp in spans_sorted:
+                                try:
+                                    s0 = int(sp.get("start"))
+                                    e0 = int(sp.get("end"))
+                                except Exception:
+                                    continue
+                                if e0 <= para_s or s0 >= para_e:
+                                    continue
+                                ls = max(0, s0 - para_s)
+                                le = min(seg_len, e0 - para_s)
+                                if le <= ls:
+                                    continue
+
+                                base_txt = sp.get("text")
+                                if not isinstance(base_txt, str) or not base_txt:
+                                    base_txt = cleaned_txt[ls:le]
+                                rt = sp.get("replace_text")
+                                if isinstance(rt, str) and rt and len(rt) == len(base_txt):
+                                    repl = rt
+                                else:
+                                    repl = _except_hyphen(base_txt)
+
+                                for k in range(ls, le):
+                                    mi = idx_map[k]
+                                    if mi is None or mi < 0:
+                                        continue
+                                    if (k - ls) >= len(repl):
+                                        continue
+                                    ch = repl[k - ls]
+                                    b0 = int(mi) * 2
+                                    b1 = b0 + 2
+                                    if b1 > len(seg_ba):
+                                        continue
+                                    enc = str(ch).encode("utf-16le", "ignore")
+                                    if len(enc) != 2:
+                                        continue
+                                    seg_ba[b0:b1] = enc
+
+                            seg = bytes(seg_ba)
+                        g_off += seg_len + 1
+                    else:
+                        for old, repl in rep_items:
+                            seg, _, _ = replace_bytes_with_enc(seg, old, "utf-16le", replace_text=repl)
+                        for t in plain_targets:
+                            seg, _, _ = replace_bytes_with_enc(seg, t, "utf-16le")
                     buf[off:off + size] = seg
                 off += size
 
@@ -716,7 +1019,9 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
                 if "prv" in name and "text" in name:
                     raw = ole.openstream(path).read()
                     new_raw = raw
-                    for t in targets:
+                    for old, repl in rep_items:
+                        new_raw, _, _ = replace_bytes_with_enc(new_raw, old, "utf-16le", replace_text=repl)
+                    for t in plain_targets:
                         new_raw, _, _ = replace_bytes_with_enc(new_raw, t, "utf-16le")
 
                     if len(new_raw) < len(raw):

@@ -30,49 +30,81 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
     if not s:
         return "", {}
 
+    # normalization_text()와 "동일한 결과 문자열"을 만들면서,
+    # 정규화된 인덱스 -> 원문 인덱스를 매핑한다.
     out_chars: list[str] = []
-    index_map: dict[int, int] = {}
-    norm_i = 0
+    map_list: list[int] = []
+
     prev_space = False
+    skip_next_lf = False  # \r\n? -> \n 정규화
+
+    def _trim_line_trailing_spaces() -> None:
+        # normalization_text: 각 라인 끝의 [ \t]+ 제거
+        # (여기서는 탭이 이미 공백으로 변환되므로 공백만 제거)
+        nonlocal prev_space
+        while out_chars and out_chars[-1] == " ":
+            out_chars.pop()
+            map_list.pop()
+        prev_space = False
 
     for i, ch in enumerate(s):
-        # 1) NFKC
-        norm = unicodedata.normalize("NFKC", ch)
+        if skip_next_lf and ch == "\n":
+            skip_next_lf = False
+            continue
+        skip_next_lf = False
 
-        # 2) 제로폭 제거
-        if _ZERO_WIDTH.match(norm):
-            if out_chars:
-                index_map[len(out_chars)] = i
+        # 0) \r\n? -> \n (normalization_text와 동일)
+        if ch == "\r":
+            _trim_line_trailing_spaces()
+            out_chars.append("\n")
+            map_list.append(i)
+            skip_next_lf = True
             continue
 
-        # 3) NBSP류 → ' '
-        norm = _NBSP.sub(" ", norm)
-        if out_chars:
-            index_map[len(out_chars)] = i
-
-        # 4) 대시류 → '-'
-        norm = _DASHES.sub("-", norm)
+        # 1) NFKC (문자 단위로 적용; 대부분 케이스에서 normalization_text와 동일)
+        norm = unicodedata.normalize("NFKC", ch)
 
         for c in norm:
-            # 탭 → 공백
+            # 2) strip_invisible: 제로폭 제거
+            if _ZERO_WIDTH.match(c):
+                continue
+
+            # 3) NBSP류 → ' '
+            c = _NBSP.sub(" ", c)
+
+            # 4) 대시류 → '-'
+            c = _DASHES.sub("-", c)
+
+            # 5) 탭 → 공백
             if c == "\t":
                 c = " "
-            # CR/LF 정규화:
-            if c == "\r":
-                c = "\n"
 
-            # 연속 공백 압축 (줄바꿈 제외)
+            # 6) normalization_text의 [ \f\v]+ -> " " 를 반영
+            if c == "\f" or c == "\v":
+                c = " "
+
+            # 7) 공백 압축(줄바꿈 제외)
+            if c == "\n":
+                _trim_line_trailing_spaces()
+                out_chars.append("\n")
+                map_list.append(i)
+                prev_space = False
+                continue
+
             if c == " ":
                 if prev_space:
                     continue
                 prev_space = True
             else:
-                    prev_space = False
+                prev_space = False
 
             out_chars.append(c)
-            index_map[norm_i] = i
-            norm_i += 1
+            map_list.append(i)
+
+    # 마지막 라인 trailing space 제거
+    _trim_line_trailing_spaces()
 
     text = "".join(out_chars)
+    index_map = {j: raw_i for j, raw_i in enumerate(map_list)}
     return text, index_map
 
